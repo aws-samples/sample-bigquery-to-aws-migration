@@ -1,0 +1,15 @@
+{
+  "name": "sample-bigquery-to-aws-migration",
+  "owner": {
+    "name": "Amazon Web Services"
+  },
+  "description": "Assess migrating a BigQuery warehouse to an AWS lakehouse (S3 Tables / Apache Iceberg + Amazon Redshift or Amazon Athena).",
+  "plugins": [
+    {
+      "name": "bq-assess",
+      "source": "./",
+      "version": "0.3.5",
+      "description": "Read-only BigQuery migration assessment: per-table Migration Effort and Query Complexity scoring, Iceberg DDL, engine recommendation (Athena vs Redshift), and a BigQuery-vs-AWS cost comparison — as a Python CLI plus a guided Claude Code skill."
+    }
+  ]
+}

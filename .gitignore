@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.hypothesis/
+.pytest_cache/
+.coverage
+htmlcov/
+reports/
+.DS_Store
+.bq-assess-cache.db
+*.token
+*-sa.json
+*service-account*.json
