@@ -1,7 +1,6 @@
 """Tests for BigQuery location → AWS region mapping."""
 from __future__ import annotations
 
-
 from bq_assess.core.region_mapping import bq_location_to_aws_region
 
 

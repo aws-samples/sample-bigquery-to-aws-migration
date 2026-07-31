@@ -108,11 +108,14 @@ def test_capacity_jobs_yields_capacity_with_edition_medium() -> None:
     assert result.edition == "ENTERPRISE"
     assert result.edition in k.V4_EDITION_SLOT_HOUR_USD  # priceable by the estimator (R18.2)
     assert result.confidence is ConfidenceLevel.MEDIUM
-    # Figures not auto-enriched in 5.1 → None, and the note prompts for --reservation-config.
+    # Figures not auto-enriched in 5.1 → None, and the note prompts for --bigquery-monthly-cost.
     assert result.baseline_slots is None
     assert result.max_slots is None
     assert result.commitment_slots is None
-    assert "--reservation-config" in result.source_note
+    assert "--bigquery-monthly-cost" in result.source_note
+    # reservation_id carried from the JOBS rows so the collector's auto-read
+    # (Stage 3b) reuses it instead of re-querying INFORMATION_SCHEMA (2026-07-28).
+    assert result.reservation_id == "admin:us.resv1"
 
 
 # --- Outcome 1: --reservation-config override ----------------------------------------
@@ -151,7 +154,7 @@ def _assert_undeterminable(result: PricingDetection) -> None:
     assert result.model is not BQPricingModel.UNKNOWN
     assert result.confidence is ConfidenceLevel.LOW
     assert result.edition is None
-    assert "--reservation-config" in result.source_note
+    assert "--bigquery-monthly-cost" in result.source_note
 
 
 def test_empty_job_list_defaults_to_on_demand_low() -> None:
@@ -307,3 +310,19 @@ def test_grouped_all_null_reservation_is_on_demand() -> None:
     assert detection.model == BQPricingModel.ON_DEMAND
     assert detection.confidence == ConfidenceLevel.MEDIUM
     assert "42" in detection.source_note
+
+
+def test_capacity_detected_in_secondary_region() -> None:
+    """A list of locations unions per-region JOBS rows — a reservation visible
+    only in a secondary region still classifies the Source as CAPACITY
+    (2026-07-28: the reservation signal is per-region)."""
+    class _RegionClient:
+        def query(self, sql, **kwargs):
+            if kwargs.get("location") == "EU":
+                return _FakeQueryJob([_job(reservation_id="admin:eu.resv1", edition="ENTERPRISE")])
+            return _FakeQueryJob([_job(reservation_id=None)])  # primary: ad-hoc only
+
+    result = PricingDetector().detect(_RegionClient(), "proj", None, location=["US", "EU"])
+    assert result.model is BQPricingModel.CAPACITY
+    assert result.edition == "ENTERPRISE"
+    assert result.reservation_id == "admin:eu.resv1"

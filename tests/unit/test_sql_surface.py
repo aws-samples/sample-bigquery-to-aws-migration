@@ -175,3 +175,39 @@ class TestAssemble:
         assert UNNEST in {c.construct_class for c in attributed["d.unnest_view"]}
         assert JS_UDF in {c.construct_class for c in attributed["d.js_fn"]}
         assert "d.clean" not in attributed  # no constructs → omitted
+
+
+def test_ad_hoc_detection_early_exits_when_all_classes_found():
+    """Once every construct class is seen in a bucket, remaining SQL is skipped —
+    at query-log scale the 5 regex passes otherwise run over the entire corpus
+    after the result can no longer change (2026-07-28 scale review #10)."""
+    from unittest.mock import patch
+
+    from bq_assess.core.sql_surface import CONSTRUCT_CLASSES, SQLSurfaceAnalyzer
+
+    detector = SQLSurfaceAnalyzer()
+    # One statement per construct class (hits all 5), then a long tail
+    all_constructs = [
+        "SELECT * FROM UNNEST(arr)",                                   # UNNEST
+        "SELECT TIMESTAMP_DIFF(a, b, DAY)",                            # FUNCTION_DRIFT
+        "SELECT ARRAY_AGG(x) FROM t",                                  # ARRAY_FN
+        "SELECT s.field.nested FROM t",                                 # STRUCT_NAV
+        "CREATE TEMP FUNCTION f(x INT64) RETURNS INT64 LANGUAGE js AS 'return x'",  # JS_UDF
+    ]
+    tail = [f"SELECT {i} FROM plain_table" for i in range(1000)]
+
+    calls = {"n": 0}
+    original_detect = detector.detect
+
+    def counting_detect(sql):
+        calls["n"] += 1
+        return original_detect(sql)
+
+    with patch.object(detector, "detect", side_effect=counting_detect):
+        result = detector.detect_for_entities([], all_constructs + tail)
+
+    found_classes = {c.construct_class for c in result["__ad_hoc__"]}
+    assert found_classes == set(CONSTRUCT_CLASSES)
+    # detect() must stop shortly after the 5 class-hitting statements — not
+    # run over the 1000-statement tail
+    assert calls["n"] <= len(all_constructs) + 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from bq_assess.engine.redshift.placement import PlacementAdvisor
 from bq_assess.models import (
     ConfidenceLevel,
     EntityMetadata,
@@ -10,7 +11,6 @@ from bq_assess.models import (
     EntityType,
     RoutineMetadata,
 )
-from bq_assess.engine.redshift.placement import PlacementAdvisor
 
 
 def _entity(etype=EntityType.VIEW, routine=None):

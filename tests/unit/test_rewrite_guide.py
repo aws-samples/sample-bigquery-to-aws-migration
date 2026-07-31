@@ -3,13 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from bq_assess.engine.redshift.rewrite import RewriteGuide
 from bq_assess.models import (
     DetectedConstruct,
     EntityMetadata,
     EntityPopulation,
     EntityType,
 )
-from bq_assess.engine.redshift.rewrite import RewriteGuide
 
 
 def _entity():

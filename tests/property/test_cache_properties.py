@@ -18,7 +18,6 @@ from hypothesis import given, settings
 
 from bq_assess.core.cache import MetadataCache
 from bq_assess.models import ColumnSchema, EntityMetadata
-
 from tests.conftest import entity_metadata
 
 
@@ -49,7 +48,7 @@ def test_p8_cache_round_trip(entities: list[EntityMetadata]) -> None:
     assert loaded is not None
     assert len(loaded) == len(entities)
 
-    key = lambda e: (e.dataset_id, e.entity_id)  # noqa: E731
+    key = lambda e: (e.dataset_id, e.entity_id)
     for orig, back in zip(sorted(entities, key=key), sorted(loaded, key=key)):
         _assert_entity_equivalent(orig, back)
 

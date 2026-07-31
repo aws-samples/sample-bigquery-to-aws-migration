@@ -91,11 +91,20 @@ class TestComplexityScorer:
         # 2 + 2 + 1 = 5 → REWRITE
         assert result.category == ComplexityCategory.REWRITE
 
-    def test_has_logs_gives_high_confidence(self):
+    def test_has_logs_with_surface_gives_high_confidence(self):
         scorer = ComplexityScorer()
         result = scorer.score(_entity(), constructs=[], has_logs=True)
         assert result.confidence == ConfidenceLevel.HIGH
         assert result.confidence_source == ConfidenceSource.QUERY_LOGS
+
+    def test_has_logs_without_surface_stays_low(self):
+        # Logs are not attributed per-entity: a plain table with no SQL of its
+        # own must not be marked HIGH just because logs exist (R11.4 amendment).
+        scorer = ComplexityScorer()
+        e = _entity(entity_type=EntityType.TABLE, view_query=None)
+        result = scorer.score(e, constructs=[], has_logs=True)
+        assert result.confidence == ConfidenceLevel.LOW
+        assert result.confidence_source == ConfidenceSource.SCHEMA_ONLY
 
     def test_constructs_included_in_result(self):
         scorer = ComplexityScorer()

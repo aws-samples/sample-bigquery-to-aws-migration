@@ -417,7 +417,9 @@ class TestScannerConnectionPool:
             table_objs[f"t_{i}"] = tbl
 
         client.list_tables.return_value = items
-        client.get_table.side_effect = lambda ref: table_objs[ref.table_id]
+        # Accept **kwargs to mirror the real client signature — the scanner
+        # passes retry=None to disable the library's built-in retry ladder.
+        client.get_table.side_effect = lambda ref, **kwargs: table_objs[ref.table_id]
         client.list_routines.return_value = []
 
         scanner._client = client

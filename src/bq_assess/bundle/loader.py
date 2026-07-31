@@ -14,16 +14,22 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from bq_assess.bundle.models import Bundle, SCHEMA_VERSION, QueryRecord, sha256_file
+from bq_assess.bundle.models import (
+    COMPATIBLE_SCHEMA_VERSIONS,
+    Bundle,
+    QueryRecord,
+    sha256_file,
+)
+from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO
 from bq_assess.models import (
+    BQPricingModel,
     ColumnSchema,
+    ConfidenceLevel,
     EntityMetadata,
     EntityPopulation,
     EntityType,
     FailureRecord,
     PricingDetection,
-    BQPricingModel,
-    ConfidenceLevel,
     RangePartitionConfig,
     RoutineMetadata,
     SlotUtilization,
@@ -122,11 +128,11 @@ class BundleLoader:
             raise BundleError(f"Failed to parse manifest.json: {exc}") from exc
 
         version = manifest.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if version not in COMPATIBLE_SCHEMA_VERSIONS:
             raise BundleError(
                 f"Bundle schema version mismatch: bundle is v{version} "
                 f"(collector {manifest.get('collector_version', 'unknown')}), "
-                f"this tool expects v{SCHEMA_VERSION}. "
+                f"this tool accepts v{sorted(COMPATIBLE_SCHEMA_VERSIONS)}. "
                 f"Re-collect with a matching collector version or use a matching bq-assess."
             )
 
@@ -164,6 +170,7 @@ class BundleLoader:
 
     def _deserialize(self, bundle_dir: Path, manifest: dict) -> Bundle:
         entities = self._load_entities(bundle_dir)
+        self._rederive_assumed_physical(entities, manifest)
         failures = self._load_failures(bundle_dir)
         workload = self._load_workload(bundle_dir)
         pricing = self._load_pricing(bundle_dir)
@@ -181,9 +188,36 @@ class BundleLoader:
             rates=rates,
             queries=queries,
             storage_basis=manifest.get("storage_basis", "assumed"),
+            regions=manifest.get("regions") or [],  # [] → __post_init__ defaults to [bq_location]
             collector_version=manifest.get("collector_version", ""),
             created_at=manifest.get("created_at", ""),
         )
+
+    @staticmethod
+    def _rederive_assumed_physical(entities: list[EntityMetadata], manifest: dict) -> None:
+        """Re-derive fallback physical bytes at the CURRENT assumed ratio.
+
+        A ``storage_basis: assumed`` bundle carries no measured TABLE_STORAGE rows —
+        its ``physical_bytes`` are ``ratio × num_bytes`` at whatever
+        ASSUMED_PHYSICAL_RATIO the *collector build* shipped with. The report prints
+        the current constant in every storage note, so pricing baked bytes from an
+        older ratio silently mislabels the estimate (the 0.75-baked/0.50-labelled
+        class). Recompute here so ratio changes reach existing customer bundles
+        without recollection.
+
+        Only the pure-fallback basis is rewritten: "measured"/"mixed" bundles carry
+        real bytes (and per-entity provenance is not recorded, so a mixed bundle
+        cannot be safely split). ``assumed_physical_ratio`` in the manifest records
+        what the collector used (absent in pre-0.3.3 bundles).
+        """
+        if manifest.get("storage_basis", "assumed") != "assumed":
+            return
+        baked_ratio = manifest.get("assumed_physical_ratio")
+        if baked_ratio == ASSUMED_PHYSICAL_RATIO:
+            return
+        for e in entities:
+            if e.num_bytes > 0:
+                e.physical_bytes = round(e.num_bytes * ASSUMED_PHYSICAL_RATIO)
 
     def _load_entities(self, bundle_dir: Path) -> list[EntityMetadata]:
         entities: list[EntityMetadata] = []

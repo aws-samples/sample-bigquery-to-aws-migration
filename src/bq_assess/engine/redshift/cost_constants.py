@@ -94,36 +94,67 @@ GB_PER_BYTE: float = 1e-9                    # AWS storage billing: bytes → de
 # Physical-bytes fallback ratio: canonical value lives in core/storage_stats.py
 # (collection-time concern — the collector distribution must not import the engine).
 # Re-exported so cost/report call sites keep their k.ASSUMED_PHYSICAL_RATIO idiom.
-from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO  # noqa: E402,F401
+from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO  # noqa: F401
 
 # S3-Tables-only recurring maintenance lines (plain S3 lacks these) — the "negligible
-# request/maintenance lines" R18.1 folds alongside storage.
+# request/maintenance lines" R18.1 folds alongside storage. Object monitoring is the
+# recurring one and IS billed into the storage line (object count estimated from
+# physical bytes at the post-compaction target object size). Compaction bills per GB
+# of NEWLY WRITTEN data — unknowable without an ingestion rate, so it stays a
+# pricing-note disclosure. Request charges remain out of scope (scope note).
 V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH: float = 0.025
 V2_COMPACTION_USD_PER_1K_OBJECTS: float = 0.002
 V2_COMPACTION_USD_PER_GB_PROCESSED: float = 0.005
 V2_REQUEST_TIER1_USD_PER_1K: float = 0.005      # PUT/COPY/POST/LIST
 V2_REQUEST_TIER2_USD_PER_1K: float = 0.0004     # GET/other
+# Assumed average object size AFTER compaction (S3 Tables' default target file size
+# is 512 MB; real estates land below target on small partitions — 128 MB is the
+# conservative-high object-count anchor for the monitoring estimate).
+V2_ASSUMED_OBJECT_SIZE_MB: float = 128.0
+
+# =============================================================================
+# V2 — S3 Tables Intelligent-Tiering storage class, $/GB-month, us-east-1
+# (verified 2026-07-31 against the AmazonS3 Price List offer file)
+# The INT storage class tiers FILES within a table by access recency:
+#   Frequent Access — default; bills at EXACTLY the Standard tier rates above
+#     (confirmed SKU-by-SKU: Tables-TimedStorage-INT-FA-ByteHrs carries the same
+#     three volume-tier prices as Tables-TimedStorage-ByteHrs) → no FA constants.
+#   Infrequent Access — after 30 days unaccessed; FLAT rate, no volume tiers.
+#   Archive Instant Access — after 90 days unaccessed; FLAT rate, no volume tiers.
+# All three serve reads at millisecond latency; a read moves the file back to
+# Frequent at no retrieval charge. Monitoring bills through the SAME
+# Tables-MonitoredObjects SKU already priced above — no separate INT fee.
+# Live values overwrite these via apply_live_rates (same path as the Standard
+# tiers); the fallback constants are us-east-1.
+# ⚠️ The cost model's tier split uses last_modified as an ACCESS proxy (we do
+# not collect per-table read recency) — every surface showing the tiered figure
+# must carry that caveat.
+# =============================================================================
+
+V2_INT_INFREQUENT_THRESHOLD_DAYS: int = 30
+V2_INT_ARCHIVE_THRESHOLD_DAYS: int = 90
+V2_INT_IA_USD_PER_GB_MONTH: float = 0.0144    # Tables-TimedStorage-INT-IA-ByteHrs
+V2_INT_AIA_USD_PER_GB_MONTH: float = 0.0046   # Tables-TimedStorage-INT-AIA-ByteHrs
 
 # =============================================================================
 # V3 — slot→RPU bridge.  ⚠️⚠️ LOW-CONFIDENCE ASSUMPTION, NOT A VERIFIED FACT. ⚠️⚠️
 # There is NO published AWS/GCP slot↔RPU equivalence. Cross-referencing hardware specs
 # (1 RPU = 2 vCPU + 16 GB; 1 BQ slot ≈ 0.5 vCPU) yields ~0.25; the Fivetran 2022 benchmark
 # (300 BQ slots ≈ 18 RPU-equiv at performance parity) yields ~0.06; pure cost ratio ($0.06 vs
-# $0.375 per unit-hr) yields ~0.16. We use 0.20 — deliberately ABOVE the evidence midpoint,
-# toward the hardware-spec bound (~0.25) — so the projected Redshift compute errs on the
-# HIGH side and quoted savings err conservative (raised from 0.15 on 2026-07-05 after the
-# Montu reconciliation; understating AWS cost is the riskier direction in a customer-facing
-# business case). MUST be replaced by empirical RPU-hour measurement (SYS_SERVERLESS_USAGE)
-# on a representative migrated workload before quoting. Every emitted compute line carries a
-# visible LOW-confidence / ASSUMPTION label (R18.7).
+# $0.375 per unit-hr) yields ~0.16. We use 0.15 — the midpoint of the 0.06–0.25 evidence
+# range (lowered from 0.20 on 2026-07-23; history: 0.15→0.20 on 2026-07-05 after the Montu
+# reconciliation, back to 0.15 with the serverless 4-RPU active-hours billing floor now
+# catching the understatement risk on always-on workloads). MUST be replaced by empirical
+# RPU-hour measurement (SYS_SERVERLESS_USAGE) on a representative migrated workload before
+# quoting. Every emitted compute line carries a visible ASSUMPTION label (R18.7).
 # =============================================================================
 
-V3_SLOT_TO_RPU_RATIO: float = 0.20
+V3_SLOT_TO_RPU_RATIO: float = 0.15
 V3_CONFIDENCE_IS_ASSUMPTION: bool = True
 V3_ASSUMPTION_NOTE: str = (
-    "slot→RPU 0.20 ASSUMPTION (evidence range: 0.06–0.25, set above midpoint so AWS "
-    "compute deliberately estimated high / savings conservative; no published equivalence; "
-    "overridable; verify with empirical RPU-hour measurement before quoting)"
+    "slot→RPU 0.15 ASSUMPTION (evidence range: 0.06–0.25, set at midpoint; "
+    "no published equivalence; overridable; verify with empirical RPU-hour "
+    "measurement before quoting)"
 )
 
 # =============================================================================
@@ -246,7 +277,7 @@ V6_CONCURRENCY_SCALING_OVERHEAD_FRACTION: float = 0.20
 # BigQuery location token (lowercase) → AWS region: canonical mapping lives in
 # core/region_mapping.py (the collector distribution records aws_region in the bundle
 # manifest without importing the engine). Re-exported here for existing call sites.
-from bq_assess.core.region_mapping import (  # noqa: E402,F401
+from bq_assess.core.region_mapping import (  # noqa: F401
     BQ_LOCATION_TO_AWS_REGION,
     bq_location_to_aws_region,
 )
@@ -258,6 +289,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "US East (N. Virginia)",
         "rpu_hour": 0.375, "rms": 0.024,
         "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
         "rg.xlarge": (0.76, 0.532, 0.331), "rg.4xlarge": (3.043, 2.130, 1.324),
         "ra3.xlplus": (1.086, 0.760, 0.473), "ra3.4xlarge": (3.26, 2.282, 1.418), "ra3.16xlarge": (13.04, 9.128, 5.672),
     },
@@ -265,6 +297,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "US West (Oregon)",
         "rpu_hour": 0.36, "rms": 0.024,
         "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
         "rg.xlarge": (0.7602, 0.53214, 0.33075), "rg.4xlarge": (3.04267, 2.12987, 1.32356),
         "ra3.xlplus": (1.086, 0.7602, 0.4725), "ra3.4xlarge": (3.26, 2.282, 1.4181), "ra3.16xlarge": (13.04, 9.128, 5.6724),
     },
@@ -272,6 +305,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Canada (Central)",
         "rpu_hour": 0.4125, "rms": 0.0261,
         "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
         "rg.xlarge": (0.8414, 0.58898, 0.36603), "rg.4xlarge": (3.36653, 2.35723, 1.46487),
         "ra3.xlplus": (1.202, 0.8414, 0.5229), "ra3.4xlarge": (3.607, 2.5256, 1.5695), "ra3.16xlarge": (14.43, 10.101, 6.2771),
     },
@@ -279,6 +313,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "South America (São Paulo)",
         "rpu_hour": 0.5976, "rms": 0.043,
         "s3_tables": (0.0466, 0.0449, 0.0426),
+        "s3_int": (0.0254, 0.0095),
         "rg.xlarge": (1.2117, 0.8484, 0.5271), "rg.4xlarge": (4.84867, 3.39407, 2.10924),
         "ra3.xlplus": (1.731, 1.212, 0.753), "ra3.4xlarge": (5.195, 3.6365, 2.2599), "ra3.16xlarge": (20.78, 14.546, 9.0393),
     },
@@ -286,6 +321,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Europe (Ireland)",
         "rpu_hour": 0.387, "rms": 0.024,
         "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
         "rg.xlarge": (0.8414, 0.58898, 0.36603), "rg.4xlarge": (3.3656, 2.35592, 1.46412),
         "ra3.xlplus": (1.202, 0.8414, 0.5229), "ra3.4xlarge": (3.606, 2.5242, 1.5687), "ra3.16xlarge": (14.424, 10.0968, 6.2745),
     },
@@ -293,6 +329,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Europe (London)",
         "rpu_hour": 0.467, "rms": 0.025,
         "s3_tables": (0.0276, 0.0265, 0.0253),
+        "s3_int": (0.0151, 0.0058),
         "rg.xlarge": (0.8848, 0.61936, 0.38493), "rg.4xlarge": (3.54013, 2.47809, 1.54),
         "ra3.xlplus": (1.264, 0.8848, 0.5499), "ra3.4xlarge": (3.793, 2.6551, 1.65), "ra3.16xlarge": (15.174, 10.6218, 6.6007),
     },
@@ -300,6 +337,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Europe (Frankfurt)",
         "rpu_hour": 0.451, "rms": 0.0256,
         "s3_tables": (0.0282, 0.027, 0.0259),
+        "s3_int": (0.0155, 0.0058),
         "rg.xlarge": (0.9086, 0.63602, 0.39529), "rg.4xlarge": (3.6344, 2.54408, 1.58097),
         "ra3.xlplus": (1.298, 0.9086, 0.5647), "ra3.4xlarge": (3.894, 2.7258, 1.6939), "ra3.16xlarge": (15.578, 10.9046, 6.7765),
     },
@@ -307,6 +345,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Asia Pacific (Sydney)",
         "rpu_hour": 0.419, "rms": 0.0261,
         "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
         "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
         "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
     },
@@ -314,6 +353,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Asia Pacific (Singapore)",
         "rpu_hour": 0.45, "rms": 0.0261,
         "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
         "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
         "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
     },
@@ -321,6 +361,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Asia Pacific (Tokyo)",
         "rpu_hour": 0.494, "rms": 0.0261,
         "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
         "rg.xlarge": (0.8946, 0.62622, 0.3892), "rg.4xlarge": (3.58027, 2.50619, 1.55745),
         "ra3.xlplus": (1.278, 0.8946, 0.556), "ra3.4xlarge": (3.836, 2.6852, 1.6687), "ra3.16xlarge": (15.347, 10.7429, 6.676),
     },
@@ -328,6 +369,7 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "label": "Asia Pacific (Mumbai)",
         "rpu_hour": 0.4275, "rms": 0.0261,
         "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
         "rg.xlarge": (0.8645, 0.60515, 0.37611), "rg.4xlarge": (3.45893, 2.42125, 1.50472),
         "ra3.xlplus": (1.235, 0.8645, 0.5373), "ra3.4xlarge": (3.706, 2.5942, 1.6122), "ra3.16xlarge": (14.827, 10.3789, 6.4498),
     },
@@ -345,6 +387,7 @@ def apply_aws_region(region: str) -> bool:
     global V1_SERVERLESS_1YR_NO_UPFRONT_RPU_HOUR_USD, V1_SERVERLESS_3YR_RPU_HOUR_USD
     global V2_S3_TABLES_USD_PER_GB_MONTH_TIER1, V2_S3_TABLES_USD_PER_GB_MONTH_TIER2
     global V2_S3_TABLES_USD_PER_GB_MONTH_TIER3, V6_MANAGED_STORAGE_USD_PER_GB_MONTH
+    global V2_INT_IA_USD_PER_GB_MONTH, V2_INT_AIA_USD_PER_GB_MONTH
     global AWS_PRICING_REGION, AWS_REGION_SCOPE
 
     rates = AWS_REGIONAL_RATES.get(region)
@@ -366,6 +409,9 @@ def apply_aws_region(region: str) -> bool:
     V2_S3_TABLES_USD_PER_GB_MONTH_TIER2 = t2
     V2_S3_TABLES_USD_PER_GB_MONTH_TIER3 = t3
     V6_MANAGED_STORAGE_USD_PER_GB_MONTH = rates["rms"]
+    ia, aia = rates["s3_int"]
+    V2_INT_IA_USD_PER_GB_MONTH = ia
+    V2_INT_AIA_USD_PER_GB_MONTH = aia
 
     for node_type, table in (("rg.xlarge", V7_RG_NODE_TYPES), ("rg.4xlarge", V7_RG_NODE_TYPES),
                              ("ra3.xlplus", V6_RA3_NODE_TYPES), ("ra3.4xlarge", V6_RA3_NODE_TYPES),

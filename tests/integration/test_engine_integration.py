@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-
 from bq_assess.core.engine_config import resolve_engine_config
 from bq_assess.engine.athena.cost import AthenaCostEstimator
 from bq_assess.engine.athena.migration import AthenaMigrationGenerator
@@ -86,7 +85,7 @@ def test_full_pipeline_low_volume():
 
     # Step 2: Cost
     cost = AthenaCostEstimator().estimate_cost(profile, pricing)
-    assert cost.monthly_compute > Decimal("0")
+    assert cost.monthly_compute > Decimal(0)
     assert cost.engine_id == "athena"
 
     # Step 3: Translation — assert real Trino output
@@ -140,7 +139,7 @@ def test_full_pipeline_low_volume():
     assert len(dml.statements) >= 1, "Should generate at least one migration statement"
     first_stmt = dml.statements[0]
     assert "INSERT INTO" in first_stmt, "Migration must use INSERT INTO syntax"
-    assert "iceberg_db.ds_big_table" in first_stmt, "INSERT must target correct table name"
+    assert "ds.big_table" in first_stmt, "INSERT must target correct table name"
 
     # assert shortcoming categories are exactly as expected
     shortcoming_categories = {s.category for s in dml.shortcomings}
@@ -151,10 +150,13 @@ def test_full_pipeline_low_volume():
     assert shortcoming_categories == {"sort_order", "compaction"}, \
         f"Expected sort_order and compaction shortcomings; got {shortcoming_categories}"
 
-    # explicit post_optimization check
+    # explicit post_optimization check — S3 Tables compacts as managed
+    # maintenance, so the only emitted step is the one-time sort declaration
     assert config.post_optimization is True, "Config should have post_optimization enabled"
-    assert any(s.step_type == "compact" for s in dml.post_optimization), \
-        "Post-optimization should include compaction for large table"
+    assert any(s.step_type == "sort" for s in dml.post_optimization), \
+        "Post-optimization should carry the sort-order step for clustered tables"
+    assert not any(s.step_type in ("compact", "vacuum") for s in dml.post_optimization), \
+        "S3 Tables managed maintenance replaces self-managed compact/vacuum steps"
 
 
 def test_full_pipeline_high_volume():

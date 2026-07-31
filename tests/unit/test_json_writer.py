@@ -6,10 +6,21 @@ import tempfile
 from datetime import datetime, timezone
 
 from bq_assess.models import (
-    Assessment, AssessmentSummary, BQPricingModel, ConfidenceLevel,
-    CostComparison, CostLine, EntityPopulation, EntityReport, EntityType,
-    EffortCategory, EffortResult, ComplexityCategory, ComplexityResult,
-    ConfidenceSource, ConversionResult,
+    Assessment,
+    AssessmentSummary,
+    BQPricingModel,
+    ComplexityCategory,
+    ComplexityResult,
+    ConfidenceLevel,
+    ConfidenceSource,
+    ConversionResult,
+    CostComparison,
+    CostLine,
+    EffortCategory,
+    EffortResult,
+    EntityPopulation,
+    EntityReport,
+    EntityType,
 )
 from bq_assess.report.json_writer import JSONWriter
 
@@ -77,7 +88,7 @@ def test_json_landing_schema():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    landing_path = [p for p in paths if "landing" in p][0]
+    landing_path = next(p for p in paths if "landing" in p)
     with open(landing_path) as f:
         data = json.load(f)
     for key in ["schema_version", "assessment_id", "generated_at", "project_id", "summary", "cost", "failures"]:
@@ -93,7 +104,7 @@ def test_json_landing_carries_schema_version():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    landing_path = [p for p in paths if "landing" in p][0]
+    landing_path = next(p for p in paths if "landing" in p)
     with open(landing_path) as f:
         data = json.load(f)
     assert data["schema_version"] == __version__
@@ -103,7 +114,7 @@ def test_json_effort_tables_only():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    effort_path = [p for p in paths if "effort" in p][0]
+    effort_path = next(p for p in paths if "effort" in p)
     with open(effort_path) as f:
         data = json.load(f)
     assert data["assessment_id"] == "assess-20260617-abc123"
@@ -116,7 +127,7 @@ def test_json_query_includes_rebuilt():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    query_path = [p for p in paths if "query" in p][0]
+    query_path = next(p for p in paths if "query" in p)
     with open(query_path) as f:
         data = json.load(f)
     assert len(data["entities"]) == 2
@@ -143,10 +154,10 @@ def test_json_none_fields_omitted():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    query_path = [p for p in paths if "query" in p][0]
+    query_path = next(p for p in paths if "query" in p)
     with open(query_path) as f:
         data = json.load(f)
-    view_entity = [e for e in data["entities"] if e["full_name"] == "ds.active_users_v"][0]
+    view_entity = next(e for e in data["entities"] if e["full_name"] == "ds.active_users_v")
     assert "effort" not in view_entity
     assert "conversion" not in view_entity
     assert "load_sync_dml" not in view_entity
@@ -156,7 +167,7 @@ def test_json_enum_serialized_as_value():
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
-    landing_path = [p for p in paths if "landing" in p][0]
+    landing_path = next(p for p in paths if "landing" in p)
     with open(landing_path) as f:
         data = json.load(f)
     assert data["cost"]["bq_pricing_model"] == "CAPACITY"

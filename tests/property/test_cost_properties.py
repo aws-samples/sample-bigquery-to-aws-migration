@@ -16,10 +16,9 @@ testing it would exercise zero production code. The whole point is to test the e
 from __future__ import annotations
 
 import hypothesis.strategies as st
-
-from bq_assess.engine.redshift import cost_constants as k
 from hypothesis import given, settings
 
+from bq_assess.engine.redshift import cost_constants as k
 from bq_assess.engine.redshift.cost import CostEstimator
 from bq_assess.models import (
     BQPricingModel,

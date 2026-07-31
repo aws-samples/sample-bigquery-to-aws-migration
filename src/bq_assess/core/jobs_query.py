@@ -20,17 +20,10 @@ no-signal as no-data and never raise (R16.3 / R17.3).
 from __future__ import annotations
 
 import logging
-import time
-
-from google.api_core.exceptions import GoogleAPICallError
 
 from bq_assess.core import pricing_constants as k
 
 logger = logging.getLogger(__name__)
-
-_RETRYABLE_CODES = {429, 500, 503}
-_MAX_RETRIES = 3
-_INITIAL_DELAY = 1.0
 
 DEFAULT_LOOKBACK_DAYS = 30
 
@@ -70,7 +63,11 @@ def read_jobs(
     if group_by:
         sql += f" GROUP BY {group_by}"
     try:
-        return list(_retry_query(lambda: client.query(sql).result()))
+        # location= pins the query job to the data's region — region-qualified
+        # INFORMATION_SCHEMA views only resolve when the job runs in that region.
+        # Without it, a non-US-default project silently returns no rows (same
+        # bug class as the 2026-07-23 TABLE_STORAGE fix in storage_stats.py).
+        return list(_retry_query(lambda: client.query(sql, location=location).result()))
     except Exception as exc:  # missing perms / any error → no signal, not a failure
         logger.warning("Could not read INFORMATION_SCHEMA.JOBS_BY_PROJECT: %s", exc)
         return []
@@ -112,11 +109,40 @@ def read_jobs_hourly(
     )
 
 
-# Cap on distinct query texts exported to queries.jsonl. Ordered by total slot-ms so the
+# Cap on distinct query SHAPES exported to queries.jsonl. Ordered by total slot-ms so the
 # heaviest statements always survive the cut; the collector logs when truncation occurs.
 # Bounds the export the same way read_jobs_hourly bounds the workload read (no per-job
 # row stream — the 2026-07-08 deep-audit OOM class).
 QUERIES_EXPORT_LIMIT = 50_000
+
+# Server-side query-shape normalization for the GROUP BY key (2026-07-28 scale
+# review finding #6). Grouping on EXACT text let a literal-heavy workload fill
+# all 50k slots with variants of a few hundred templates — coverage of distinct
+# query shapes collapsed while the count looked healthy. These REGEXP_REPLACEs
+# mirror analyzer.anonymize_query's literal-stripping (the rule applied
+# client-side before export), so the group key IS (approximately) the shape:
+#   1. '…' string literals → '?'   (analyzer._STRING_LITERAL_RE: '[^']*')
+#   2. numeric literals after an operator/comma/paren/space → ?
+# BigQuery's re2 has no lookaround, so the Python rule's lookbehind/lookahead
+# become capture groups (\1 … \3). Because each match CONSUMES its trailing
+# delimiter, one pass skips every second literal in a run (IN (1,2,3) →
+# (?,2,?)) — the numeric replace therefore runs TWICE; the second pass catches
+# the odd positions, so comma-separated literal lists fully normalize
+# (2026-07-28 MR E review). Any residual divergence from the Python rule is
+# strictly FINER grouping, which never merges distinct shapes.
+#
+# INVARIANT (relied on by collector._queries_from_api_multi's cross-region
+# dedup): any two texts in one shape group must Python-anonymize to the SAME
+# exported string — Python's rules replace a superset of the spans replaced
+# here. Pinned by tests/unit/test_jobs_query.py::TestQueryShapeKey::
+# test_same_shape_group_anonymizes_identically.
+_QUERY_SHAPE_NUM_PATTERN = "r\"([\\s=><!(,+*/-])(\\d+\\.?\\d*)([\\s,);]|$)\""
+QUERY_SHAPE_SQL = (
+    "REGEXP_REPLACE(REGEXP_REPLACE("
+    "REGEXP_REPLACE(query, r\"'[^']*'\", \"'?'\"), "
+    f"{_QUERY_SHAPE_NUM_PATTERN}, r\"\\1?\\3\"), "
+    f"{_QUERY_SHAPE_NUM_PATTERN}, r\"\\1?\\3\")"
+)
 
 
 def read_jobs_queries(
@@ -127,16 +153,22 @@ def read_jobs_queries(
     location: str = "US",
     limit: int = QUERIES_EXPORT_LIMIT,
 ) -> list:
-    """Read DISTINCT query texts + aggregate per-statement stats (bounded).
+    """Read DISTINCT query SHAPES + aggregate per-statement stats (bounded).
 
-    Groups server-side by query text so the row count is bounded by workload
-    *diversity*, not volume, then caps at ``limit`` ordered by total slot-ms
-    (heaviest statements first). NULL-billed jobs are tracked per group via
-    ``missing_billed_jobs`` — same billed semantics as the hourly read (no-scan
-    jobs exempt). Returns ``[]`` on any error — never raises (R17.3).
+    Groups server-side by the literal-normalized query shape (``QUERY_SHAPE_SQL``)
+    so the row count is bounded by workload *shape diversity*, not literal
+    variance — 1M runs of one template with different dates form ONE group whose
+    slot-ms sums, instead of 1M groups crowding real shapes out of the cap.
+    ``ANY_VALUE(query)`` carries one representative text per shape for the
+    client-side anonymizer (its literal-stripping then produces the same shape).
+    Caps at ``limit`` ordered by total slot-ms (heaviest shapes first).
+    NULL-billed jobs are tracked per group via ``missing_billed_jobs`` — same
+    billed semantics as the hourly read. Returns ``[]`` on any error — never
+    raises (R17.3).
     """
     select = (
-        "SELECT query, "
+        f"SELECT {QUERY_SHAPE_SQL} AS query_shape, "
+        "ANY_VALUE(query) AS query, "
         "SUM(total_slot_ms) AS total_slot_ms, "
         "COUNT(*) AS job_count, "
         "SUM(total_bytes_processed) AS total_bytes_processed, "
@@ -148,7 +180,7 @@ def read_jobs_queries(
     return read_jobs(
         client, project_id, select,
         days=days, location=location,
-        group_by=f"query ORDER BY total_slot_ms DESC LIMIT {int(limit)}",
+        group_by=f"query_shape ORDER BY total_slot_ms DESC LIMIT {int(limit)}",
     )
 
 
@@ -178,14 +210,14 @@ def read_reservation_groups(
 
 
 def _retry_query(fn):
-    """Execute fn with exponential-backoff retries on transient BigQuery errors."""
-    delay = _INITIAL_DELAY
-    for attempt in range(_MAX_RETRIES + 1):
-        try:
-            return fn()
-        except GoogleAPICallError as exc:
-            if exc.code not in _RETRYABLE_CODES or attempt == _MAX_RETRIES:
-                raise
-            logger.warning("Retryable error (attempt %d): %s", attempt + 1, exc)
-            time.sleep(delay)
-            delay *= 2
+    """Execute fn with retries — delegates to the scanner's shared ladder.
+
+    Previously a weaker parallel implementation (3 retries, no Retry-After, no
+    jitter, no transport-error handling) that gave up in ~7s under the same
+    sustained-throttling event the scanner survives, silently degrading the
+    workload/pricing signal to [] (2026-07-28 review). One retry helper now
+    governs every BigQuery call in the collection path.
+    """
+    from bq_assess.core.scanner import _retry
+
+    return _retry(fn)

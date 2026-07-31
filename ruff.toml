@@ -1,0 +1,11 @@
+[lint]
+ignore = [
+    "BLE001",   # bare Exception in CLI/collector is intentional graceful degradation
+    "DTZ001",   # datetime() without tzinfo — test fixtures use naive datetimes
+    "DTZ003",   # utcnow() — legacy pattern, not user-facing
+    "DTZ005",   # datetime.now() without tz — test fixtures
+    "DTZ007",   # strptime without %z — test fixtures parsing known formats
+    "S112",     # try-except-continue in collector scan loops is intentional
+    "PERF402",  # list copy style preference
+    "RUF012",   # mutable class default in test dataclass
+]

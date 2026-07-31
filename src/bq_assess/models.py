@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Optional
 
 # ---- Enums -----------------------------------------------------------------
 
@@ -60,6 +59,23 @@ class ConfidenceSource(Enum):
     SAFE_DEFAULT = "safe_default"
 
 
+class TargetEngine(str, Enum):
+    """Recommended Query Engine target — typo-proof string enum (Fix 7).
+
+    The string values stay identical to the existing JSON/JS contract so
+    downstream consumers (report JS, JSON schema) are unaffected.
+    """
+    ATHENA = "athena"
+    REDSHIFT = "redshift"
+
+
+class StorageTarget(str, Enum):
+    """Per-entity Storage Target (ADR-0005). Iceberg is the default; RMS is the
+    hot-tier exception, only reachable when Redshift is the primary Query Engine."""
+    ICEBERG = "iceberg"             # S3 Tables (open, multi-engine) — default
+    RMS = "rms"                     # Redshift Managed Storage (native, engine-local)
+
+
 class BQPricingModel(Enum):
     ON_DEMAND = "ON_DEMAND"         # bytes scanned
     CAPACITY = "CAPACITY"           # slot reservations / Editions
@@ -74,7 +90,7 @@ class ColumnSchema:
     name: str
     field_type: str                 # BigQuery type name
     mode: str                       # NULLABLE | REQUIRED | REPEATED
-    fields: list["ColumnSchema"] = field(default_factory=list)  # nested STRUCT/RECORD
+    fields: list[ColumnSchema] = field(default_factory=list)  # nested STRUCT/RECORD
 
 
 @dataclass
@@ -177,10 +193,11 @@ class ComplexityResult:             # R11
 
 
 @dataclass
-class TranslationResult:            # Best-effort BQ→Redshift SQL translation
-    redshift_sql: str               # translated SQL (or original + comment if failed)
+class TranslationResult:            # Best-effort BQ→target-engine SQL translation
+    redshift_sql: str               # translated SQL — field name kept for JSON schema compat; holds recommended engine's SQL
     confidence: str                 # "HIGH" | "MEDIUM" (auto-converted, verify semantics) | "LOW"
     warnings: list[str]             # e.g. ["JavaScript UDF requires manual rewrite"]
+    target_engine: str = "redshift"  # "redshift" | "athena" — which engine dialect this translation targets
 
 
 @dataclass
@@ -189,6 +206,15 @@ class PlacementRecommendation:      # R14
     signals: list[str]
     confidence: ConfidenceLevel
     refresh_unverified: bool        # True for Iceberg-MV until V7 confirmed
+
+
+@dataclass
+class StoragePlacement:             # ADR-0005 — Tables only
+    target: StorageTarget           # ICEBERG (default) | RMS (hot-tier exception)
+    signals: list[str]              # why — each traceable to a doc-verified trade-off
+    confidence: ConfidenceLevel
+    redshift_ddl: str | None = None  # native CREATE TABLE for RMS entities; None for Iceberg
+    redshift_load: list[str] | None = None  # phase-2 statements (Redshift) for RMS entities
 
 
 # ---- Cost ------------------------------------------------------------------
@@ -207,6 +233,9 @@ class PricingDetection:             # R16 — what PricingDetector.detect() retu
     max_slots: int | None = None
     commitment_slots: int | None = None
     commitment_plan: str | None = None      # "FLEX" | "MONTHLY" | "ANNUAL" | "THREE_YEAR"
+    reservation_id: str | None = None       # "project:location.name" from JOBS — lets the
+                                            # collector's auto-read reuse detection's rows
+                                            # instead of re-querying INFORMATION_SCHEMA
 
 
 @dataclass
@@ -240,6 +269,12 @@ class CostLine:
     monthly_high: float | None
     confidence: ConfidenceLevel
     source_note: str                # pricing-constant provenance + date (R18.7; V1–V4)
+    # When set, totals (aws_monthly_low/high, scenario totals) use THIS value on
+    # both bounds while monthly_low/high remain the displayed range. Used by the
+    # Intelligent-Tiering storage line (2026-07-31): the comparison prices the
+    # customer's observed access pattern; the breakdown still shows the month-1
+    # transition bound. None = totals derive from monthly/low/high as before.
+    headline: float | None = None
 
 
 @dataclass
@@ -322,6 +357,11 @@ class CostComparison:               # R18
     # Pricing mechanics a reader needs to reconcile the figure against a real bill
     # (30-day-month normalization, unknown-region rate fallback caveat).
     pricing_notes: list[str] = field(default_factory=list)
+    # S3 Tables Intelligent-Tiering derivation rows for the report's storage table
+    # (2026-07-31). Rows: frequent / infrequent / archive / monitoring / total, each
+    # {"tier", "label", "tables", "gb", "rate", "rate_note", "monthly"}. Empty when
+    # the estate has no cold bytes (storage line stays a point — nothing to derive).
+    storage_tier_breakdown: list[dict] = field(default_factory=list)
     # The assumptions most likely to move the AWS figure — each bullet names the
     # uncertainty AND how to validate it (pilot workload / SYS_SERVERLESS_USAGE).
     key_uncertainties: list[str] = field(default_factory=list)
@@ -363,6 +403,7 @@ class EntityReport:
     translated_sql: TranslationResult | None = None
     placement: PlacementRecommendation | None = None
     physical_bytes: int | None = None  # measured physical storage; None = not available/measured
+    storage_placement: StoragePlacement | None = None  # ADR-0005; None for non-tables / Athena-primary
 
 
 @dataclass
@@ -374,6 +415,10 @@ class AssessmentSummary:
     complexity_counts: dict[str, int]   # {"PORTABLE": n, "ADAPT": n, "REWRITE": n}
     sql_surface_confidence: ConfidenceLevel
     total_logical_size_gb: float = 0.0  # BigQuery logical size (what the customer's console shows)
+    # Construct classes (R10.3) detected in the collected query-log workload (the
+    # __ad_hoc__ SQL-surface bucket) — SQL not owned by any defined entity, e.g.
+    # application/BI queries. Empty when no logs were collected or none matched.
+    workload_constructs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -386,7 +431,8 @@ class Assessment:
     entities: list[EntityReport]
     failures: list[FailureRecord]
     engine_recommendation: EngineRecommendation | None = None
-    migration_plans: Dict[str, MigrationDML] | None = None
+    migration_plans: dict[str, MigrationDML] | None = None
+    source_db_setup: list[str] | None = None
 
 
 # ---- Engine layer (Phase 9 — Athena addition) -----------------------------
@@ -416,7 +462,7 @@ class SignalContribution:
 class EngineRecommendation:
     primary_engine: str  # "athena" | "redshift"
     confidence: float
-    reasoning: List[SignalContribution]
+    reasoning: list[SignalContribution]
     crossover_point_tb_day: Decimal
     override_reason: str | None
 
@@ -426,17 +472,17 @@ class EngineRewrite:
     engine_id: str
     translated_sql: str
     confidence: str  # "HIGH" | "MEDIUM" | "LOW"
-    warnings: List[str]
-    unsupported_constructs: List[str]
+    warnings: list[str]
+    unsupported_constructs: list[str]
 
 
 @dataclass
 class EnginePlacement:
     engine_id: str
     home: str
-    signals: List[str]
+    signals: list[str]
     confidence: str
-    gaps: List[str]
+    gaps: list[str]
 
 
 @dataclass
@@ -462,9 +508,9 @@ class PostMigrationStep:
 @dataclass
 class MigrationDML:
     table: str
-    statements: List[str]
-    shortcomings: List[MigrationShortcoming]
-    post_optimization: List[PostMigrationStep]
+    statements: list[str]
+    shortcomings: list[MigrationShortcoming]
+    post_optimization: list[PostMigrationStep]
     estimated_scan_bytes: int | None
 
 
@@ -472,10 +518,10 @@ class MigrationDML:
 class EngineConfig:
     target_region: str
     query_sla_ms: int
-    preferred_engine: Optional[str]
+    preferred_engine: str | None
     chunk_days: int
     post_optimization: bool
     compaction_threshold_gb: float
-    peak_concurrency_override: Optional[int]
-    idle_hours_override: Optional[float]
-    source: Dict[str, str]  # field → "cli" | "yaml" | "prompt" | "inferred"
+    peak_concurrency_override: int | None
+    idle_hours_override: float | None
+    source: dict[str, str]  # field → "cli" | "yaml" | "prompt" | "inferred"

@@ -13,7 +13,11 @@ from bq_assess.models import (
     SlotUtilization,
 )
 
-SCHEMA_VERSION = 1
+# v2 (2026-07-28): multi-region collection — manifest gains "regions" (all dataset
+# locations found); bq_location becomes the PRIMARY region (most datasets). The
+# loader accepts v1 bundles (regions defaults to [bq_location]).
+SCHEMA_VERSION = 2
+COMPATIBLE_SCHEMA_VERSIONS = frozenset({1, 2})
 
 
 def sha256_file(path: str | Path) -> str:
@@ -40,7 +44,7 @@ class QueryRecord:
 class Bundle:
     """The complete hand-off artifact between collector and report generator."""
     project_id: str
-    bq_location: str
+    bq_location: str                # PRIMARY region (most datasets) — pricing anchor
     aws_region: str
     entities: list[EntityMetadata]
     failures: list[FailureRecord] = field(default_factory=list)
@@ -51,3 +55,13 @@ class Bundle:
     storage_basis: str = "assumed"  # measured | mixed | assumed (from StorageStats.basis)
     collector_version: str = ""
     created_at: str = ""
+    regions: list[str] = field(default_factory=list)  # ALL dataset locations (v2)
+
+    def __post_init__(self) -> None:
+        # Single home for the v1-compat rule: regions is NEVER empty — a legacy
+        # bundle (or in-memory construction) defaults to [bq_location]. Enforced
+        # here so writer/loader/report consumers read bundle.regions directly
+        # instead of re-deriving the fallback (2026-07-28 review: three sites
+        # each had their own copy, already divergent).
+        if not self.regions:
+            self.regions = [self.bq_location]

@@ -6,8 +6,8 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
-from bq_assess.models import Assessment, EntityPopulation
 from bq_assess.engine.redshift import cost_constants as k
+from bq_assess.models import Assessment, EntityPopulation
 
 
 def _to_dict(obj):
@@ -87,6 +87,7 @@ def serialize_landing(assessment: Assessment) -> dict:
         "failures": _to_dict(assessment.failures),
         "engine_recommendation": _to_dict(assessment.engine_recommendation),
         "migration_plans": migration_summary,
+        "source_db_setup": assessment.source_db_setup,
     }
     return result
 
@@ -129,15 +130,28 @@ def serialize_entities(assessment: Assessment) -> tuple[list[dict], list[dict]]:
 # the embedded JSON (and thus the report file) small at warehouse scale. The template's
 # JS renderer and these allowlists are pinned together by
 # tests/unit/test_report_serialize.py::test_report_rows_cover_template_accesses.
+#
+# Heavy detail-only fields (conversion DDL, migration DML, translated SQL) are NOT in
+# the row allowlists: they ship in separate per-chunk JSON script tags that the browser
+# leaves unparsed until a row is expanded (`detail_chunk` is the row's chunk index).
+# The main report-data blob must stay JSON.parse-able at page load for 100k+ entities.
 _EFFORT_ROW_KEYS = (
     "full_name", "entity_type", "population", "rows",
     "logical_size_gb", "physical_size_gb",
-    "effort", "conversion", "migration_plan",
+    "effort", "storage_placement", "detail_chunk",
 )
 _QUERY_ROW_KEYS = (
     "full_name", "entity_type", "population",
-    "complexity", "depends_on", "rewrite_guidance", "translated_sql", "placement",
+    "complexity", "depends_on", "rewrite_guidance", "placement", "detail_chunk",
+    "has_translated_sql",  # row-level flag; the SQL itself lives in the detail chunk
 )
+
+# Heavy per-entity fields moved out of the row payload into lazy detail chunks.
+_DETAIL_KEYS = ("conversion", "migration_plan", "translated_sql")
+
+# Entities per detail chunk: ~4 KB/entity of DDL+DML keeps each chunk's one-time
+# JSON.parse (on first expand of a row in that chunk) around 2 MB / tens of ms.
+DETAIL_CHUNK_SIZE = 500
 
 # Nested fields the renderer never reads. `complexity.constructs` matters most: it
 # carries per-construct anonymized SQL snippets, which at query-log scale dominate
@@ -146,6 +160,9 @@ _NESTED_DROP_KEYS = {
     "complexity": ("constructs",),
     "placement": ("refresh_unverified",),
     "conversion": ("success",),
+    # DDL + load statements live in migration/redshift_phase.sql (the canonical,
+    # runnable copy) — the report renders only target + signals.
+    "storage_placement": ("redshift_ddl", "redshift_load"),
 }
 
 
@@ -167,21 +184,70 @@ def _project_row(d: dict, keys: tuple[str, ...]) -> dict:
     return row
 
 
-def build_report_rows(effort_entities: list[dict], query_entities: list[dict]) -> dict:
+def build_report_rows(
+    effort_entities: list[dict], query_entities: list[dict],
+) -> tuple[dict, list[dict]]:
     """Project serialized entity dicts down to the HTML report's table payload.
 
     Rows without a score are dropped here, mirroring the former template-side
     ``{% if e.effort %}`` / ``{% if e.complexity %}`` guards.
+
+    Returns ``(rows, detail_chunks)``. Heavy fields (Iceberg DDL, load DML,
+    translated SQL) are split into ``detail_chunks`` — lists of
+    ``{full_name: {conversion, migration_plan, translated_sql}}`` dicts of
+    ``DETAIL_CHUNK_SIZE`` entities each. The template embeds each chunk as its own
+    inert JSON script tag; the JS parses a chunk only when a row in it is first
+    expanded. Keeping them out of ``rows`` keeps the page-load ``JSON.parse``
+    proportional to entity count, not DDL volume (a 50k-table estate: 219 MB of
+    load-time JSON with DDL inline vs 46 MB without — the chunks stay unparsed).
     """
-    return {
+    detail_chunks: list[dict] = []
+    chunk_of: dict[str, int] = {}
+    current: dict[str, dict] = {}
+    for d in query_entities:  # superset: includes every effort entity
+        heavy = {}
+        for key in _DETAIL_KEYS:
+            value = d.get(key)
+            if value is None:
+                continue
+            drop = _NESTED_DROP_KEYS.get(key)
+            if drop and isinstance(value, dict):
+                value = {k: v for k, v in value.items() if k not in drop}
+            heavy[key] = value
+        if not heavy:
+            continue
+        if len(current) >= DETAIL_CHUNK_SIZE:
+            detail_chunks.append(current)
+            current = {}
+        current[d["full_name"]] = heavy
+        chunk_of[d["full_name"]] = len(detail_chunks)
+    if current:
+        detail_chunks.append(current)
+
+    def _effort_row(d: dict) -> dict:
+        row = _project_row(d, _EFFORT_ROW_KEYS)
+        chunk = chunk_of.get(d["full_name"])
+        if chunk is not None:
+            row["detail_chunk"] = chunk
+        return row
+
+    def _query_row(d: dict) -> dict:
+        row = _project_row(d, _QUERY_ROW_KEYS)
+        chunk = chunk_of.get(d["full_name"])
+        if chunk is not None:
+            row["detail_chunk"] = chunk
+        if d.get("translated_sql") is not None:
+            row["has_translated_sql"] = True
+        return row
+
+    rows = {
         "effort": [
-            _project_row(d, _EFFORT_ROW_KEYS)
-            for d in effort_entities if d.get("effort")
+            _effort_row(d) for d in effort_entities if d.get("effort")
         ],
         "query": [
-            _project_row(d, _QUERY_ROW_KEYS)
-            for d in query_entities if d.get("complexity")
+            _query_row(d) for d in query_entities if d.get("complexity")
         ],
     }
+    return rows, detail_chunks
 
 

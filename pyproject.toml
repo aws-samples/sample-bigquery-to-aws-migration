@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bq-assess"
-version = "0.3.5"
+version = "0.6.0"
 description = "Read-only BigQuery migration assessment CLI: profiles a Source and assesses migrating it to an AWS lakehouse (S3 Tables / Apache Iceberg storage, Amazon Redshift Serverless query engine)."
 readme = "README.md"
 license = "Apache-2.0"

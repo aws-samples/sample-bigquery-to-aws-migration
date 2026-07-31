@@ -13,16 +13,14 @@ from datetime import datetime, timezone
 import hypothesis.strategies as st
 from hypothesis import HealthCheck, given, settings
 
+from bq_assess.core.relationships import RelationshipInferrer
 from bq_assess.models import (
-    EntityType,
-    EntityPopulation,
     ColumnSchema,
     ConfidenceLevel,
     EntityMetadata,
+    EntityPopulation,
+    EntityType,
 )
-from bq_assess.core.relationships import RelationshipInferrer
-
-
 
 # ---------------------------------------------------------------------------
 # Strategies

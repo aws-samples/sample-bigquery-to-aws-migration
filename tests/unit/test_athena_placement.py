@@ -15,24 +15,24 @@ from bq_assess.models import (
 
 
 def _entity(entity_type: EntityType, population: EntityPopulation, **kwargs) -> EntityMetadata:
-    defaults = dict(
-        entity_id="test",
-        dataset_id="ds",
-        full_name="ds.test",
-        entity_type=entity_type,
-        population=population,
-        num_rows=0,
-        num_bytes=0,
-        columns=[],
-        time_partitioning=None,
-        range_partitioning=None,
-        clustering_fields=None,
-        view_query=None,
-        mview_query=None,
-        routine=None,
-        depends_on=[],
-        last_modified=datetime.now(timezone.utc),
-    )
+    defaults = {
+        "entity_id": "test",
+        "dataset_id": "ds",
+        "full_name": "ds.test",
+        "entity_type": entity_type,
+        "population": population,
+        "num_rows": 0,
+        "num_bytes": 0,
+        "columns": [],
+        "time_partitioning": None,
+        "range_partitioning": None,
+        "clustering_fields": None,
+        "view_query": None,
+        "mview_query": None,
+        "routine": None,
+        "depends_on": [],
+        "last_modified": datetime.now(timezone.utc),
+    }
     defaults.update(kwargs)
     return EntityMetadata(**defaults)
 
@@ -60,6 +60,19 @@ def test_mv_flagged_as_unsupported(advisor):
     result = advisor.recommend(entity)
     assert result is not None
     assert any("cannot create" in g.lower() or "unsupported" in g.lower() for g in result.gaps)
+
+
+def test_mv_gap_note_names_glue_path_and_rewrite_limitation(advisor):
+    """Gap analysis 2026-07-22 item 3.1: the MV note must name the doc-supported
+    creation path (Glue 5.1 under Lake Formation) and the no-auto-rewrite limitation,
+    not just say 'cannot create MVs'."""
+    entity = _entity(EntityType.MATERIALIZED_VIEW, EntityPopulation.REBUILT, mview_query="SELECT 1")
+    result = advisor.recommend(entity)
+    gap_text = " ".join(result.gaps).lower()
+    assert "glue 5.1" in gap_text
+    assert "lake formation" in gap_text
+    assert "without automatic" in gap_text or "no automatic query rewrite" in gap_text
+    assert "s3 access" in gap_text  # LF credential vending is insufficient for MV DDL
 
 
 def test_js_udf_flagged(advisor):

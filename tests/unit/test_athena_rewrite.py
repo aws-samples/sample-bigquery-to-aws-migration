@@ -39,9 +39,10 @@ def test_merge_produces_warning_not_blocker(guide):
         assert any("parse" in w.lower() or "translation failed" in w.lower() for w in result.warnings)
 
 
-def test_struct_constructor_flagged(guide):
+def test_struct_constructor_translated(guide):
     result = guide.translate("SELECT STRUCT(1 AS a, 'b' AS b)")
-    assert any("STRUCT" in w or "ROW" in w for w in result.warnings + result.unsupported_constructs)
+    assert "ROW" in result.translated_sql
+    assert result.confidence in ("HIGH", "MEDIUM")
 
 
 def test_geography_flagged(guide):
@@ -60,3 +61,32 @@ def test_qualify_rewritten(guide):
     sql = "SELECT * FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) = 1"
     result = guide.translate(sql)
     assert "QUALIFY" not in result.translated_sql
+
+
+def test_procedural_script_is_blocker_not_high(guide):
+    """BQ scripting (BEGIN/DECLARE) can never run on Athena — must be LOW with a
+    BLOCKER, never HIGH (2026-07-30 live-verification finding #3)."""
+    sql = "BEGIN DECLARE d DATE DEFAULT CURRENT_DATE(); SET d = CURRENT_DATE(); END"
+    result = guide.translate(sql)
+    assert result.confidence == "LOW"
+    assert any("procedural script" in u for u in result.unsupported_constructs)
+
+
+def test_reserved_word_user_gets_quoted(guide):
+    """`user` is reserved in Trino/Athena — struct-path references must be quoted
+    (finding #5)."""
+    result = guide.translate("SELECT e.user.user_id FROM ds.events AS e")
+    assert 'e."user".user_id' in result.translated_sql
+    assert any("reserved" in w for w in result.warnings)
+
+
+def test_ignore_nulls_distinct_filter_is_valid(guide):
+    """ARRAY_AGG(DISTINCT x IGNORE NULLS): the FILTER predicate must not carry the
+    DISTINCT keyword (finding #6 — `WHERE DISTINCT x` is a syntax error)."""
+    result = guide.translate(
+        "SELECT ARRAY_AGG(DISTINCT e.event_type IGNORE NULLS) FROM ds.events AS e"
+    )
+    assert "WHERE DISTINCT" not in result.translated_sql
+    assert "FILTER (WHERE e.event_type IS NOT NULL)" in result.translated_sql
+    # the aggregate itself keeps DISTINCT
+    assert "ARRAY_AGG(DISTINCT e.event_type)" in result.translated_sql

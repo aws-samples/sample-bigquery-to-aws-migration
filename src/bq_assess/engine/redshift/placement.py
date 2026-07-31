@@ -58,8 +58,8 @@ class PlacementAdvisor:
         if multi_domain:
             home = "ICEBERG_CATALOG"
             signals = [
-                f"spans {len(distinct_datasets)} datasets — open multi-engine access favors "
-                "the Iceberg catalog"
+                (f"spans {len(distinct_datasets)} datasets — open multi-engine access favors "
+                "the Iceberg catalog")
             ]
         else:
             home = "REDSHIFT"

@@ -162,17 +162,23 @@ def test_p9_clean_types_produce_valid_ddl(entity: m.EntityMetadata):
         assert col.name in result.ddl
     # No lossy casts for clean-only tables
     assert result.lossy_casts == []
-    # DDL is executable on Athena: mandatory clauses present
+    # DDL is executable on Athena: mandatory clauses present. No LOCATION —
+    # the S3 Tables target owns the warehouse path (clause omitted by design).
     assert "TBLPROPERTIES ('table_type'='ICEBERG')" in result.ddl
-    assert "LOCATION '" in result.ddl
-    # Constraints are never emitted — REQUIRED-ness rides as a comment
+    assert "LOCATION" not in result.ddl
+    # Constraints are never emitted — REQUIRED-ness rides in the header
+    # comment block above CREATE (inline column comments break DDL on
+    # federated catalogs), and column-list lines stay comment-free.
     assert "NOT NULL" not in result.ddl
+    header = result.ddl[: result.ddl.index("CREATE TABLE")]
+    body = result.ddl[result.ddl.index("CREATE TABLE"):]
     for col in entity.columns:
         if col.mode == "REQUIRED":
-            for line in result.ddl.split("\n"):
-                if line.strip().startswith(col.name) or f" {col.name} " in line:
-                    assert "-- REQUIRED in BigQuery" in line
-                    break
+            assert f"{col.name}: REQUIRED in BigQuery" in header
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("--"):
+            assert "--" not in line
 
 
 # =============================================================================

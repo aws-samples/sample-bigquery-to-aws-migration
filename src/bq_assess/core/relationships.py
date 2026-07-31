@@ -210,7 +210,7 @@ class RelationshipInferrer:
         """Extract relationships from query log join patterns."""
         relationships: list[InferredRelationship] = []
 
-        for _table, patterns in query_analysis.join_patterns.items():
+        for patterns in query_analysis.join_patterns.values():
             for jp in patterns:
                 relationships.append(
                     InferredRelationship(

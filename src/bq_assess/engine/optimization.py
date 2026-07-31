@@ -1,11 +1,17 @@
-"""Post-migration optimization steps — sort, compact, partition evolution.
+"""Post-migration optimization steps for S3 Tables targets.
 
-Emitted per-table when the BQ source has characteristics that Athena's INSERT
-cannot replicate (clustering → sort order, many small files → compaction).
+S3 Tables runs compaction and snapshot management as MANAGED maintenance
+(enabled by default; Athena's OPTIMIZE/VACUUM are unsupported on the
+s3tablescatalog and self-managed rewrites can conflict with the managed
+compactor). The only remaining per-table step is a one-time sort-order
+declaration: BigQuery clustering has no Athena-DDL equivalent, but once
+Spark sets the Iceberg sort order in table metadata, S3 Tables' default
+`auto` compaction strategy applies sort compaction continuously.
+(Verified against the S3 Tables maintenance docs, 2026-07-31.)
 """
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from bq_assess.models import EngineConfig, EntityMetadata, PostMigrationStep
 
@@ -13,17 +19,26 @@ _GB = 1024**3
 
 
 def iceberg_table_name(full_name: str) -> str:
-    """Convert BQ full_name (dataset.table) to Iceberg table identifier."""
-    return f"iceberg_db.{full_name.replace('.', '_')}"
+    """Convert BQ full_name (dataset.table) to Iceberg table identifier.
+
+    Uses the dataset as the namespace and the table as the table name,
+    matching the DDL convention (CREATE TABLE dataset.table_name).
+    """
+    parts = full_name.split(".", 1)
+    if len(parts) == 2:
+        return f"{parts[0]}.{parts[1]}"
+    return full_name
 
 
-def spark_sort_command(table: str, sort_cols: Sequence[str], catalog: str = "spark_catalog") -> str:
-    """Build Iceberg rewrite_data_files CALL for sorting."""
-    sort_order = ", ".join(f"{col} ASC NULLS LAST" for col in sort_cols)
-    return (
-        f"CALL {catalog}.system.rewrite_data_files("
-        f"table => '{table}', strategy => 'sort', sort_order => '{sort_order}')"
-    )
+def spark_sort_command(table: str, sort_cols: Sequence[str]) -> str:
+    """One-time Spark DDL that persists the sort order in Iceberg metadata.
+
+    S3 Tables' managed compaction reads the sort order from table metadata
+    (auto strategy -> sort compaction) — no recurring rewrite_data_files runs
+    are needed, and running them would race the managed compactor.
+    """
+    order = ", ".join(f"{col} ASC NULLS LAST" for col in sort_cols)
+    return f"ALTER TABLE {table} WRITE ORDERED BY ({order})"
 
 
 def generate_post_optimization(
@@ -32,7 +47,8 @@ def generate_post_optimization(
     steps: list[PostMigrationStep] = []
     table = entity.full_name
 
-    # Sort order (when BQ has clustering)
+    # Sort order (when BQ has clustering): one-time metadata change via Spark
+    # (EMR/Glue — Athena rejects custom TBLPROPERTIES so it cannot set this).
     if entity.clustering_fields:
         table_iceberg = iceberg_table_name(table)
         size_gb = entity.num_bytes / _GB
@@ -42,29 +58,12 @@ def generate_post_optimization(
             step_type="sort",
             command=spark_sort_command(table_iceberg, entity.clustering_fields),
             engine="spark_emr",
-            reason=f"BQ clustering on [{', '.join(entity.clustering_fields)}] has no Athena equivalent during INSERT",
+            reason=(
+                f"BQ clustering on [{', '.join(entity.clustering_fields)}] has no "
+                "Athena equivalent — set the Iceberg sort order once and S3 Tables "
+                "managed compaction keeps data sorted from then on"
+            ),
             priority=priority,
         ))
-
-    # Compaction (always — Athena INSERT creates many small files)
-    table_iceberg = iceberg_table_name(table)
-    steps.append(PostMigrationStep(
-        table=table,
-        step_type="compact",
-        command=f"OPTIMIZE {table_iceberg} REWRITE DATA USING BIN_PACK",
-        engine="athena",
-        reason="Post-load compaction reduces small-file overhead from chunked INSERTs",
-        priority="recommended",
-    ))
-
-    # Vacuum (expire snapshots and remove orphan files after compaction)
-    steps.append(PostMigrationStep(
-        table=table,
-        step_type="vacuum",
-        command=f"VACUUM {table_iceberg}",
-        engine="athena",
-        reason="Expire snapshots and remove orphan files left by DML and compaction (OPTIMIZE does not do this); billed via S3 API requests",
-        priority="recommended",
-    ))
 
     return steps

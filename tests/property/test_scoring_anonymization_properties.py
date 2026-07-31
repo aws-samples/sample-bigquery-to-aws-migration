@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 
 import hypothesis.strategies as st
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 
 from bq_assess.core.sql_surface import SQLSurfaceAnalyzer
 from bq_assess.models import (
@@ -29,9 +29,7 @@ from bq_assess.models import (
 )
 from bq_assess.scoring.complexity import ComplexityScorer
 from bq_assess.scoring.effort import EffortScorer
-
 from tests.conftest import entity_metadata
-
 
 # ---------------------------------------------------------------------------
 # P13: Migration Effort is Tables-only and additive — R9.1-R9.5
@@ -150,6 +148,11 @@ def test_p14_complexity_never_fails_on_missing_input(entity):
 @st.composite
 def _sql_with_literals(draw: st.DrawFn) -> tuple[str, str, str]:
     str_val = draw(st.text(alphabet=st.characters(whitelist_categories=("L",)), min_size=3, max_size=12))
+    # A generated value equal to one of the template's own tokens (e.g. 'name')
+    # survives as the IDENTIFIER after the literal is stripped — a false
+    # positive the word-boundary check can't distinguish (found by a fresh
+    # Hypothesis database drawing 'name', 2026-07-30).
+    assume(str_val not in {"SELECT", "FROM", "WHERE", "AND", "t", "name", "amount"})
     num_val = str(draw(st.integers(min_value=1000, max_value=999999)))
     sql = f"SELECT * FROM t WHERE name = '{str_val}' AND amount = {num_val}"
     return sql, str_val, num_val

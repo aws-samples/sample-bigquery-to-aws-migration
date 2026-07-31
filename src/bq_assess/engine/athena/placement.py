@@ -6,8 +6,6 @@ stored procedures. UDFs require AWS Lambda invoked via USING EXTERNAL FUNCTION.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 from bq_assess.models import (
     EnginePlacement,
     EntityMetadata,
@@ -23,7 +21,7 @@ class AthenaPlacementAdvisor:
 
     def recommend(
         self, entity: EntityMetadata, has_logs: bool = False
-    ) -> Optional[EnginePlacement]:
+    ) -> EnginePlacement | None:
         if entity.population == EntityPopulation.TABLE:
             return None
 
@@ -52,7 +50,11 @@ class AthenaPlacementAdvisor:
             signals=["Athena cannot CREATE MATERIALIZED VIEW (parse-level rejection)"],
             confidence="HIGH",
             gaps=[
-                "Cannot create MVs in Athena — use Spark/Glue to create, Athena can read as Iceberg table"
+                ("Athena SQL cannot CREATE materialized views. Create via Glue 5.1 Spark "
+                "(the doc-supported path under Lake Formation governance; the definer role "
+                "needs direct S3 access alongside LF grants) with managed auto-refresh; "
+                "Athena SQL can then query the MV as an Iceberg table — without automatic "
+                "query rewrite, so queries must reference the MV by name")
             ],
         )
 

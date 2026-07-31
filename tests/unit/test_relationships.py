@@ -9,8 +9,13 @@ from datetime import datetime, timezone
 
 from bq_assess.core.analyzer import JoinPattern, QueryAnalysis
 from bq_assess.core.relationships import RelationshipInferrer
-from bq_assess.models import ColumnSchema, ConfidenceLevel, EntityMetadata, EntityType, EntityPopulation
-
+from bq_assess.models import (
+    ColumnSchema,
+    ConfidenceLevel,
+    EntityMetadata,
+    EntityPopulation,
+    EntityType,
+)
 
 # ---------------------------------------------------------------------------
 # Helper

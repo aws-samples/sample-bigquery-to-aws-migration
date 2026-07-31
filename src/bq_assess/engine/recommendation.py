@@ -12,7 +12,6 @@ latency consistency.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import List
 
 from bq_assess.models import (
     EngineConfig,
@@ -126,8 +125,8 @@ class RecommendationScorer:
 
     def _score_signals(
         self, profile: WorkloadProfile, config: EngineConfig
-    ) -> List[SignalContribution]:
-        contributions: List[SignalContribution] = []
+    ) -> list[SignalContribution]:
+        contributions: list[SignalContribution] = []
         crossover = float(self._crossover(config.target_region))
 
         # Check if SLA warmth caveat is active (sub-3s SLA + idle cluster)

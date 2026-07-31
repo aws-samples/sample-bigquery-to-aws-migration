@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -139,6 +140,13 @@ def _normalize(assessment) -> dict:
     return d
 
 
+def _find_project_dir(base: Path, project_id: str) -> Path:
+    """Find the dated project folder (e.g. fixture-project_2026-07-22)."""
+    matches = list(base.glob(f"{project_id}_*"))
+    assert matches, f"no project dir matching {project_id}_* in {base}"
+    return matches[0]
+
+
 @pytest.fixture()
 def report_params(tmp_path):
     def _params(subdir: str) -> dict:
@@ -146,7 +154,7 @@ def report_params(tmp_path):
         out.mkdir()
         return {
             "output": str(out),
-            "format": "json,html",
+            "format": "html",
             "export_bundle": False,
             "skip_translation": True,  # deterministic + fast
         }
@@ -171,32 +179,33 @@ class TestBundleRoundTripEquivalence:
         params["export_bundle"] = True
         direct = analyze_and_report(_fixture_bundle(), params)
 
-        emitted = str(tmp_path / "assess-run" / "bundle")
+        project_dir = _find_project_dir(tmp_path / "assess-run", "fixture-project")
+        emitted = str(project_dir / "bundle")
         loaded = BundleLoader().load(emitted)
         rerun = analyze_and_report(loaded, report_params("rerun"))
 
         assert _normalize(direct) == _normalize(rerun)
 
     def test_report_outputs_written(self, tmp_path, report_params) -> None:
-        """The report side writes HTML + 3 JSON files from a loaded bundle."""
+        """The report side writes HTML into <project>_<date>/report/."""
         bundle_dir = BundleWriter().write(_fixture_bundle(), str(tmp_path / "b"))
         loaded = BundleLoader().load(bundle_dir)
         params = report_params("out")
         analyze_and_report(loaded, params)
 
-        out = tmp_path / "out"
-        files = {p.name for p in out.iterdir()}
+        project_dir = _find_project_dir(tmp_path / "out", "fixture-project")
+        report_dir = project_dir / "report"
+        files = {p.name for p in report_dir.iterdir()}
         assert any(f.endswith("-assessment.html") for f in files)
-        assert any(f.startswith("assessment-landing-") for f in files)
-        assert any(f.startswith("assessment-effort-") for f in files)
-        assert any(f.startswith("assessment-query-") for f in files)
 
     def test_html_report_carries_disclaimer(self, tmp_path, report_params) -> None:
         """Spec test 6: the HTML footer contains the beta/legal block."""
         params = report_params("disc")
         analyze_and_report(_fixture_bundle(), params)
 
-        html_files = list((tmp_path / "disc").glob("*-assessment.html"))
+        project_dir = _find_project_dir(tmp_path / "disc", "fixture-project")
+        report_dir = project_dir / "report"
+        html_files = list(report_dir.glob("*-assessment.html"))
         assert html_files, "no HTML report written"
         html = html_files[0].read_text(encoding="utf-8")
         assert "Beta &amp; Disclaimer Notice" in html

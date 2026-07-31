@@ -126,8 +126,8 @@ def test_p3_dataset_filter_scoping(all_datasets: list[str], filter_ratio: float)
 
     table_items = {d: _make_table_list_item(d, f"t_{d}") for d in all_datasets}
     table_objects = {id(tli.reference): _make_table(d, f"t_{d}") for d, tli in table_items.items()}
-    client.list_tables.side_effect = lambda ds: [table_items[ds]] if ds in table_items else []
-    client.get_table.side_effect = lambda ref: table_objects[id(ref)]
+    client.list_tables.side_effect = lambda ds, **kw: [table_items[ds]] if ds in table_items else []
+    client.get_table.side_effect = lambda ref, **kw: table_objects[id(ref)]
 
     n_filter = max(1, int(len(all_datasets) * filter_ratio))
     dataset_filter = all_datasets[:n_filter]
@@ -291,8 +291,12 @@ def test_p27_retry_then_succeeds(mock_sleep, status_code, failures_before_succes
 @settings(max_examples=50)
 @given(status_code=st.sampled_from([429, 500, 503]))
 @patch("bq_assess.core.scanner.time.sleep")
-def test_p27_retry_caps_at_3_then_raises(mock_sleep, status_code):
-    """A persistently failing transient error raises after exactly 3 retries (4 attempts)."""
+def test_p27_retry_caps_then_raises(mock_sleep, status_code):
+    """A persistently failing transient error raises after the code's retry budget:
+    3 retries for 500/503, 8 for 429 (throttling is recoverable backpressure —
+    deeper ladder added in the 2026-07-27 scale review)."""
+    from bq_assess.core.scanner import RETRY_CONFIG
+
     err = GoogleAPICallError(f"persistent {status_code}")
     err.code = status_code
 
@@ -303,10 +307,15 @@ def test_p27_retry_caps_at_3_then_raises(mock_sleep, status_code):
         calls += 1
         raise err
 
+    budget = (
+        RETRY_CONFIG["max_retries_throttled"]
+        if status_code == 429
+        else RETRY_CONFIG["max_retries"]
+    )
     with pytest.raises(GoogleAPICallError):
         _retry(fn)
-    assert calls == 4  # 1 initial + 3 retries
-    assert mock_sleep.call_count == 3
+    assert calls == budget + 1  # 1 initial + budget retries
+    assert mock_sleep.call_count == budget
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +345,7 @@ def test_p28_pipeline_resilience(mock_sleep, n_tables, k_failures):
     err.code = 400  # non-retryable → immediate per-entity failure
     ref_to_idx = {id(it.reference): i for i, it in enumerate(items)}
 
-    def get_table(ref):
+    def get_table(ref, **kw):
         idx = ref_to_idx[id(ref)]
         if idx in fail_idx:
             raise err

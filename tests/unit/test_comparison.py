@@ -30,7 +30,6 @@ from bq_assess.models import (
     WorkloadProfile,
 )
 
-
 # ---- Fixtures ----
 
 
@@ -100,7 +99,7 @@ def _athena_estimate(monthly_compute: float = 5.0) -> EngineCostEstimate:
         engine_id="athena",
         monthly_total=Decimal(str(monthly_compute)),
         monthly_compute=Decimal(str(monthly_compute)),
-        monthly_storage=Decimal("0"),
+        monthly_storage=Decimal(0),
         pricing_mode="on_demand",
         confidence="MEDIUM",
         source_note="test athena",
@@ -433,7 +432,7 @@ class TestDeriveEstimateBasis:
             monthly_total=15.0,
             confidence=ConfidenceLevel.MEDIUM,
         )
-        level, text = _derive_estimate_basis(
+        _level, text = _derive_estimate_basis(
             [], athena_scenario, _low_volume_profile()
         )
         assert "Athena" in text
@@ -441,7 +440,7 @@ class TestDeriveEstimateBasis:
     def test_redshift_with_data(self):
         """Redshift scenario with workload data mentions Redshift."""
         rs_scenario = _serverless_scenario()
-        level, text = _derive_estimate_basis(
+        _level, text = _derive_estimate_basis(
             [], rs_scenario, _low_volume_profile()
         )
         assert "Redshift" in text

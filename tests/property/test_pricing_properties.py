@@ -94,7 +94,7 @@ def test_pricing_properties_auto_detection_is_honest(jobs: list[dict]) -> None:
         # No usable leaf signal → undeterminable → ON_DEMAND at LOW with a prompt.
         assert result.model is BQPricingModel.ON_DEMAND
         assert result.confidence is ConfidenceLevel.LOW
-        assert "--reservation-config" in result.source_note
+        assert "--bigquery-monthly-cost" in result.source_note
     else:
         assert result.model is BQPricingModel.ON_DEMAND
 

@@ -19,7 +19,6 @@ from google.cloud import bigquery
 from bq_assess.core.scanner import BigQueryScanner
 from bq_assess.models import EntityPopulation, EntityType
 
-
 # ---------------------------------------------------------------------------
 # Mock builders
 # ---------------------------------------------------------------------------
@@ -134,7 +133,7 @@ class TestRoutineScanning:
         err = GoogleAPICallError("boom")
         err.code = 400
 
-        def get_routine(ref):
+        def get_routine(ref, **kw):
             if ref is bad.reference:
                 raise err
             return _make_full_routine("good_fn")
@@ -169,7 +168,7 @@ class TestDatasetLevelFailures:
         err = GoogleAPICallError("dataset boom")
         err.code = 400
 
-        def list_tables(ds):
+        def list_tables(ds, **kw):
             if ds == "bad_ds":
                 raise err
             return [good_item]

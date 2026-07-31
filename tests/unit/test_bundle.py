@@ -21,19 +21,21 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from bq_assess.bundle import Bundle, BundleLoader, BundleWriter, SCHEMA_VERSION
+from bq_assess.bundle import SCHEMA_VERSION, Bundle, BundleLoader, BundleWriter
 from bq_assess.bundle.loader import BundleError
 from bq_assess.bundle.models import QueryRecord
 from bq_assess.core.disclaimer import FULL_DISCLAIMER
 from bq_assess.models import (
     BQPricingModel,
     ConfidenceLevel,
+    EntityMetadata,
+    EntityPopulation,
+    EntityType,
     FailureRecord,
     PricingDetection,
     SlotUtilization,
 )
 from tests.conftest import entity_metadata
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,27 +43,27 @@ from tests.conftest import entity_metadata
 
 
 def _make_bundle(entities, **overrides) -> Bundle:
-    defaults = dict(
-        project_id="test-project",
-        bq_location="australia-southeast1",
-        aws_region="ap-southeast-2",
-        entities=entities,
-        failures=[FailureRecord(entity_name="ds.broken", stage="scan", error="403")],
-        workload=SlotUtilization(
+    defaults = {
+        "project_id": "test-project",
+        "bq_location": "australia-southeast1",
+        "aws_region": "ap-southeast-2",
+        "entities": entities,
+        "failures": [FailureRecord(entity_name="ds.broken", stage="scan", error="403")],
+        "workload": SlotUtilization(
             avg_slots=10.0, p50_slots=8.0, p99_slots=40.0, peak_slots=55.0,
             active_hour_fraction=0.4, total_slot_ms=86_400_000, days_sampled=14,
             total_bytes_processed=5 * 10**12, total_bytes_billed=4 * 10**12,
             has_billed_bytes=True, total_queries=1200, lookback_days=30,
         ),
-        pricing=PricingDetection(
+        "pricing": PricingDetection(
             model=BQPricingModel.ON_DEMAND,
             confidence=ConfidenceLevel.HIGH,
             source_note="JOBS reservation_id NULL on all jobs (2026-07-08)",
         ),
-        rates={"aws": {"rpu_hour": 0.45}, "gcp": {}, "is_live": True,
+        "rates": {"aws": {"rpu_hour": 0.45}, "gcp": {}, "is_live": True,
                "staleness_warning": "", "aws_region": "ap-southeast-2",
                "bq_location": "australia-southeast1"},
-        queries=[
+        "queries": [
             QueryRecord(
                 query="SELECT a FROM ds.t WHERE x = '?'",
                 total_slot_ms=1234, total_bytes_processed=10**9,
@@ -75,10 +77,10 @@ def _make_bundle(entities, **overrides) -> Bundle:
                 creation_time=None,
             ),
         ],
-        storage_basis="measured",
-        collector_version="0.3.0",
-        created_at="2026-07-08T12:00:00+00:00",
-    )
+        "storage_basis": "measured",
+        "collector_version": "0.3.0",
+        "created_at": "2026-07-08T12:00:00+00:00",
+    }
     defaults.update(overrides)
     return Bundle(**defaults)
 
@@ -326,10 +328,29 @@ class TestZipIngestion:
 
 
 class TestSchemaVersion:
-    def test_schema_version_is_one(self) -> None:
+    def test_schema_version_is_two(self) -> None:
         """Bump SCHEMA_VERSION when the bundle shape changes — this test is the
-        tripwire reminding you the loader/writer must stay compatible."""
-        assert SCHEMA_VERSION == 1
+        tripwire reminding you the loader/writer must stay compatible.
+        v2 (2026-07-28): multi-region — manifest gains `regions`; v1 accepted."""
+        from bq_assess.bundle.models import COMPATIBLE_SCHEMA_VERSIONS
+        assert SCHEMA_VERSION == 2
+        assert 1 in COMPATIBLE_SCHEMA_VERSIONS  # v1 customer bundles must keep loading
+
+    def test_v1_manifest_loads(self, tmp_path) -> None:
+        """A bundle stamped schema_version=1 (pre-multi-region collector) loads;
+        regions defaults to [bq_location]."""
+        import json as _json
+
+        bundle = _make_bundle([])
+        out_dir = BundleWriter().write(bundle, str(tmp_path))
+        manifest_path = Path(out_dir) / "manifest.json"
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 1
+        manifest.pop("regions", None)
+        manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+
+        loaded = BundleLoader().load(out_dir)
+        assert loaded.regions == [loaded.bq_location]
 
 
 # ---------------------------------------------------------------------------
@@ -448,3 +469,130 @@ class TestTruncationProof:
         records, truncated = coll._queries_from_api(None, "p", 30, "US")
         assert truncated is False
         assert len(records) == QUERIES_EXPORT_LIMIT
+
+
+class TestQueriesFromApiMulti:
+    """Cross-region merge rules (2026-07-28 review of the multi-region MR)."""
+
+    @staticmethod
+    def _row(text: str, slot_ms: int = 100, billed: int | None = 10**9):
+        return {"query": text, "total_slot_ms": slot_ms,
+                "total_bytes_processed": 10**9, "total_bytes_billed": billed,
+                "missing_billed_jobs": 0, "statement_type": "SELECT",
+                "creation_time": None}
+
+    def test_same_statement_across_regions_merges_with_summed_stats(self, monkeypatch) -> None:
+        """A statement run in two regions yields ONE record with summed slot-ms —
+        split stats let heavy shared statements be evicted at the cap."""
+        from bq_assess import collector as coll
+
+        per_region = {
+            "US": [self._row("SELECT a FROM t WHERE x = ?", slot_ms=100)],
+            "EU": [self._row("SELECT a FROM t WHERE x = ?", slot_ms=250)],
+        }
+        monkeypatch.setattr(
+            coll, "read_jobs_queries",
+            lambda client, project, days, location, limit: per_region[location],
+        )
+        records, truncated, failed = coll._queries_from_api_multi(None, "p", 30, ["US", "EU"])
+        assert failed == []
+        assert truncated is False
+        assert len(records) == 1
+        assert records[0].total_slot_ms == 350
+        assert records[0].total_bytes_billed == 2 * 10**9
+
+    def test_failed_region_is_isolated_and_named(self, monkeypatch) -> None:
+        """One region raising must not discard the other regions' records."""
+        from bq_assess import collector as coll
+
+        def _read(client, project, days, location, limit):
+            if location == "EU":
+                raise RuntimeError("boom")
+            return [self._row("SELECT 1", slot_ms=5)]
+
+        monkeypatch.setattr(coll, "read_jobs_queries", _read)
+        records, _, failed = coll._queries_from_api_multi(None, "p", 30, ["US", "EU"])
+        assert failed == ["EU"]
+        assert records is not None and len(records) == 1
+
+    def test_mixed_billed_degrades_to_none(self, monkeypatch) -> None:
+        """Billed bytes stay all-or-nothing across the merged group."""
+        from bq_assess import collector as coll
+
+        per_region = {
+            "US": [self._row("SELECT b", billed=10**9)],
+            "EU": [self._row("SELECT b", billed=None)],
+        }
+        # missing_billed_jobs must be >0 for the None-billed row to carry None
+        per_region["EU"][0]["missing_billed_jobs"] = 1
+        monkeypatch.setattr(
+            coll, "read_jobs_queries",
+            lambda client, project, days, location, limit: per_region[location],
+        )
+        records, _, _ = coll._queries_from_api_multi(None, "p", 30, ["US", "EU"])
+        assert records[0].total_bytes_billed is None
+
+
+# ---------------------------------------------------------------------------
+# Assumed-ratio re-derivation on load (stale-bundle fix, 2026-07-23)
+# ---------------------------------------------------------------------------
+
+
+class TestAssumedRatioRederivation:
+    """storage_basis="assumed" bundles re-derive physical_bytes at the CURRENT
+    ASSUMED_PHYSICAL_RATIO on load — a ratio change must reach existing customer
+    bundles without recollection (the 0.75-baked / 0.50-labelled bug)."""
+
+    def _entity(self, num_bytes: int, physical_bytes: int | None):
+        from datetime import datetime, timezone
+        return EntityMetadata(
+            entity_id="t", dataset_id="ds", full_name="ds.t",
+            entity_type=EntityType.TABLE, population=EntityPopulation.TABLE,
+            num_rows=10, num_bytes=num_bytes, columns=[],
+            time_partitioning=None, range_partitioning=None,
+            clustering_fields=None, view_query=None, mview_query=None,
+            routine=None, depends_on=[],
+            last_modified=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            physical_bytes=physical_bytes,
+        )
+
+    def test_assumed_bundle_rederives_stale_ratio(self, tmp_path) -> None:
+        from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO
+        # Baked at the old 0.75 ratio, no assumed_physical_ratio manifest key
+        # (pre-0.3.3 collector) — loader must recompute at the current constant.
+        e = self._entity(num_bytes=1_000_000, physical_bytes=750_000)
+        bundle = _make_bundle([e], storage_basis="assumed")
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        # Simulate a pre-stamp manifest: remove the ratio key + re-hash is not
+        # needed (manifest itself is not hash-verified).
+        manifest_path = Path(bundle_dir) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["assumed_physical_ratio"]
+        manifest_path.write_text(json.dumps(manifest))
+
+        loaded = BundleLoader().load(bundle_dir)
+        assert loaded.entities[0].physical_bytes == round(1_000_000 * ASSUMED_PHYSICAL_RATIO)
+
+    def test_assumed_bundle_current_ratio_untouched(self, tmp_path) -> None:
+        from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO
+        baked = round(1_000_000 * ASSUMED_PHYSICAL_RATIO)
+        e = self._entity(num_bytes=1_000_000, physical_bytes=baked)
+        bundle = _make_bundle([e], storage_basis="assumed")
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        loaded = BundleLoader().load(bundle_dir)
+        assert loaded.entities[0].physical_bytes == baked
+
+    def test_measured_bundle_never_rederived(self, tmp_path) -> None:
+        # Measured bytes are real — a ratio change must NOT rewrite them.
+        e = self._entity(num_bytes=1_000_000, physical_bytes=123_456)
+        bundle = _make_bundle([e], storage_basis="measured")
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        loaded = BundleLoader().load(bundle_dir)
+        assert loaded.entities[0].physical_bytes == 123_456
+
+    def test_manifest_stamps_current_ratio(self, tmp_path) -> None:
+        from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO
+        bundle = _make_bundle([], storage_basis="assumed")
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        manifest = json.loads((Path(bundle_dir) / "manifest.json").read_text())
+        assert manifest["assumed_physical_ratio"] == ASSUMED_PHYSICAL_RATIO

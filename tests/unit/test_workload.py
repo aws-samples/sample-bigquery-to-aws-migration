@@ -39,9 +39,11 @@ class _FakeClient:
         self._rows = rows if rows is not None else []
         self._query_error = query_error
         self.queries: list[str] = []
+        self.query_kwargs: list[dict] = []
 
     def query(self, sql: str, *args, **kwargs) -> _FakeQueryJob:
         self.queries.append(sql)
+        self.query_kwargs.append(kwargs)
         if self._query_error is not None:
             raise self._query_error
         return _FakeQueryJob(self._rows)
@@ -169,6 +171,16 @@ def test_api_sql_pulls_fields_over_lookback() -> None:
     assert "statement_type != 'SCRIPT'" in sql
 
 
+def test_api_query_job_pinned_to_data_region() -> None:
+    """The query JOB must run in the data's region, not just name it in the SQL —
+    region-qualified INFORMATION_SCHEMA views resolve only when the job runs there.
+    Without location= a non-US project silently returns no rows (the 2026-07-23
+    TABLE_STORAGE bug class, fixed for JOBS reads 2026-07-27)."""
+    client = _FakeClient(rows=[_job()])
+    WorkloadAnalyzer().analyze_from_api(client, "proj", days=30, location="EU")
+    assert client.query_kwargs[0].get("location") == "EU"
+
+
 def test_missing_jobs_listall_returns_none_no_raise() -> None:
     """Missing bigquery.jobs.listAll (Forbidden) → (None, []), never raises (R17.3 degradation).
     The descriptive permission message is the CLI's job (R17.3 names THE CLI)."""
@@ -192,7 +204,7 @@ def test_rows_with_null_creation_time_are_skipped() -> None:
 
 # --- File path: analyze_from_file (R1.3 --query-logs, R17.4) --------------------------
 
-import json  # noqa: E402
+import json
 
 
 def _write(tmp_path, obj):
@@ -460,7 +472,7 @@ def test_file_null_hour_bucket_falls_back_to_creation_time(tmp_path) -> None:
         {"hour_bucket": None, "creation_time": "2025-06-02T10:30:00Z",
          "total_slot_ms": _HOUR, "total_bytes_processed": 10**9},
     ]
-    slots, raw = WorkloadAnalyzer().analyze_from_file(_write(tmp_path, entries))
+    slots, _raw = WorkloadAnalyzer().analyze_from_file(_write(tmp_path, entries))
     assert slots is not None
     assert slots.total_queries == 2
     assert slots.total_slot_ms == 2 * _HOUR
@@ -614,7 +626,7 @@ def test_float_formatted_numeric_strings_are_parsed_not_zeroed(tmp_path) -> None
         {"hour_bucket": "2025-06-02T09:00:00Z", "total_slot_ms": "3600000.0",
          "job_count": "2.0", "total_bytes_processed": "1e9"},
     ]
-    slots, raw = WorkloadAnalyzer().analyze_from_file(_write(tmp_path, entries))
+    slots, _raw = WorkloadAnalyzer().analyze_from_file(_write(tmp_path, entries))
     assert slots is not None
     assert slots.total_slot_ms == _HOUR
     assert slots.total_queries == 2
@@ -643,3 +655,60 @@ def test_merge_preserves_degraded_legacy_bucket() -> None:
         assert len(merged) == 1
         assert merged[0]["has_billed_bytes"] is False, f"order={ordering[0]['job_count']}"
         assert merged[0]["missing_billed_jobs"] == 2
+
+
+# --- Multi-region merge (2026-07-28 scale review finding #4) ---------------------------
+
+def test_multi_region_workload_merges_buckets() -> None:
+    """analyze_from_api_multi reads each region and merges same-hour buckets into
+    ONE hour-unique bucket (the export contract) with summed stats."""
+    calls = []
+
+    class _RegionClient:
+        def query(self, sql, **kwargs):
+            calls.append(kwargs.get("location"))
+            region = kwargs.get("location")
+            n = 100 if region == "EU" else 50
+            return _FakeQueryJob([_job(slot_ms=n * 3_600_000)])
+
+    slots, buckets, empty = WorkloadAnalyzer().analyze_from_api_multi(
+        _RegionClient(), "proj", days=30, locations=["EU", "us-central1"]
+    )
+    assert calls == ["EU", "us-central1"]
+    assert slots is not None
+    # both regions' jobs merged: 100h + 50h of slot time in the same window
+    assert slots.total_slot_ms == 150 * 3_600_000
+    # same-hour buckets from different regions FOLD into one — the ≤24×days,
+    # hour-unique bucket contract holds for the cross-region union too
+    assert len(buckets) == 1
+    assert buckets[0]["total_slot_ms"] == 150 * 3_600_000
+    assert empty == []
+
+
+def test_multi_region_single_region_matches_single_api() -> None:
+    """analyze_from_api delegates to the multi path — equivalent by construction."""
+    rows = [_job()]
+    multi, multi_buckets, _ = WorkloadAnalyzer().analyze_from_api_multi(
+        _FakeClient(rows=rows), "proj", locations=["EU"]
+    )
+    single, single_buckets = WorkloadAnalyzer().analyze_from_api(
+        _FakeClient(rows=rows), "proj", location="EU"
+    )
+    assert multi == single
+    assert multi_buckets == single_buckets
+
+
+def test_multi_region_reports_empty_regions() -> None:
+    """A region whose JOBS read yields nothing is named in the third element so
+    the caller can surface it — a failed region must not vanish silently."""
+    class _OneEmptyClient:
+        def query(self, sql, **kwargs):
+            if kwargs.get("location") == "EU":
+                return _FakeQueryJob([_job()])
+            return _FakeQueryJob([])
+
+    slots, _, empty = WorkloadAnalyzer().analyze_from_api_multi(
+        _OneEmptyClient(), "proj", locations=["EU", "asia-northeast1"]
+    )
+    assert slots is not None
+    assert empty == ["asia-northeast1"]

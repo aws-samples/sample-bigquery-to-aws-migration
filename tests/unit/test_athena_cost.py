@@ -33,8 +33,8 @@ def test_basic_on_demand_cost():
     result = estimator.estimate_cost(profile, _pricing())
     # 1 TB/month * $5/TB = $5/month compute
     assert result.engine_id == "athena"
-    assert result.monthly_compute == Decimal("5")
-    assert result.monthly_storage == Decimal("0")
+    assert result.monthly_compute == Decimal(5)
+    assert result.monthly_storage == Decimal(0)
     assert result.monthly_total == result.monthly_compute + result.monthly_storage
     assert result.pricing_mode == "on_demand"
 
@@ -49,7 +49,7 @@ def test_zero_scan_is_free():
     )
     estimator = AthenaCostEstimator()
     result = estimator.estimate_cost(profile, _pricing())
-    assert result.monthly_compute == Decimal("0")
+    assert result.monthly_compute == Decimal(0)
     assert result.confidence == "MEDIUM"  # days_sampled >= 7
     assert "No workload data" not in result.source_note
 
@@ -58,7 +58,7 @@ def test_no_data_returns_zero():
     profile = WorkloadProfile(has_data=False)
     estimator = AthenaCostEstimator()
     result = estimator.estimate_cost(profile, _pricing())
-    assert result.monthly_compute == Decimal("0")
+    assert result.monthly_compute == Decimal(0)
     assert result.confidence == "LOW"
 
 
@@ -71,7 +71,7 @@ def test_ddl_is_free():
     )
     estimator = AthenaCostEstimator()
     result = estimator.estimate_cost(profile, _pricing())
-    assert result.monthly_compute == Decimal("0")
+    assert result.monthly_compute == Decimal(0)
 
 
 def test_optimize_one_time_cost():
@@ -86,7 +86,7 @@ def test_optimize_one_time_cost():
     estimator = AthenaCostEstimator()
     result = estimator.estimate_cost(profile, _pricing())
     # 1024 GB / 1024 = 1 TB * $5/TB = $5
-    assert result.one_time_migration == Decimal("5")
+    assert result.one_time_migration == Decimal(5)
     assert "OPTIMIZE" in result.source_note or "compaction" in result.source_note
 
 

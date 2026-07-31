@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime, timedelta, timezone
 
 from bq_assess.core import pricing_constants as v4
+from bq_assess.core.units import fmt_size_exact
 from bq_assess.engine.redshift import cost_constants as k
 from bq_assess.models import (
     AWSRecommendation,
@@ -56,6 +58,7 @@ class CostEstimator:
         # once-per-instance flag silently skipped it and left the snapshot rates).
         self._refreshed_pairs: set[tuple[str, str]] = set()
         self._skip_live_pricing = skip_live_pricing
+        self._longterm_bytes: int = 0  # set per estimate() call from last_modified
 
     def _refresh_pricing(self, bq_location: str, aws_region: str) -> None:
         """Attempt live pricing lookup; updates module constants and confirmed dates."""
@@ -79,6 +82,7 @@ class CostEstimator:
         *,
         location: str | None = None,
         storage_basis: str = "assumed",
+        as_of: datetime | None = None,
     ) -> CostComparison:
         # ---- Region cascade: price BOTH clouds in the Source's geography (2026-07-02) ----
         # BigQuery rates re-resolve to the detected dataset location; AWS rates re-resolve
@@ -123,6 +127,17 @@ class CostEstimator:
             region_known = True
         total_bytes = sum(_entity_bytes(e) for e in entities)
         total_physical_bytes = sum(_entity_physical_bytes(e) for e in entities)
+        # Long-term split (V4): a table untouched for 90+ days bills at ~50% of the
+        # active-logical rate. last_modified is collected per entity, so the BQ side
+        # must honor it — pricing everything active overstates the customer's current
+        # bill (67% of one audited estate was long-term-eligible).
+        self._longterm_bytes = _longterm_bytes(entities, as_of)
+        # S3 Tables Intelligent-Tiering split (V2-INT): the AWS-side mirror of the
+        # long-term split above — symmetric treatment of both clouds' aging
+        # discounts. Consumed by _aws_s3_storage_line as the steady-state low bound
+        # and rendered as the report's per-tier derivation table. All-Frequent
+        # (no cold bytes) keeps the storage line a point.
+        self._int_tiers = _int_tier_breakdown(entities, as_of)
 
         # ---- BigQuery side: per detected model, override wins (R18.2) ----
         bigquery_monthly, bq_breakdown = self._bigquery_runrate(
@@ -192,6 +207,7 @@ class CostEstimator:
             key_uncertainties=self._key_uncertainties(slots),
             estimate_basis_level=basis_level,
             estimate_basis=basis_text,
+            storage_tier_breakdown=self._storage_tier_rows(total_physical_bytes),
         )
 
     def _estimate_basis(
@@ -240,8 +256,9 @@ class CostEstimator:
         if slots is not None and slots.total_slot_ms > 0:
             notes.append(
                 f"BigQuery-slot to Redshift-RPU conversion ({k.V3_SLOT_TO_RPU_RATIO}): a "
-                "research-based assumption, set above the evidence midpoint (range "
-                "0.06–0.25) so the AWS compute figure is deliberately estimated on the high side. "
+                "research-based assumption at the midpoint of the evidence range "
+                "(0.06–0.25); always-on workloads are additionally floored at Redshift "
+                "Serverless's 4-RPU minimum base capacity. "
                 "This is the largest uncertainty in the AWS estimate — validate with "
                 "SYS_SERVERLESS_USAGE from a pilot workload before committing to a migration budget "
                 "(the view retains 7 days; capture within that window or use Cost "
@@ -271,9 +288,9 @@ class CostEstimator:
             "optimization is applied)."
         )
         notes.append(
-            "The Athena-vs-Redshift crossover (~2.7 TB/day, ap-southeast-2) assumes Redshift "
-            "Serverless at its 4-RPU/8-hour minimum posture; always-on workloads break even "
-            "nearer 8 TB/day."
+            f"The Athena-vs-Redshift crossover (~2.4–2.7 TB/day depending on region; priced "
+            f"for {k.AWS_PRICING_REGION}) assumes Redshift Serverless at its 4-RPU/8-hour "
+            f"minimum posture; always-on workloads break even nearer 8 TB/day."
         )
         return notes
 
@@ -294,13 +311,33 @@ class CostEstimator:
         )
         notes = [
             f"{bq_side}; AWS priced for {k.AWS_REGION_SCOPE}.",
-            "Athena priced at $5.00/TB scanned (on-demand, region-invariant; verified 2026-07-21); "
-            "DDL and failed queries are not billed; a 10 MB per-query minimum applies.",
-            "Athena one-time OPTIMIZE compaction estimated at $5/TB of stored data — an upper bound "
-            "based on uncompressed BigQuery logical size (Parquet on S3 is typically several times smaller).",
-            "Monthly figures normalize to a 30-day month; calendar months of 31 days "
-            "bill ~3% higher.",
+            ("Athena priced at $5.00/TB scanned (on-demand, region-invariant; verified 2026-07-21); "
+            "DDL and failed queries are not billed; a 10 MB per-query minimum applies."),
+            ("Athena one-time OPTIMIZE compaction estimated at $5/TB of stored data — an upper bound "
+            "based on uncompressed BigQuery logical size (Parquet on S3 is typically several times smaller)."),
+            ("Monthly figures normalize to a 30-day month; calendar months of 31 days "
+            "bill ~3% higher."),
+            (f"S3 Tables ongoing compaction (${k.V2_COMPACTION_USD_PER_GB_PROCESSED}/GB "
+            "processed) bills against newly written data — not estimable without an "
+            "ingestion rate; expect it to track your write volume."),
         ]
+        tiers = getattr(self, "_int_tiers", None) or {}
+        cold_bytes = sum(
+            tiers.get(key, {}).get("bytes", 0) for key in ("infrequent", "archive")
+        )
+        if cold_bytes > 0:
+            notes.append(
+                "S3 Tables Intelligent-Tiering: storage is priced on the observed "
+                "access pattern — cold data bills at the discounted tiers (Infrequent "
+                f"Access after {k.V2_INT_INFREQUENT_THRESHOLD_DAYS} days without access, "
+                f"Archive Instant Access after {k.V2_INT_ARCHIVE_THRESHOLD_DAYS}). All "
+                "tiers serve reads at millisecond latency with no retrieval fee; an "
+                "accessed file returns to Frequent automatically. Caveats: month 1 bills "
+                "all-Frequent (the storage line's upper bound) and declines as files "
+                "tier; the split is estimated from last-modified time, not true access "
+                "history — tables that are read regularly stay Frequent; periodic "
+                "full-table scans re-heat cold files."
+            )
         if not region_known and bq_location != "us":
             notes.insert(0, (
                 f"⚠️ No verified rate table for BigQuery location '{bq_location}' — priced "
@@ -318,15 +355,15 @@ class CostEstimator:
         exclusions sit next to them so out-of-scope is one list, not two.
         """
         return [
-            "BigQuery side: covers on-demand analysis (bytes billed) and active logical "
+            ("BigQuery side: covers on-demand analysis (bytes billed) and active logical "
             "storage only. Not modeled: streaming inserts, Storage Read/Write API, "
             "BI Engine, Data Transfer Service — these appear on the BigQuery bill and can "
             "be significant for ingestion- or extract-heavy projects. The on-demand free "
             "tier (1 TiB scan + 10 GiB storage/month) and negotiated discounts are also "
-            "excluded.",
-            "AWS side: one-time migration data transfer is not included; Redshift "
+            "excluded."),
+            ("AWS side: one-time migration data transfer is not included; Redshift "
             "Spectrum, ML features, and cross-region replication are not modeled. "
-            "Glue Data Catalog request charges and S3 request charges are not modeled for either Query Engine.",
+            "Glue Data Catalog request charges and S3 request charges are not modeled for either Query Engine."),
         ]
 
     # ================================================================== AWS Scenarios
@@ -853,6 +890,15 @@ class CostEstimator:
         """Serverless RPU compute (V1) via the slot→RPU bridge (V3)."""
         if slots is not None and slots.total_slot_ms > 0:
             rpu_hours = _rpu_hours_per_month(slots)
+            # Billing floor: while processing, Serverless bills at least the minimum
+            # base capacity (4 RPU). Slot-derived RPU-hours below that floor over the
+            # workload's active hours understate always-on workloads (~97%-active
+            # estates came in ~10% under). Charge whichever is larger.
+            floor_hours = (
+                k.SERVERLESS_MIN_RPU_FLOOR * slots.active_hour_fraction * k.HOURS_PER_MONTH
+            )
+            floored = rpu_hours < floor_hours
+            rpu_hours = max(rpu_hours, floor_hours)
             usd = rpu_hours * k.V1_RPU_HOUR_USD
             # Capped at MEDIUM by the tool's own rubric ("priced using research-based
             # conversion ratios"): the dollar figure rides on the V3 slot→RPU ratio, an
@@ -866,12 +912,17 @@ class CostEstimator:
                 monthly=round(usd, 4), monthly_low=None, monthly_high=None,
                 confidence=conf,
                 # Rate provenance and sizing assumption stated separately — the old
-                # single-breath "ratio 0.2 (assumption ...) (verified ...)" read as a
+                # single-breath "ratio (assumption ...) (verified ...)" read as a
                 # contradiction ("assumption or verified?").
                 source_note=(
                     f"${k.V1_RPU_HOUR_USD}/RPU-hr (rate verified {k.AWS_CONFIRMED_DATE}); "
                     f"sized via slot-to-RPU ratio {k.V3_SLOT_TO_RPU_RATIO} — an assumption, "
                     f"validate with a pilot workload"
+                    + (
+                        f"; floored at the {k.SERVERLESS_MIN_RPU_FLOOR}-RPU minimum base "
+                        f"capacity over {slots.active_hour_fraction:.0%} active hours"
+                        if floored else ""
+                    )
                 ),
             )
             return line, conf
@@ -892,9 +943,24 @@ class CostEstimator:
         return line, ConfidenceLevel.LOW
 
     def _aws_s3_storage_line(self, total_physical_bytes: int, basis: str = "measured") -> CostLine:
-        """S3 Tables tiered storage (V2) — sized on physical (compressed) bytes."""
+        """S3 Tables tiered storage (V2) — sized on physical (compressed) bytes.
+
+        Includes the recurring object-monitoring charge S3 Tables adds over plain
+        S3 (R18.1's "maintenance lines" — previously defined but never billed).
+        Object count is estimated from physical bytes at the assumed post-compaction
+        object size; compaction itself (per GB newly written) needs an ingestion
+        rate we don't collect, so it stays disclosure-only in pricing_notes.
+
+        Intelligent-Tiering (V2-INT, 2026-07-31): when the per-entity split
+        (estimate() → self._int_tiers) has cold bytes, the line becomes a range —
+        high = all data in Frequent Access (month 1; Frequent bills at the Standard
+        tier rates), low = steady state with Infrequent/Archive Instant bytes at
+        their flat rates. No cold bytes ⇒ the point line, unchanged.
+        """
         gb = total_physical_bytes * k.GB_PER_BYTE
-        usd = _tiered_s3_tables_usd(gb)
+        est_objects = (total_physical_bytes / (k.V2_ASSUMED_OBJECT_SIZE_MB * 1e6)) if total_physical_bytes else 0.0
+        monitoring_usd = est_objects / 1000.0 * k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH
+        all_frequent_usd = _tiered_s3_tables_usd(gb) + monitoring_usd
 
         if basis == "measured":
             confidence = ConfidenceLevel.HIGH
@@ -907,17 +973,162 @@ class CostEstimator:
             basis_phrase = f"({k.ASSUMED_PHYSICAL_RATIO}× logical — TABLE_STORAGE unavailable)"
 
         note = (
-            f"{gb:,.1f} GB {basis_phrase} × tiered from "
+            f"{fmt_size_exact(gb)} {basis_phrase} × tiered from "
             f"${k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER1}/GB-mo "
+            f"+ ${monitoring_usd:,.0f} object monitoring "
+            f"(~{est_objects:,.0f} objects @ {k.V2_ASSUMED_OBJECT_SIZE_MB:.0f} MB, "
+            f"${k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH}/1k-mo) "
             f"{k.AWS_REGION_SCOPE} (verified {k.AWS_CONFIRMED_DATE})"
         )
 
+        tiers = getattr(self, "_int_tiers", None) or {}
+        cold_bytes = sum(
+            tiers.get(key, {}).get("bytes", 0) for key in ("infrequent", "archive")
+        )
+        if cold_bytes > 0:
+            # Steady state: Frequent bytes at the volume-tiered Standard rates (the
+            # marginal-tier ladder applied to just the hot GB — Frequent fills the
+            # cheapest tiers first, which slightly overstates steady state: the safe
+            # direction); IA/AIA bytes at their flat rates; monitoring unchanged
+            # (per-object, not tiered).
+            freq_gb = tiers["frequent"]["bytes"] * k.GB_PER_BYTE
+            ia_gb = tiers["infrequent"]["bytes"] * k.GB_PER_BYTE
+            arc_gb = tiers["archive"]["bytes"] * k.GB_PER_BYTE
+            steady_state_usd = (
+                _tiered_s3_tables_usd(freq_gb)
+                + ia_gb * k.V2_INT_IA_USD_PER_GB_MONTH
+                + arc_gb * k.V2_INT_AIA_USD_PER_GB_MONTH
+                + monitoring_usd
+            )
+        else:
+            steady_state_usd = all_frequent_usd
+
+        # Materiality guard: a range only when tiering moves the rounded figure.
+        # Estates with a few cold KB would otherwise render "X – X" (the
+        # 2026-07-31 test-env re-render caught exactly this).
+        if round(steady_state_usd, 4) >= round(all_frequent_usd, 4):
+            return CostLine(
+                label="S3 Tables storage",
+                monthly=round(all_frequent_usd, 4), monthly_low=None, monthly_high=None,
+                confidence=confidence,
+                source_note=note,
+            )
+
+        # Lead with the verdict, in the customer's numbers (2026-07-31 review:
+        # the range explanation was buried mid-note). Plain text — source notes
+        # render autoescaped, and |safe would open an injection path for notes
+        # that carry customer identifiers.
+        arc_tb = tiers["archive"]["bytes"] / 1e12
+        ia_tb = tiers["infrequent"]["bytes"] / 1e12
+        freq_tb = tiers["frequent"]["bytes"] / 1e12
+        int_note = (
+            f"${steady_state_usd:,.0f}/mo is your cost on today's storage "
+            f"access pattern — {arc_tb:,.1f} TB unmodified "
+            f"{k.V2_INT_ARCHIVE_THRESHOLD_DAYS}+ days bills at the Archive Instant "
+            f"rate, {ia_tb:,.1f} TB ({k.V2_INT_INFREQUENT_THRESHOLD_DAYS}–"
+            f"{k.V2_INT_ARCHIVE_THRESHOLD_DAYS - 1} days) at Infrequent, "
+            f"{freq_tb:,.1f} TB at Frequent (derivation table below). "
+            f"${all_frequent_usd:,.0f}/mo is month 1 only: all data "
+            f"lands in the Frequent tier at migration and declines to "
+            f"${steady_state_usd:,.0f} as files tier automatically at "
+            f"{k.V2_INT_INFREQUENT_THRESHOLD_DAYS}/{k.V2_INT_ARCHIVE_THRESHOLD_DAYS} "
+            f"days. The cost comparison uses the pattern-based figure. "
+            f"Basis: {note}. Split uses last_modified as an access proxy: tables "
+            f"read within {k.V2_INT_INFREQUENT_THRESHOLD_DAYS} days stay Frequent "
+            f"regardless of age"
+        )
         return CostLine(
             label="S3 Tables storage",
-            monthly=round(usd, 4), monthly_low=None, monthly_high=None,
+            monthly=None,
+            monthly_low=round(steady_state_usd, 4),
+            monthly_high=round(all_frequent_usd, 4),
             confidence=confidence,
-            source_note=note,
+            source_note=int_note,
+            headline=round(steady_state_usd, 4),
         )
+
+    def _storage_tier_rows(self, total_physical_bytes: int) -> list[dict]:
+        """Per-tier derivation rows for the report's storage table (V2-INT).
+
+        Empty when the estate has no cold bytes — the storage line is a point and
+        there is nothing to derive. Row shape documented on
+        CostComparison.storage_tier_breakdown. Must stay in lockstep with
+        _aws_s3_storage_line's steady-state arithmetic: the total row's monthly
+        equals the line's monthly_low.
+        """
+        tiers = getattr(self, "_int_tiers", None) or {}
+        cold_bytes = sum(
+            tiers.get(key, {}).get("bytes", 0) for key in ("infrequent", "archive")
+        )
+        if cold_bytes <= 0:
+            return []
+
+        est_objects = (
+            total_physical_bytes / (k.V2_ASSUMED_OBJECT_SIZE_MB * 1e6)
+            if total_physical_bytes else 0.0
+        )
+        monitoring_usd = est_objects / 1000.0 * k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH
+
+        freq = tiers["frequent"]
+        ia = tiers["infrequent"]
+        arc = tiers["archive"]
+        freq_gb = freq["bytes"] * k.GB_PER_BYTE
+        ia_gb = ia["bytes"] * k.GB_PER_BYTE
+        arc_gb = arc["bytes"] * k.GB_PER_BYTE
+        freq_usd = _tiered_s3_tables_usd(freq_gb)
+        ia_usd = ia_gb * k.V2_INT_IA_USD_PER_GB_MONTH
+        arc_usd = arc_gb * k.V2_INT_AIA_USD_PER_GB_MONTH
+        total_usd = freq_usd + ia_usd + arc_usd + monitoring_usd
+        total_tables = freq["tables"] + ia["tables"] + arc["tables"]
+        total_gb = freq_gb + ia_gb + arc_gb
+
+        std_t1 = k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER1
+        ia_pct = (1 - k.V2_INT_IA_USD_PER_GB_MONTH / std_t1) if std_t1 else 0
+        arc_pct = (1 - k.V2_INT_AIA_USD_PER_GB_MONTH / std_t1) if std_t1 else 0
+
+        return [
+            {
+                "tier": "frequent",
+                "label": f"Frequent Access (modified < {k.V2_INT_INFREQUENT_THRESHOLD_DAYS} days)",
+                "tables": freq["tables"], "gb": round(freq_gb, 3),
+                "rate": std_t1, "rate_note": "",
+                "monthly": round(freq_usd, 4),
+            },
+            {
+                "tier": "infrequent",
+                "label": (
+                    f"Infrequent Access ({k.V2_INT_INFREQUENT_THRESHOLD_DAYS}–"
+                    f"{k.V2_INT_ARCHIVE_THRESHOLD_DAYS - 1} days)"
+                ),
+                "tables": ia["tables"], "gb": round(ia_gb, 3),
+                "rate": k.V2_INT_IA_USD_PER_GB_MONTH,
+                "rate_note": f"−{ia_pct:.0%}",
+                "monthly": round(ia_usd, 4),
+            },
+            {
+                "tier": "archive",
+                "label": f"Archive Instant Access ({k.V2_INT_ARCHIVE_THRESHOLD_DAYS}+ days)",
+                "tables": arc["tables"], "gb": round(arc_gb, 3),
+                "rate": k.V2_INT_AIA_USD_PER_GB_MONTH,
+                "rate_note": f"−{arc_pct:.0%}",
+                "monthly": round(arc_usd, 4),
+            },
+            {
+                "tier": "monitoring",
+                "label": f"Object monitoring (~{est_objects:,.0f} objects @ {k.V2_ASSUMED_OBJECT_SIZE_MB:.0f} MB)",
+                "tables": None, "gb": None,
+                "rate": k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH,
+                "rate_note": "$/1k objects",
+                "monthly": round(monitoring_usd, 4),
+            },
+            {
+                "tier": "total",
+                "label": "Storage total (steady state)",
+                "tables": total_tables, "gb": round(total_gb, 3),
+                "rate": None, "rate_note": "",
+                "monthly": round(total_usd, 4),
+            },
+        ]
 
     # ================================================================== BigQuery
 
@@ -932,25 +1143,54 @@ class CostEstimator:
             return float(override), [line]
 
         if pricing.model is BQPricingModel.CAPACITY:
-            return self._bq_capacity(pricing)
+            return self._bq_capacity(pricing, total_bytes, slots)
         return self._bq_ondemand(total_bytes, slots)
 
+    def _bq_storage_line(self, total_bytes: int) -> CostLine:
+        """BigQuery storage cost line — shared by on-demand and capacity paths.
+
+        Active/long-term split from per-entity last_modified (V4: 90 idle days →
+        ~50% rate). Assumes logical (uncompressed) billing, the BigQuery default;
+        datasets on physical billing bill differently — measured TABLE_STORAGE
+        data is needed to detect that, so it stays a scope note for now.
+        """
+        lt_bytes = min(getattr(self, "_longterm_bytes", 0), total_bytes)
+        active_bytes = total_bytes - lt_bytes
+        active_gib = active_bytes / (1024 ** 3)
+        lt_gib = lt_bytes / (1024 ** 3)
+        storage_usd = (
+            active_gib * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
+            + lt_gib * v4.V4_STORAGE_LONGTERM_LOGICAL_USD_PER_GIB_MONTH
+        )
+        if lt_bytes > 0:
+            detail = (
+                f"{active_gib:,.1f} GiB active × ${v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH}/GiB-mo "
+                f"+ {lt_gib:,.1f} GiB long-term (≥{v4.V4_LONGTERM_THRESHOLD_DAYS} days unmodified) × "
+                f"${v4.V4_STORAGE_LONGTERM_LOGICAL_USD_PER_GIB_MONTH}/GiB-mo"
+            )
+        else:
+            detail = (
+                f"{active_gib:,.1f} GiB stored × "
+                f"${v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH}/GiB-mo"
+            )
+        return CostLine(
+            label="BigQuery storage", monthly=round(storage_usd, 4),
+            monthly_low=None, monthly_high=None, confidence=ConfidenceLevel.HIGH,
+            source_note=(
+                f"{detail} ({v4.V4_PRICING_REGION}) (verified {v4.V4_CONFIRMED_DATE})"
+            ),
+        )
+
     def _bq_ondemand(self, total_bytes, slots):
-        gib = total_bytes / (1024 ** 3)
-        storage_usd = gib * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
+        storage_line = self._bq_storage_line(total_bytes)
         region = v4.V4_PRICING_REGION
 
         basis_bytes, basis_label = _scan_basis(slots)
-        # A carried-but-zero billed total (all-cached / reservation-served window) is a
-        # genuine $0 scan month — don't fall through to the stored-bytes proxy branch.
         billed_zero_window = (
             slots is not None and slots.has_billed_bytes and slots.total_bytes_billed == 0
         )
 
         if slots is not None and slots.days_sampled > 0 and (basis_bytes > 0 or billed_zero_window):
-            # Project over the CALENDAR window, not just active days: dividing by
-            # days_sampled inflates sparse/batch workloads (10 TiB across 4 active days
-            # in a 30-day window is ~10 TiB/month, not 75).
             window_days = _window_days(slots)
             monthly_scanned_bytes = basis_bytes / window_days * k.DAYS_PER_MONTH
             scanned_tib = monthly_scanned_bytes / (1024 ** 4)
@@ -974,24 +1214,18 @@ class CostEstimator:
             )
 
         lines = [
-            CostLine(
-                label="BigQuery storage", monthly=round(storage_usd, 4),
-                monthly_low=None, monthly_high=None, confidence=ConfidenceLevel.HIGH,
-                source_note=(
-                    f"{gib:,.1f} GiB stored × ${v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH}/GiB-mo "
-                    f"({region}) (verified {v4.V4_CONFIRMED_DATE})"
-                ),
-            ),
+            storage_line,
             CostLine(
                 label="BigQuery bytes scanned", monthly=round(scanned_usd, 4),
                 monthly_low=None, monthly_high=None, confidence=scan_conf,
                 source_note=scan_note,
             ),
         ]
-        return round(storage_usd + scanned_usd, 4), lines
+        return round(storage_line.monthly + scanned_usd, 4), lines
 
-    def _bq_capacity(self, pricing: PricingDetection):
-        """Price a capacity Source from its reservation figures."""
+    def _bq_capacity(self, pricing: PricingDetection, total_bytes: int,
+                     slots: SlotUtilization | None):
+        """Price a capacity Source from its reservation figures or slot-ms fallback."""
         caveats: list[str] = []
 
         edition = pricing.edition if pricing.edition in v4.V4_EDITION_SLOT_HOUR_USD else None
@@ -1018,8 +1252,31 @@ class CostEstimator:
             ("max", pricing.max_slots),
         )
         if slots_n is None:
-            slots_n, conf = 0, ConfidenceLevel.LOW
-            caveats.append("no reservation slot figures — supply --reservation-config")
+            if slots is not None and slots.total_slot_ms > 0:
+                consumed_slot_hours = slots.total_slot_ms / _MS_PER_HOUR
+                window_days = _window_days(slots)
+                monthly_slot_hours = consumed_slot_hours / window_days * k.DAYS_PER_MONTH
+
+                if edition in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS:
+                    # Cap at 10x: beyond that the estimate is too unreliable
+                    correction = min(max(1.0 / max(slots.active_hour_fraction, 0.01), 1.25), 10.0)
+                    conf = ConfidenceLevel.LOW
+                    basis = "slot-ms (enterprise estimate)"
+                else:
+                    correction = 1.25
+                    conf = ConfidenceLevel.MEDIUM
+                    basis = "slot-ms (standard estimate)"
+
+                slots_n = monthly_slot_hours * correction / k.HOURS_PER_MONTH
+                caveats.append(
+                    f"estimated from {consumed_slot_hours:,.0f} measured slot-hours × "
+                    f"{correction:.2f} correction ({basis})"
+                )
+            else:
+                slots_n, conf = 0, ConfidenceLevel.LOW
+                caveats.append(
+                    "no reservation figures and no workload data — supply --bigquery-monthly-cost"
+                )
         else:
             conf = ConfidenceLevel.HIGH if basis in ("commitment", "baseline") else ConfidenceLevel.MEDIUM
         if not edition_known:
@@ -1028,16 +1285,17 @@ class CostEstimator:
         monthly = slots_n * slot_hour_usd * k.HOURS_PER_MONTH
         note = (
             f"BigQuery {edition} slot-hour @ ${slot_hour_usd} ({rate_key}, "
-            f"{v4.V4_PRICING_REGION}) × {slots_n:g} slots × "
+            f"{v4.V4_PRICING_REGION}) × {slots_n:,.1f} slots × "
             f"{k.HOURS_PER_MONTH:g}h (verified {v4.V4_CONFIRMED_DATE})"
         )
         if caveats:
             note += " ⚠️ " + "; ".join(caveats)
-        line = CostLine(
+        compute_line = CostLine(
             label=f"BigQuery capacity ({edition})", monthly=round(monthly, 4),
             monthly_low=None, monthly_high=None, confidence=conf, source_note=note,
         )
-        return round(monthly, 4), [line]
+        storage_line = self._bq_storage_line(total_bytes)
+        return round(monthly + storage_line.monthly, 4), [storage_line, compute_line]
 
     # ================================================================== Justification helpers
 
@@ -1058,16 +1316,23 @@ class CostEstimator:
         crossover = engine_recommendation.crossover_point_tb_day
         confidence_pct = int(engine_recommendation.confidence * 100)
 
-        # Core justification: volume, crossover, pattern
+        # Core justification: volume, crossover, pattern. The crossover-assumptions
+        # sentence describes Serverless's 4-RPU minimum posture — only relevant when
+        # the recommended scenario IS Serverless (a provisioned recommendation
+        # mentioning "4 RPU" reads as a contradiction — sandbox feedback).
         justification = (
             f"Your workload scans {monthly_scanned_tb:.2f} TB/month ({daily_scanned_tb:.2f} TB/day, "
             f"{qpd:,.0f} queries/day) — far below the ~{crossover:.2f} TB/day crossover where "
-            f"Redshift Serverless becomes cheaper. The crossover assumes Redshift's minimum posture "
-            f"(4 RPU, ~8 active hours/day); always-on workloads break even nearer 8 TB/day. "
-            f"Note: if the workgroup auto-scales above 4 RPUs it will not scale back down "
-            f"automatically — the 4-RPU floor requires manual reset, so sustained bursts "
-            f"erode this posture. "
+            f"Redshift Serverless becomes cheaper. "
         )
+        if scenario_type == "serverless":
+            justification += (
+                "The crossover assumes Redshift's minimum posture "
+                "(4 RPU, ~8 active hours/day); always-on workloads break even nearer 8 TB/day. "
+                "Note: if the workgroup auto-scales above 4 RPUs it will not scale back down "
+                "automatically — the 4-RPU floor requires manual reset, so sustained bursts "
+                "erode this posture. "
+            )
 
         # Pattern fit
         active_frac = slots.active_hour_fraction
@@ -1089,10 +1354,11 @@ class CostEstimator:
 
         # Revisit conditions
         if scenario_type == "serverless":
+            dml_quota = 200 if k.AWS_PRICING_REGION == "us-east-1" else 100
             justification += (
                 f"Revisit if scan volume approaches {crossover:.2f} TB/day, sustained concurrency "
-                f"approaches your account's Athena DML quota (default 100 in ap-southeast-2, "
-                f"adjustable), or sub-3-second latency SLAs emerge."
+                f"approaches your account's Athena DML quota (default {dml_quota} in "
+                f"{k.AWS_PRICING_REGION}, adjustable), or sub-3-second latency SLAs emerge."
             )
         else:
             justification += (
@@ -1136,8 +1402,10 @@ class CostEstimator:
         spec = k.V7_RG_NODE_TYPES[node_type]
         notes = []
         total_vcpu = node_count * spec["vcpu"]
-        peak_conc = profile.peak_concurrent_queries
+        peak_conc = max(profile.peak_concurrent_queries, profile.peak_slots or 0)
 
+        if peak_conc < 1:
+            return notes
         if total_vcpu >= peak_conc * k.V6_VCPU_PER_CONCURRENT_QUERY:
             notes.append(f"✓ {total_vcpu} vCPUs handles {peak_conc:.0f} peak concurrent queries")
         else:
@@ -1222,6 +1490,91 @@ def _safe_num(value) -> float:
     return n if n >= 0 else 0.0
 
 
+def _longterm_bytes(entities, as_of: datetime | None) -> int:
+    """Bytes in entities unmodified for V4_LONGTERM_THRESHOLD_DAYS+ days.
+
+    ``as_of`` anchors the idle window (bundle collection time — NOT report time,
+    which would drift tables into long-term as a bundle ages on disk). Entities
+    without a usable last_modified count as active (conservative for the
+    comparison: overstating the BQ side is the misleading direction).
+    """
+    if as_of is None:
+        as_of = datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    cutoff = as_of - timedelta(days=v4.V4_LONGTERM_THRESHOLD_DAYS)
+    total = 0
+    for e in entities:
+        lm = getattr(e, "last_modified", None)
+        if lm is None:
+            continue
+        if lm.tzinfo is None:
+            lm = lm.replace(tzinfo=timezone.utc)
+        if lm < cutoff:
+            total += _entity_bytes(e)
+    return total
+
+
+def _int_tier_breakdown(entities, as_of: datetime | None) -> dict:
+    """Per-tier table counts and physical bytes for S3 Tables Intelligent-Tiering.
+
+    Returns {"frequent"|"infrequent"|"archive": {"tables": int, "bytes": int}},
+    weighted by PHYSICAL bytes (what S3 bills). Mirrors _longterm_bytes:
+    last_modified is the recency signal, as_of anchors the window to bundle
+    collection time, naive timestamps read as UTC.
+    ⚠️ last_modified is a MODIFICATION proxy for ACCESS recency — a daily-read
+    static table would stay Frequent in reality. Callers must pair the tiered
+    figure with the all-Frequent bound and surface the caveat. Entities without
+    last_modified count as Frequent (conservative: overstates the AWS bill,
+    the same safe direction as _longterm_bytes' count-as-active).
+    """
+    if as_of is None:
+        as_of = datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    ia_cutoff = as_of - timedelta(days=k.V2_INT_INFREQUENT_THRESHOLD_DAYS)
+    arc_cutoff = as_of - timedelta(days=k.V2_INT_ARCHIVE_THRESHOLD_DAYS)
+
+    tiers = {
+        "frequent": {"tables": 0, "bytes": 0},
+        "infrequent": {"tables": 0, "bytes": 0},
+        "archive": {"tables": 0, "bytes": 0},
+    }
+    for e in entities:
+        b = _entity_physical_bytes(e)
+        lm = getattr(e, "last_modified", None)
+        if lm is None:
+            key = "frequent"  # conservative
+        else:
+            if lm.tzinfo is None:
+                lm = lm.replace(tzinfo=timezone.utc)
+            if lm < arc_cutoff:
+                key = "archive"
+            elif lm < ia_cutoff:
+                key = "infrequent"
+            else:
+                key = "frequent"
+        tiers[key]["tables"] += 1
+        tiers[key]["bytes"] += b
+    return tiers
+
+
+def _int_tier_split(entities, as_of: datetime | None) -> tuple[float, float, float]:
+    """Fractions of total physical bytes per Intelligent-Tiering tier.
+
+    Returns (frequent, infrequent, archive_instant) summing to 1.0
+    ((1.0, 0.0, 0.0) for an empty/zero-byte estate). Thin wrapper over
+    _int_tier_breakdown — see its docstring for the signal and caveats.
+    """
+    tiers = _int_tier_breakdown(entities, as_of)
+    total = sum(t["bytes"] for t in tiers.values())
+    if total <= 0:
+        return (1.0, 0.0, 0.0)
+    ia = tiers["infrequent"]["bytes"] / total
+    arc = tiers["archive"]["bytes"] / total
+    return (1.0 - ia - arc, ia, arc)
+
+
 def _entity_bytes(e) -> int:
     if hasattr(e, "num_bytes"):
         return int(e.num_bytes)
@@ -1257,7 +1610,13 @@ def _rpu_hours_per_month(slots: SlotUtilization) -> float:
 
 
 def _line_value(line: CostLine) -> float:
-    """Get the effective monthly value from a CostLine (point or range midpoint)."""
+    """Get the effective monthly value from a CostLine.
+
+    Precedence: headline (the totals-basis figure — see CostLine.headline) →
+    point value → range midpoint.
+    """
+    if getattr(line, "headline", None) is not None:
+        return line.headline
     if line.monthly is not None:
         return line.monthly
     low = line.monthly_low or 0
@@ -1266,10 +1625,14 @@ def _line_value(line: CostLine) -> float:
 
 
 def _line_low(line: CostLine) -> float:
+    if getattr(line, "headline", None) is not None:
+        return line.headline
     return line.monthly if line.monthly is not None else (line.monthly_low or 0)
 
 
 def _line_high(line: CostLine) -> float:
+    if getattr(line, "headline", None) is not None:
+        return line.headline
     return line.monthly if line.monthly is not None else (line.monthly_high or 0)
 
 
@@ -1277,6 +1640,81 @@ def _breakeven(onetime: float, monthly_delta: float) -> float:
     if monthly_delta <= 0:
         return k.BREAKEVEN_NEVER
     return onetime / monthly_delta
+
+
+def apply_rms_storage_split(
+    cost: CostComparison, rms_physical_bytes: int, total_physical_bytes: int
+) -> None:
+    """Split the storage line after Stage 13a placed entities on RMS, in place.
+
+    Serverless bills RMS storage separately by GB/month (serverless-billing.html,
+    verified 2026-07-22) — RMS-placed entities leave the S3 Tables tier and incur
+    an RMS line instead. RMS ($0.024/GB us-east-1) is cheaper than S3 Tables tier 1
+    ($0.0265/GB), so this slightly LOWERS the estimate; the point is the line item
+    exists and the totals reconcile with the placement decision.
+
+    ``total_physical_bytes`` is the full estate the S3 line was priced on: the
+    reduced line is recomputed through the tier function at the remaining volume
+    (marginal bytes leave the TOP occupied tier — a flat tier-1 subtraction
+    over-reduced the line on >50 TB estates) and the object-monitoring component
+    is re-estimated for the remaining objects.
+
+    Mutates the best-scenario lines and headline figures only; per-scenario lists
+    keep their all-Iceberg storage (they compare compute postures, not placement).
+    """
+    if rms_physical_bytes <= 0:
+        return
+    s3_line = next((ln for ln in cost.aws_lines if ln.label == "S3 Tables storage"), None)
+    if s3_line is None or s3_line.monthly is None:
+        return
+
+    rms_gb = rms_physical_bytes * k.GB_PER_BYTE
+    old_s3_usd = s3_line.monthly
+    remaining_bytes = max(0, total_physical_bytes - rms_physical_bytes)
+    remaining_objects = remaining_bytes / (k.V2_ASSUMED_OBJECT_SIZE_MB * 1e6)
+    reduced_s3_usd = (
+        _tiered_s3_tables_usd(remaining_bytes * k.GB_PER_BYTE)
+        + remaining_objects / 1000.0 * k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH
+    )
+    reduced_s3_usd = min(reduced_s3_usd, old_s3_usd)  # a split must never raise the line
+    rms_usd = rms_gb * k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH
+
+    s3_line.monthly = round(reduced_s3_usd, 4)
+    s3_line.source_note += f"; {fmt_size_exact(rms_gb)} moved to RMS by storage placement"
+    cost.aws_lines.append(CostLine(
+        label="Redshift Managed Storage (RMS-placed tables)",
+        monthly=round(rms_usd, 4), monthly_low=None, monthly_high=None,
+        confidence=ConfidenceLevel.HIGH,
+        source_note=(
+            f"{fmt_size_exact(rms_gb)} × ${k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH}/GB-mo "
+            f"{k.AWS_REGION_SCOPE} — serverless bills RMS separately from RPU compute "
+            f"(verified {k.AWS_CONFIRMED_DATE})"
+        ),
+    ))
+
+    delta_usd = rms_usd - (old_s3_usd - reduced_s3_usd)   # negative when RMS is cheaper
+    cost.aws_monthly_low = round(cost.aws_monthly_low + delta_usd, 4)
+    cost.aws_monthly_high = round(cost.aws_monthly_high + delta_usd, 4)
+    cost.monthly_delta_low = cost.bigquery_monthly - cost.aws_monthly_high
+    cost.monthly_delta_high = cost.bigquery_monthly - cost.aws_monthly_low
+    cost.annual_savings_low = cost.monthly_delta_low * 12
+    cost.annual_savings_high = cost.monthly_delta_high * 12
+    cost.breakeven_months_low = _breakeven(cost.migration_onetime, cost.monthly_delta_low)
+    cost.breakeven_months_high = _breakeven(cost.migration_onetime, cost.monthly_delta_high)
+
+
+def reprice_migration_effort(cost: CostComparison, effort_total) -> None:
+    """Recompute migration_onetime + breakeven from an updated effort total, in place.
+
+    Stage 13a (storage placement, ADR-0005) amends per-entity effort AFTER Stage 10
+    priced the migration — RMS-placed entities gain a two-phase-load point. This
+    re-applies the same formula estimate() used so the cost summary and the
+    per-entity effort cards agree. Only the effort-derived fields change; monthly
+    run-rate figures are untouched.
+    """
+    cost.migration_onetime = _safe_num(effort_total) * k.MIGRATION_USD_PER_EFFORT_POINT
+    cost.breakeven_months_low = _breakeven(cost.migration_onetime, cost.monthly_delta_low)
+    cost.breakeven_months_high = _breakeven(cost.migration_onetime, cost.monthly_delta_high)
 
 
 def _fmt_usd(amount: float) -> str:

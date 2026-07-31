@@ -77,9 +77,9 @@ CLEAN_TYPE_MAP: dict[str, str] = {
 LOSSY_TYPE_MAP: dict[str, tuple[str, str]] = {
     "BYTES": (
         "string",
-        "Athena Iceberg DDL supports 'binary' but BigQuery exports BYTES as raw "
+        ("Athena Iceberg DDL supports 'binary' but BigQuery exports BYTES as raw "
         "Parquet binary and no layer converts it automatically. Mapped to string; "
-        "the load process must encode bytes explicitly (e.g. TO_BASE64 at export).",
+        "the load process must encode bytes explicitly (e.g. TO_BASE64 at export)."),
     ),
     "GEOGRAPHY": (
         "string",
@@ -111,15 +111,23 @@ class IcebergConverter:
     Contract (design.md § Component Interfaces):
         def convert(self, entity: EntityMetadata) -> ConversionResult
 
-    ``iceberg_location_root`` is the S3 prefix for table data (V10: the Query
-    Engine's Iceberg CREATE TABLE requires a LOCATION clause). When not provided,
-    a placeholder is emitted and a warning tells the operator to substitute it.
+    ``iceberg_location_root`` is the S3 prefix for table data (V10: on a
+    general-purpose bucket the Query Engine's Iceberg CREATE TABLE requires a
+    LOCATION clause). When not provided, a placeholder is emitted and a warning
+    tells the operator to substitute it.
+
+    ``s3_tables`` targets an S3 table bucket instead (ADR-0001's Storage
+    Target): S3 Tables manages the warehouse location itself, so no LOCATION
+    clause is emitted — the docs' S3 Tables CREATE TABLE examples carry none,
+    and the table resolves through the s3tablescatalog execution context
+    (Athena S3 Tables docs, checked 2026-07-30).
     """
 
     _LOCATION_PLACEHOLDER = "s3://<ICEBERG_BUCKET>"
 
-    def __init__(self, iceberg_location_root: str | None = None):
+    def __init__(self, iceberg_location_root: str | None = None, *, s3_tables: bool = True):
         self._location_root = (iceberg_location_root or "").rstrip("/") or None
+        self._s3_tables = s3_tables
 
     def convert(self, entity: EntityMetadata) -> ConversionResult:
         """Convert entity schema to Iceberg DDL.
@@ -163,8 +171,8 @@ class IcebergConverter:
         # Map columns — reserved-word / non-standard names get backtick-quoted
         # (Athena DDL is Hive-based). NOT NULL is never emitted: Athena does not
         # support column constraints on Iceberg tables (nor does Redshift when
-        # querying them). REQUIRED-ness is preserved as a trailing comment.
-        cols: list[tuple[str, str]] = []  # (definition, trailing comment)
+        # querying them). REQUIRED-ness is preserved in the header comment block.
+        cols: list[tuple[str, str]] = []  # (definition, header note)
         required_cols: list[str] = []
         for col in entity.columns:
             iceberg_type = self._resolve_type(col, lossy_casts)
@@ -179,13 +187,38 @@ class IcebergConverter:
                 required_cols.append(col.name)
             cols.append((f"  {quote_identifier_ddl(col.name)} {iceberg_type}", comment))
 
-        # Comma before the comment on every line but the last, so a trailing
-        # comment never swallows the separator.
+        # Ingestion-time partitioning (R7.3): BigQuery's _PARTITIONTIME is a
+        # pseudo-column with no schema presence. The partition mapping suggests
+        # day(_ingestion_time), so the DDL must declare that column or Athena
+        # rejects the CREATE (partition source column must exist).
+        if entity.time_partitioning is not None and entity.time_partitioning.field is None:
+            cols.append((
+                "  _ingestion_time timestamp",
+                "  -- added: BigQuery ingestion-time pseudo-column; load must populate it",
+            ))
+            warnings.append(
+                "Ingestion-time partitioned in BigQuery (_PARTITIONTIME pseudo-column): "
+                "an explicit _ingestion_time column was added to carry the partition "
+                "value. The load process must populate it (e.g. from _PARTITIONTIME "
+                "at export) — review before applying."
+            )
+
+        # Column annotations ride in a header block ABOVE the CREATE statement:
+        # Athena rejects `--` comments inside the column list on federated
+        # catalogs (live-verified on s3tablescatalog 2026-07-30 — "no viable
+        # alternative at input"), so the column list itself must stay bare.
         lines = [
-            f"{defn}{',' if i < len(cols) - 1 else ''}{comment}"
-            for i, (defn, comment) in enumerate(cols)
+            f"{defn}{',' if i < len(cols) - 1 else ''}"
+            for i, (defn, _comment) in enumerate(cols)
         ]
         columns_sql = "\n".join(lines)
+        column_notes = "".join(
+            f"--   {defn.strip().split(' ')[0]}:{comment.replace('  --', '')}\n"
+            for defn, comment in cols
+            if comment
+        )
+        if column_notes:
+            column_notes = "-- COLUMN NOTES (not part of the DDL):\n" + column_notes
 
         if required_cols:
             warnings.append(
@@ -208,12 +241,15 @@ class IcebergConverter:
         # Sort order: Athena Iceberg DDL has no sort mechanism. The Storage
         # Target's CreateTable API does accept writeOrder (design.md V9), so the
         # intent is preserved as a comment for that path.
+        # Placed BEFORE the CREATE statement: a comment after the closing ';'
+        # makes Athena's single-statement API reject the whole submission
+        # ("Only one sql statement is allowed") — live-verified 2026-07-30.
         sort_comment = ""
         if partition_mapping and partition_mapping.sort_order:
             sorts = ", ".join(partition_mapping.sort_order)
             sort_comment = (
-                f"\n-- SORT ORDER ({sorts}): not applicable via Athena DDL;"
-                " apply as writeOrder if creating via the S3 Tables API"
+                f"-- SORT ORDER ({sorts}): not applicable via Athena DDL;"
+                " apply as writeOrder if creating via the S3 Tables API\n"
             )
             warnings.append(
                 f"Sort order ({sorts}) cannot be applied through Athena Iceberg "
@@ -222,16 +258,20 @@ class IcebergConverter:
                 "creating the table via the S3 Tables API instead."
             )
 
-        # LOCATION + TBLPROPERTIES form the Athena Iceberg DDL. Location root
-        # comes from config or a placeholder.
-        location_root = self._location_root or self._LOCATION_PLACEHOLDER
-        location = f"{location_root}/{entity.full_name.replace('.', '/')}/"
-        if self._location_root is None:
-            warnings.append(
-                "No Iceberg location root configured — DDL contains the "
-                f"placeholder {self._LOCATION_PLACEHOLDER}; substitute the "
-                "Storage Target bucket before executing."
-            )
+        # LOCATION + TBLPROPERTIES form the Athena Iceberg DDL — except on
+        # S3 Tables, where the service owns the warehouse path and the clause
+        # is omitted (table resolves via the s3tablescatalog context).
+        location_clause = ""
+        if not self._s3_tables:
+            location_root = self._location_root or self._LOCATION_PLACEHOLDER
+            location = f"{location_root}/{entity.full_name.replace('.', '/')}/"
+            location_clause = f"LOCATION '{location}'\n"
+            if self._location_root is None:
+                warnings.append(
+                    "No Iceberg location root configured — DDL contains the "
+                    f"placeholder {self._LOCATION_PLACEHOLDER}; substitute the "
+                    "Storage Target bucket before executing."
+                )
 
         engine_note = ""
         if has_nested:
@@ -249,11 +289,13 @@ class IcebergConverter:
 
         ddl = (
             f"{engine_note}"
+            f"{sort_comment}"
+            f"{column_notes}"
             f"CREATE TABLE {quote_full_name_ddl(entity.full_name)} "
             f"(\n{columns_sql}\n)"
             f"{partition_clause}\n"
-            f"LOCATION '{location}'\n"
-            f"TBLPROPERTIES ('table_type'='ICEBERG');{sort_comment}"
+            f"{location_clause}"
+            f"TBLPROPERTIES ('table_type'='ICEBERG');"
         )
 
         # Lossy cast warnings

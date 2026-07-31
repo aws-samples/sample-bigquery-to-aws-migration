@@ -19,7 +19,6 @@ from bq_assess.targets.iceberg.dml import (
     DMLGenerator,
 )
 
-
 converter = IcebergConverter()
 dml_gen = DMLGenerator()
 
@@ -84,9 +83,10 @@ class TestCleanTypeMappings:
         entity = _make_table(cols)
         result = converter.convert(entity)
         assert result.success
-        # NOT NULL never emitted; REQUIRED-ness preserved as comment
+        # NOT NULL never emitted; REQUIRED-ness preserved in the header
+        # comment block (inline column comments break federated-catalog DDL)
         assert "NOT NULL" not in result.ddl
-        assert "-- REQUIRED in BigQuery" in result.ddl
+        assert "REQUIRED in BigQuery" in result.ddl
         assert " string" in result.ddl
         assert "decimal(38,9)" in result.ddl
         assert " timestamp" in result.ddl
@@ -268,6 +268,23 @@ class TestPartitionMapping:
         assert "-- REVIEW" not in result.ddl
         assert "PARTITIONED BY (day(_ingestion_time))" in result.ddl
         assert any("review" in f.lower() for f in result.partition_mapping.decision_flags)
+
+    def test_ingestion_time_partition_column_declared(self):
+        """The partition source column must exist in the CREATE TABLE — Athena
+        rejects PARTITIONED BY on an undeclared column (2026-07-30
+        live-verification finding #2). _PARTITIONTIME is a BQ pseudo-column, so
+        the DDL adds an explicit _ingestion_time timestamp column."""
+        tp = m.TimePartitionConfig(type="DAY", field=None)
+        cols = [_col("data", "STRING")]
+        entity = _make_table(cols, time_part=tp)
+        result = converter.convert(entity)
+        assert "_ingestion_time timestamp" in result.ddl
+        assert any("_ingestion_time" in w for w in result.warnings)
+        # regular field-partitioned tables must NOT gain the extra column
+        tp2 = m.TimePartitionConfig(type="DAY", field="created_at")
+        entity2 = _make_table([_col("created_at", "TIMESTAMP")], time_part=tp2)
+        result2 = converter.convert(entity2)
+        assert "_ingestion_time" not in result2.ddl
 
     def test_clustering_becomes_sort_order(self):
         cols = [_col("a", "STRING"), _col("b", "STRING"), _col("c", "STRING")]
@@ -491,8 +508,10 @@ class TestRedshiftIcebergDDLFixes:
         assert "PARTITIONED BY (day(event_ts))" in result.ddl
         assert "-- SORT ORDER (region)" in result.ddl
         assert "SORT BY" not in result.ddl
-        # Statement terminates with TBLPROPERTIES before the sort comment
-        assert "TBLPROPERTIES ('table_type'='ICEBERG');\n-- SORT ORDER" in result.ddl
+        # Sort comment rides BEFORE the CREATE statement: trailing content
+        # after ';' makes Athena's single-statement API reject the submission.
+        assert "-- SORT ORDER (region)" in result.ddl.split("CREATE TABLE")[0]
+        assert result.ddl.rstrip().endswith("TBLPROPERTIES ('table_type'='ICEBERG');")
 
     def test_reserved_word_partition_field_quoted(self):
         """A reserved-word partition column is backtick-quoted inside PARTITIONED BY."""
@@ -535,18 +554,30 @@ class TestRedshiftIcebergDDLFixes:
         result = converter.convert(entity)
         assert "CREATE TABLE ds.`order`" in result.ddl
 
-    def test_tblproperties_location_emitted(self):
-        """DDL carries mandatory TBLPROPERTIES + LOCATION (Athena Iceberg DDL)."""
+    def test_tblproperties_emitted_no_location_on_s3_tables(self):
+        """S3 Tables target (default): TBLPROPERTIES yes, LOCATION omitted —
+        the table bucket owns the warehouse path and the docs' S3 Tables
+        CREATE TABLE examples carry no LOCATION clause."""
         cols = [_col("id", "INT64")]
         entity = _make_table(cols)
         result = converter.convert(entity)
         assert "TBLPROPERTIES ('table_type'='ICEBERG')" in result.ddl
         assert "USING ICEBERG" not in result.ddl
+        assert "LOCATION" not in result.ddl
+        assert not any("placeholder" in w for w in result.warnings)
+
+    def test_gp_bucket_mode_emits_location_placeholder(self):
+        """Legacy GP-bucket mode (s3_tables=False): LOCATION required, with a
+        placeholder + warning when no root is configured."""
+        conv = IcebergConverter(s3_tables=False)
+        cols = [_col("id", "INT64")]
+        entity = _make_table(cols)
+        result = conv.convert(entity)
         assert "LOCATION 's3://<ICEBERG_BUCKET>/ds/tbl/'" in result.ddl
         assert any("placeholder" in w for w in result.warnings)
 
     def test_configured_location_root_used(self):
-        conv = IcebergConverter(iceberg_location_root="s3://my-bucket/lake/")
+        conv = IcebergConverter(iceberg_location_root="s3://my-bucket/lake/", s3_tables=False)
         cols = [_col("id", "INT64")]
         entity = _make_table(cols)
         result = conv.convert(entity)
@@ -559,7 +590,10 @@ class TestRedshiftIcebergDDLFixes:
         entity = _make_table(cols)
         result = converter.convert(entity)
         assert "NOT NULL" not in result.ddl
-        assert "-- REQUIRED in BigQuery" in result.ddl
+        assert "REQUIRED in BigQuery" in result.ddl
+        # The note lives ABOVE the CREATE — never inside the column list
+        # (inline `--` comments are rejected on s3tablescatalog DDL).
+        assert result.ddl.index("REQUIRED in BigQuery") < result.ddl.index("CREATE TABLE")
         assert any("REQUIRED columns" in w for w in result.warnings)
 
     def test_encrypt_column_quoted(self):

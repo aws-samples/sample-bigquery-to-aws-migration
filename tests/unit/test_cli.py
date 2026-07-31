@@ -18,8 +18,13 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from bq_assess.cli import _load_config, _merge_config, _interactive_prompts, _engine_prompts, main
-
+from bq_assess.cli import (
+    _engine_prompts,
+    _interactive_prompts,
+    _load_config,
+    _merge_config,
+    main,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -265,13 +270,15 @@ class TestClickCommand:
             assert "not supported" in result.output.lower() or "csv" in result.output.lower()
             assert not mock_collect.called, "collect must not run when the format is invalid"
 
-    def test_help_shows_reservation_config(self) -> None:
-        """assess help includes --reservation-config option (R1.5). Options live on
-        the subcommand only (group options were silently dropped — review fix 5)."""
+    def test_help_shows_bigquery_monthly_cost(self) -> None:
+        """assess help includes --bigquery-monthly-cost (replaces deprecated --reservation-config).
+        Options live on the subcommand only (group options were silently dropped — review fix 5)."""
         runner = CliRunner()
         result = runner.invoke(main, ["assess", "--help"])
         assert result.exit_code == 0
-        assert "--reservation-config" in result.output
+        assert "--bigquery-monthly-cost" in result.output
+        # --reservation-config is hidden (deprecated)
+        assert "--reservation-config" not in result.output
 
     def test_options_before_subcommand_error_not_silently_dropped(self) -> None:
         """`bq-assess --gcp-project p assess` must ERROR clearly, not parse the
@@ -349,8 +356,8 @@ class TestInteractivePrompts:
             "Path to exported query logs JSON (or empty for API)": "",
             "Query log lookback window in days (1-90)": "30",
             "Monthly BigQuery cost override (or empty to calculate)": "",
-            "Output directory": "reports/",
-            "Output formats (json,html)": "json,html",
+            "Output directory": "bq-migration/",
+            "Output formats (html,json)": "html",
         }.get(a[0], "")
         mock_confirm.return_value = False
 
@@ -369,8 +376,8 @@ class TestInteractivePrompts:
             "Path to exported query logs JSON (or empty for API)": "",
             "Query log lookback window in days (1-90)": "30",
             "Monthly BigQuery cost override (or empty to calculate)": "",
-            "Output directory": "reports/",
-            "Output formats (json,html)": "json,html",
+            "Output directory": "bq-migration/",
+            "Output formats (html,json)": "html",
         }.get(a[0], "")
         mock_confirm.return_value = False
 
@@ -397,8 +404,8 @@ class TestInteractivePrompts:
                 "Path to exported query logs JSON (or empty for API)": "",
                 "Query log lookback window in days (1-90)": "30",
                 "Monthly BigQuery cost override (or empty to calculate)": "",
-                "Output directory": "reports/",
-                "Output formats (json,html)": "json,html",
+                "Output directory": "bq-migration/",
+                "Output formats (html,json)": "html",
             }
             return responses.get(prompt_text, "")
 
@@ -474,7 +481,7 @@ class TestEnginePrompts:
 
     def test_engine_prompts_returns_responses_when_no_cli_values(self) -> None:
         """_engine_prompts returns responses when CLI values are not provided."""
-        from rich.prompt import Prompt, Confirm
+        from rich.prompt import Confirm, Prompt
 
         params = {}
 
@@ -494,7 +501,7 @@ class TestEnginePrompts:
 
     def test_engine_prompts_skips_when_cli_values_provided(self) -> None:
         """_engine_prompts skips prompts when CLI values are provided."""
-        from rich.prompt import Prompt, Confirm
+        from rich.prompt import Confirm, Prompt
 
         params = {
             "target_region": "us-west-2",
@@ -514,7 +521,7 @@ class TestEnginePrompts:
 
     def test_engine_prompts_no_clustering_skips_post_optimization(self) -> None:
         """_engine_prompts skips post_optimization prompt when no clustering detected."""
-        from rich.prompt import Prompt, Confirm
+        from rich.prompt import Confirm, Prompt
 
         params = {}
 
@@ -530,7 +537,7 @@ class TestEnginePrompts:
 
     def test_engine_prompts_other_region_prompts_for_custom(self) -> None:
         """_engine_prompts prompts for custom region when 'other' is selected."""
-        from rich.prompt import Prompt, Confirm
+        from rich.prompt import Confirm, Prompt
 
         params = {}
 
@@ -548,7 +555,7 @@ class TestEnginePrompts:
 
     def test_engine_prompts_skips_with_falsy_cli_values(self) -> None:
         """Explicit falsy CLI values still suppress their prompts."""
-        from rich.prompt import Prompt, Confirm
+        from rich.prompt import Confirm, Prompt
 
         params = {
             "query_sla_ms": 0,

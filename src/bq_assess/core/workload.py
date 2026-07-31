@@ -122,11 +122,44 @@ class WorkloadAnalyzer:
         of the Source's query volume). Returns (None, []) when no usable workload is
         readable (R17.3 graceful degradation; never raises).
         """
-        rows = self._read_jobs(client, project_id, days, location)
-        buckets = self._normalize_hourly_rows(rows)
-        if not buckets:
-            return None, []
-        return self._compute(buckets), buckets
+        slots, buckets, _ = self.analyze_from_api_multi(
+            client, project_id, days=days, locations=[location]
+        )
+        return slots, buckets
+
+    def analyze_from_api_multi(
+        self, client, project_id: str, days: int = 30, locations: list[str] | None = None
+    ):
+        """Read hourly workload across MULTIPLE regions and compute one merged curve.
+
+        Region-qualified JOBS views only see their own region's jobs, so a
+        multi-region project's workload is the union of per-region reads
+        (2026-07-28 scale review finding #4). This is the single implementation
+        — ``analyze_from_api`` delegates here with one region, so the two paths
+        cannot drift (2026-07-28 review).
+
+        Returns ``(slots, buckets, empty_regions)``:
+        - the cross-region bucket union goes through ``_merge_buckets`` +
+          ``_drop_outlier_buckets`` so same-hour buckets from different regions
+          fold under the module's one merge rule and the export contract
+          (hour-unique, ≤ 24×days entries) holds for the union too;
+        - ``empty_regions`` lists regions whose read produced no buckets —
+          ``_read_jobs`` degrades to [] on error (R17.3), and the CALLER must
+          surface an empty region rather than let a transient per-region
+          failure silently understate the merged workload.
+        """
+        merged: list[dict] = []
+        empty_regions: list[str] = []
+        for loc in locations or ["US"]:
+            rows = self._read_jobs(client, project_id, days, loc)
+            region_buckets = self._normalize_hourly_rows(rows)
+            if not region_buckets:
+                empty_regions.append(loc)
+            merged.extend(region_buckets)
+        if not merged:
+            return None, [], empty_regions
+        merged = _merge_buckets(_drop_outlier_buckets(merged))
+        return self._compute(merged), merged, empty_regions
 
     def analyze_from_file(self, path):
         """Compute the curve from an exported query-log JSON file (R1.3 ``--query-logs``).
@@ -478,7 +511,7 @@ def _safe_int(value) -> int:
             n = int(float(value))
         except (ValueError, TypeError, OverflowError):
             return 0
-    return n if n > 0 else 0
+    return max(0, n)
 
 
 def _hourly_series(hour_slot_ms: dict) -> list[float]:

@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path.home() / ".bq-assess"
@@ -74,6 +75,10 @@ class AWSRates:
     s3_tables_tier1: float = 0.0
     s3_tables_tier2: float = 0.0
     s3_tables_tier3: float = 0.0
+    # S3 Tables Intelligent-Tiering storage class (flat rates, no volume tiers;
+    # Frequent Access bills at the s3_tables_tier* rates so it has no field).
+    s3_int_ia: float = 0.0    # Infrequent Access (30+ days unaccessed)
+    s3_int_aia: float = 0.0   # Archive Instant Access (90+ days unaccessed)
     fetched_at: str = ""
     source: str = "hardcoded"
 
@@ -167,8 +172,8 @@ class PriceLookup:
 
     def _fetch_aws_rates(self) -> AWSRates | None:
         """Query the AWS Price List API for Redshift rates (public, no auth)."""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         try:
             logger.info("Fetching AWS Redshift pricing from Price List API (%s)...", self._aws_region)
@@ -258,13 +263,15 @@ class PriceLookup:
             rates.s3_tables_tier1 = s3_rates.get("tier1", 0)
             rates.s3_tables_tier2 = s3_rates.get("tier2", 0)
             rates.s3_tables_tier3 = s3_rates.get("tier3", 0)
+            rates.s3_int_ia = s3_rates.get("int_ia", 0)
+            rates.s3_int_aia = s3_rates.get("int_aia", 0)
 
         return rates
 
     def _fetch_s3_tables_rates(self) -> dict | None:
         """Fetch S3 Tables storage rates from the S3 Price List API."""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         try:
             url = _AWS_OFFER_URL_TEMPLATE.format(service="AmazonS3", region=self._aws_region)
@@ -280,33 +287,49 @@ class PriceLookup:
 
     @staticmethod
     def _parse_s3_tables_tiers(products: dict, terms: dict) -> dict | None:
-        """Extract the three S3 Tables Standard storage tiers from an offer file."""
+        """Extract S3 Tables storage rates from an offer file.
+
+        Standard tiers (tier1/2/3) come from the Tables-TimedStorage-ByteHrs SKU;
+        the Intelligent-Tiering cold tiers (int_ia/int_aia) from the flat-rate
+        INT-IA / INT-AIA SKUs. INT Frequent Access (INT-FA) is skipped — verified
+        2026-07-31 that it carries the same volume-tier prices as Standard, so
+        the Standard tiers price Frequent bytes.
+        """
         tiers = {}
         for sku, product in products.items():
             attrs = product.get("attributes", {})
             usage_type = attrs.get("usagetype", "")
 
-            # Exact-suffix match: offer files also carry Intelligent-Tiering variants
-            # (…Tables-TimedStorage-INT-FA-ByteHrs etc.) that a substring match would
-            # conflate with the Standard tiers.
-            if not usage_type.endswith("Tables-TimedStorage-ByteHrs"):
-                continue
-
-            # One SKU carries all three tiers as separate priceDimensions — read each
-            # dimension's OWN price (a single extracted price assigned to every tier
-            # would bill tier-2/3 storage at the tier-1 rate).
-            for offer in terms.get(sku, {}).values():
-                for dim in offer.get("priceDimensions", {}).values():
-                    price = float(dim.get("pricePerUnit", {}).get("USD", "0") or "0")
-                    if price <= 0:
-                        continue
-                    begin = float(dim.get("beginRange", "0") or "0")
-                    if begin == 0:
-                        tiers["tier1"] = price
-                    elif begin <= 51200:  # 50 TB in GB
-                        tiers["tier2"] = price
-                    else:
-                        tiers["tier3"] = price
+            # Exact-suffix matches: a substring match would conflate the Standard
+            # tiers with the INT-FA variant (same prices, different SKU).
+            if usage_type.endswith("Tables-TimedStorage-ByteHrs"):
+                # One SKU carries all three tiers as separate priceDimensions — read
+                # each dimension's OWN price (a single extracted price assigned to
+                # every tier would bill tier-2/3 storage at the tier-1 rate).
+                for offer in terms.get(sku, {}).values():
+                    for dim in offer.get("priceDimensions", {}).values():
+                        price = float(dim.get("pricePerUnit", {}).get("USD", "0") or "0")
+                        if price <= 0:
+                            continue
+                        begin = float(dim.get("beginRange", "0") or "0")
+                        if begin == 0:
+                            tiers["tier1"] = price
+                        elif begin <= 51200:  # 50 TB in GB
+                            tiers["tier2"] = price
+                        else:
+                            tiers["tier3"] = price
+            elif usage_type.endswith("Tables-TimedStorage-INT-IA-ByteHrs"):
+                for offer in terms.get(sku, {}).values():
+                    for dim in offer.get("priceDimensions", {}).values():
+                        price = float(dim.get("pricePerUnit", {}).get("USD", "0") or "0")
+                        if price > 0:
+                            tiers["int_ia"] = price
+            elif usage_type.endswith("Tables-TimedStorage-INT-AIA-ByteHrs"):
+                for offer in terms.get(sku, {}).values():
+                    for dim in offer.get("priceDimensions", {}).values():
+                        price = float(dim.get("pricePerUnit", {}).get("USD", "0") or "0")
+                        if price > 0:
+                            tiers["int_aia"] = price
 
         return tiers if tiers else None
 
@@ -327,7 +350,7 @@ class PriceLookup:
         result = {}
         sku_terms = reserved_terms.get(sku, {})
 
-        for offer_key, offer in sku_terms.items():
+        for offer in sku_terms.values():
             term_attrs = offer.get("termAttributes", {})
             lease_length = term_attrs.get("LeaseContractLength", "")
             purchase_option = term_attrs.get("PurchaseOption", "")
@@ -353,8 +376,8 @@ class PriceLookup:
     def _fetch_gcp_rates(self, client) -> GCPRates | None:
         """Query GCP Cloud Billing Catalog for BigQuery rates using existing ADC."""
         try:
-            from google.auth.transport.requests import AuthorizedSession
             import google.auth
+            from google.auth.transport.requests import AuthorizedSession
 
             credentials = client._credentials if hasattr(client, "_credentials") else None
             if credentials is None:
@@ -516,6 +539,8 @@ class PriceLookup:
             s3_tables_tier1=k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER1,
             s3_tables_tier2=k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER2,
             s3_tables_tier3=k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER3,
+            s3_int_ia=k.V2_INT_IA_USD_PER_GB_MONTH,
+            s3_int_aia=k.V2_INT_AIA_USD_PER_GB_MONTH,
             fetched_at=k.AWS_CONFIRMED_DATE,
             source=f"hardcoded (verified {k.AWS_CONFIRMED_DATE})",
         )
@@ -650,7 +675,8 @@ def fetch_live_rates_with_timeout(
     ever reads public pricing data and writes the local cache. Callers fall back to the
     region-cascaded hardcoded rates already loaded into the constant modules.
     """
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
 
     # daemon threads so a hung request never blocks interpreter exit
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pricing-fetch")
@@ -723,6 +749,10 @@ def apply_live_rates(rates: PricingRates) -> tuple[bool, bool]:
         k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER2 = aws.s3_tables_tier2
     if aws_is_live and aws.s3_tables_tier3 > 0:
         k.V2_S3_TABLES_USD_PER_GB_MONTH_TIER3 = aws.s3_tables_tier3
+    if aws_is_live and aws.s3_int_ia > 0:
+        k.V2_INT_IA_USD_PER_GB_MONTH = aws.s3_int_ia
+    if aws_is_live and aws.s3_int_aia > 0:
+        k.V2_INT_AIA_USD_PER_GB_MONTH = aws.s3_int_aia
 
     # AWS Provisioned RA3
     if aws_is_live and aws.managed_storage_usd_per_gb > 0:

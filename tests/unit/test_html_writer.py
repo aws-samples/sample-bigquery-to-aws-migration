@@ -10,10 +10,10 @@ from bq_assess.models import (
     Assessment,
     AssessmentSummary,
     BQPricingModel,
-    ConfidenceLevel,
-    ConfidenceSource,
     ComplexityCategory,
     ComplexityResult,
+    ConfidenceLevel,
+    ConfidenceSource,
     ConversionResult,
     CostComparison,
     CostLine,
@@ -382,7 +382,13 @@ def test_html_malicious_identifier_is_neutralized():
 def test_html_engine_recommendation_section_present():
     """R19 unified surface: removed standalone recommendation banner and 'Why this Query Engine' collapsible."""
     from decimal import Decimal
-    from bq_assess.models import EngineRecommendation, SignalContribution, AWSRecommendation, WorkloadProfile
+
+    from bq_assess.models import (
+        AWSRecommendation,
+        EngineRecommendation,
+        SignalContribution,
+        WorkloadProfile,
+    )
 
     a = _known_assessment()
     # Add a cost recommendation
@@ -471,6 +477,7 @@ def test_html_migration_plan_absent_when_none():
 def test_html_per_entity_migration_plan_in_payload():
     """Per-entity migration_plan field is serialized into the effort row payload."""
     import json
+
     from bq_assess.models import MigrationDML, MigrationShortcoming, PostMigrationStep
 
     a = _known_assessment()
@@ -505,17 +512,23 @@ def test_html_per_entity_migration_plan_in_payload():
         )
     }
     html = _render_html(a)
-    # Extract the embedded JSON payload
+    # Extract the embedded JSON payloads: light rows + lazy detail chunks
     import re
     m = re.search(r'<script type="application/json" id="report-data">(.*?)</script>', html)
     assert m, "report-data JSON block not found"
     data = json.loads(m.group(1))
-    # The effort row for ds.orders must carry the structured migration_plan
     effort_rows = data["effort"]
     orders_row = next((r for r in effort_rows if r["full_name"] == "ds.orders"), None)
     assert orders_row is not None, "ds.orders not in effort rows"
-    assert "migration_plan" in orders_row, "migration_plan field missing from entity row"
-    plan = orders_row["migration_plan"]
+    # Heavy payloads live in the lazy detail chunks, referenced by detail_chunk
+    assert "migration_plan" not in orders_row, "heavy field leaked into the row payload"
+    chunk_idx = orders_row["detail_chunk"]
+    chunks = re.findall(
+        r'<script type="application/json" class="detail-chunk" data-chunk="(\d+)">(.*?)</script>',
+        html,
+    )
+    chunk = json.loads(dict(chunks)[str(chunk_idx)])
+    plan = chunk["ds.orders"]["migration_plan"]
     assert len(plan["statements"]) == 2
     assert "DELETE FROM" in plan["statements"][0]
     assert len(plan["shortcomings"]) == 1
@@ -530,9 +543,9 @@ def test_html_per_entity_migration_plan_in_payload():
 def test_format_savings_comparable_shows_delta():
     """MRI-5: abs < $1 renders 'Comparable (+-$X.XX)'."""
     from bq_assess.report.html_writer import _format_savings
-    assert _format_savings(0.11) == "Comparable (±$0.11)"
-    assert _format_savings(-0.50) == "Comparable (±$0.50)"
-    assert _format_savings(0.0) == "Comparable (±$0.00)"
+    assert _format_savings(0.11) == "Comparable (-$0.11)"
+    assert _format_savings(-0.50) == "Comparable (+$0.50)"
+    assert _format_savings(0.0) == "Comparable (-$0.00)"
 
 
 def test_format_savings_large_positive():
@@ -542,9 +555,11 @@ def test_format_savings_large_positive():
 
 
 def test_format_savings_large_negative():
-    """MRI-5: -$15 renders '+$15.00/mo'."""
+    """Negative deltas say 'more' explicitly — the previous bare '+$X' under a
+    'Savings' label read as a saving (2026-07-31 sandbox validation fix)."""
     from bq_assess.report.html_writer import _format_savings
-    assert _format_savings(-15.0) == "+$15.00/mo"
+    assert _format_savings(-15.0) == "$15.00/mo more"
+    assert _format_savings(-355.59) == "$356/mo more"
 
 
 def test_format_savings_none():
@@ -582,4 +597,306 @@ def test_html_home_label_fallback_unknown_enum():
     assert "Review required (" in html
 
 
+def test_html_athena_placement_tooltip_engine_branched():
+    """Athena-recommended entity gets the Athena placement tooltip, NOT 'inside Redshift (engine-local)'."""
+    from bq_assess.models import TranslationResult
 
+    a = _known_assessment()
+    # Give the view entity Athena-targeted translated SQL + a placement
+    a.entities[1].translated_sql = TranslationResult(
+        redshift_sql="SELECT * FROM ds.orders",
+        confidence="HIGH",
+        warnings=[],
+        target_engine="athena",
+    )
+    a.entities[1].placement = PlacementRecommendation(
+        home="CREATE VIEW",
+        signals=["Entity recommended for Athena CREATE VIEW"],
+        confidence=ConfidenceLevel.HIGH,
+        refresh_unverified=False,
+    )
+    html = _render_html(a)
+    # The Athena placement tooltip text must appear in the JS
+    assert "Athena cannot create materialized views" in html
+    # The old stale Redshift-only tooltip phrasing must NOT appear
+    assert "can live either inside Redshift (engine-local) or in the shared Iceberg catalog" not in html
+
+
+def test_html_redshift_placement_tooltip_engine_branched():
+    """Redshift-recommended entity gets the Redshift placement tooltip."""
+    from bq_assess.models import TranslationResult
+
+    a = _known_assessment()
+    a.entities[1].translated_sql = TranslationResult(
+        redshift_sql="SELECT * FROM ds.orders",
+        confidence="HIGH",
+        warnings=[],
+        target_engine="redshift",
+    )
+    a.entities[1].placement = PlacementRecommendation(
+        home="REDSHIFT",
+        signals=["Single-engine consumption"],
+        confidence=ConfidenceLevel.HIGH,
+        refresh_unverified=False,
+    )
+    html = _render_html(a)
+    # Redshift path tooltip mentions engine-local and Iceberg catalog
+    assert "Redshift (engine-local" in html
+    assert "shared Iceberg catalog" in html
+
+
+def test_help_include_no_orphaned_entries():
+    """Every key in _help.j2 dicts is referenced by combined.html.j2 or its JS, and
+    every reference in combined.html.j2 resolves to a _help.j2 key."""
+    import re
+    from pathlib import Path
+
+    templates = Path(__file__).parent.parent.parent / "src" / "bq_assess" / "report" / "templates"
+    help_src = (templates / "_help.j2").read_text()
+    combined_src = (templates / "combined.html.j2").read_text()
+
+    # Extract top-level dict names from _help.j2
+    help_dicts = re.findall(r'\{%\s*set\s+(\w+)\s*=', help_src)
+    assert help_dicts, "_help.j2 should define at least one dict"
+
+    # Every dict defined in _help.j2 must be referenced in combined.html.j2
+    for name in help_dicts:
+        assert name in combined_src, f"_help.j2 defines '{name}' but combined.html.j2 never references it"
+
+    # Every help.X reference in combined.html.j2 must resolve to a _help.j2 dict
+    # Exclude 'j2' from matches (comes from "{% import '_help.j2' as help %}")
+    refs = set(re.findall(r'help\.([A-Z]\w+)', combined_src))
+    for ref in refs:
+        assert ref in help_dicts, f"combined.html.j2 references 'help.{ref}' but _help.j2 does not define it"
+
+
+# --- Fix 1: recommended engine at payload level ---
+
+
+def test_html_athena_engine_global_without_translated_sql():
+    """Fix 1: entity with rewrite_guidance + placement but NO translated_sql reads
+    the GLOBAL recommended engine, not the per-entity translated_sql.target_engine.
+    The JS variable RECOMMENDED_ENGINE is 'athena' and ENGINE_META drives the branches."""
+    from decimal import Decimal
+
+    from bq_assess.models import EngineRecommendation, SignalContribution
+
+    a = _known_assessment()
+    a.engine_recommendation = EngineRecommendation(
+        primary_engine="athena",
+        confidence=0.85,
+        reasoning=[
+            SignalContribution(signal="daily_scan_volume_tb", value=2.0, direction="athena", weight=0.6),
+        ],
+        crossover_point_tb_day=Decimal("10.00"),
+        override_reason=None,
+    )
+    # Entity has rewrite_guidance + placement but NO translated_sql
+    a.entities[1].rewrite_guidance = ["Replace UNNEST with CROSS JOIN UNNEST"]
+    a.entities[1].translated_sql = None
+    a.entities[1].placement = PlacementRecommendation(
+        home="CREATE VIEW",
+        signals=["Simple view — CREATE VIEW on Athena"],
+        confidence=ConfidenceLevel.HIGH,
+        refresh_unverified=False,
+    )
+    html = _render_html(a)
+    # The RECOMMENDED_ENGINE JS variable must be 'athena'
+    assert '"recommendedEngine": "athena"' in html
+    # ENGINE_META.athena entries are present (both always present as they're in the JS source)
+    assert "How to rewrite for Athena" in html
+    # The JS uses `ENGINE_META[engineKey].rewriteHeading` where engineKey falls through
+    # to RECOMMENDED_ENGINE when translated_sql is absent — verified by the var assignment
+    assert "var RECOMMENDED_ENGINE = HELP.recommendedEngine" in html
+
+
+# --- Fix 3: Load DML explanation under Redshift recommendation ---
+
+
+def test_html_load_dml_redshift_explanation():
+    """Fix 3: when recommended engine is redshift, the ENGINE_META.redshift.loadDmlHelp
+    contains the explanation that Athena performs the data load regardless. The JS code
+    dispatches based on RECOMMENDED_ENGINE which is 'redshift'."""
+    from decimal import Decimal
+
+    from bq_assess.models import (
+        EngineRecommendation,
+        MigrationDML,
+        SignalContribution,
+    )
+
+    a = _known_assessment()
+    a.engine_recommendation = EngineRecommendation(
+        primary_engine="redshift",
+        confidence=0.75,
+        reasoning=[
+            SignalContribution(signal="concurrency", value=80, direction="redshift", weight=0.5),
+        ],
+        crossover_point_tb_day=Decimal("25.00"),
+        override_reason=None,
+    )
+    a.migration_plans = {
+        "ds.orders": MigrationDML(
+            table="ds.orders",
+            statements=["INSERT INTO iceberg_db.ds_orders SELECT * FROM source_db.ds_orders;"],
+            shortcomings=[],
+            post_optimization=[],
+            estimated_scan_bytes=1073741824,
+        )
+    }
+    html = _render_html(a)
+    # The ENGINE_META.redshift.loadDmlHelp text is in the JS
+    assert "Athena performs the one-time data load regardless of the recommended Query Engine" in html
+    # And the RECOMMENDED_ENGINE is set to 'redshift'
+    assert '"recommendedEngine": "redshift"' in html
+    # The JS dispatches: ENGINE_META[RECOMMENDED_ENGINE].loadDmlHelp → picks redshift entry
+    assert "ENGINE_META[RECOMMENDED_ENGINE].loadDmlHelp" in html
+
+
+def test_html_load_dml_athena_recommended_engine():
+    """Fix 3: when recommended engine is athena, RECOMMENDED_ENGINE='athena', so JS
+    dispatches to ENGINE_META.athena.loadDmlHelp (which lacks the Redshift explanation)."""
+    from decimal import Decimal
+
+    from bq_assess.models import (
+        EngineRecommendation,
+        MigrationDML,
+        SignalContribution,
+    )
+
+    a = _known_assessment()
+    a.engine_recommendation = EngineRecommendation(
+        primary_engine="athena",
+        confidence=0.85,
+        reasoning=[
+            SignalContribution(signal="daily_scan_volume_tb", value=2.0, direction="athena", weight=0.6),
+        ],
+        crossover_point_tb_day=Decimal("10.00"),
+        override_reason=None,
+    )
+    a.migration_plans = {
+        "ds.orders": MigrationDML(
+            table="ds.orders",
+            statements=["INSERT INTO iceberg_db.ds_orders SELECT * FROM source_db.ds_orders;"],
+            shortcomings=[],
+            post_optimization=[],
+            estimated_scan_bytes=1073741824,
+        )
+    }
+    html = _render_html(a)
+    # RECOMMENDED_ENGINE is set to 'athena'
+    assert '"recommendedEngine": "athena"' in html
+    # The athena.loadDmlHelp does NOT contain the "regardless" sentence
+    # (verified structurally: both ENGINE_META entries are in the JS, but the dispatch selects athena)
+    assert "ENGINE_META[RECOMMENDED_ENGINE].loadDmlHelp" in html
+
+
+# --- Fix 4: no Trino in customer-facing content ---
+
+
+def test_html_no_trino_in_report():
+    """Fix 4: 'Trino' must not appear in any customer-facing report content."""
+    a = _known_assessment()
+    html = _render_html(a)
+    assert "Trino" not in html
+
+
+# --- Fix 5: restored tooltip facts ---
+
+
+def test_html_placement_high_udf_constraint():
+    """Fix 5: HIGH placement confidence tooltip mentions the Iceberg catalog has no function concept."""
+    a = _known_assessment()
+    html = _render_html(a)
+    assert "Iceberg catalog has no function concept" in html
+
+
+def test_html_redshift_placement_iceberg_catalog_benefit():
+    """Fix 5: Redshift placement tooltip names the catalog benefit (queryable by Athena, Redshift, and Spark)."""
+    from bq_assess.models import TranslationResult
+
+    a = _known_assessment()
+    a.entities[1].translated_sql = TranslationResult(
+        redshift_sql="SELECT * FROM ds.orders",
+        confidence="HIGH",
+        warnings=[],
+        target_engine="redshift",
+    )
+    a.entities[1].placement = PlacementRecommendation(
+        home="REDSHIFT",
+        signals=["Single-engine consumption"],
+        confidence=ConfidenceLevel.HIGH,
+        refresh_unverified=False,
+    )
+    html = _render_html(a)
+    assert "queryable by Athena, Redshift, and Spark" in html
+
+
+# --- Fix 7: TargetEngine enum ---
+
+
+def test_target_engine_enum_str_comparison():
+    """Fix 7: TargetEngine enum compares equal to bare strings (str inheritance)."""
+    from bq_assess.models import TargetEngine
+    assert TargetEngine.ATHENA == "athena"
+    assert TargetEngine.REDSHIFT == "redshift"
+    assert TargetEngine.ATHENA != "redshift"
+
+
+
+def test_range_storage_line_renders_range_not_na():
+    """A range CostLine (monthly=None, low/high set) must render 'low – high'.
+    _to_dict omits None-valued keys, so the template must use .get(): Jinja's
+    Undefined is NOT none, and the bare check rendered every range line as
+    'N/A' (2026-07-31 sandbox validation: all three storage cells showed N/A)."""
+    a = _known_assessment()
+    a.cost.aws_lines = [
+        CostLine(
+            label="S3 Tables storage",
+            monthly=None, monthly_low=1905.0, monthly_high=2103.0,
+            confidence=ConfidenceLevel.MEDIUM, source_note="V2-INT range",
+        )
+    ]
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    i = html.index("S3 Tables storage")
+    cell = html[i:i + 800]
+    assert "N/A" not in cell
+    assert "$1,905" in cell and "$2,103" in cell
+
+
+def test_negative_delta_never_labeled_savings():
+    """A cost increase must not render as a green 'Savings' (sandbox validation:
+    -$356/mo rendered '+$355.59/mo' under 'Monthly Savings')."""
+    a = _known_assessment()
+    a.cost.monthly_delta_low = -355.59
+    a.cost.monthly_delta_high = -100.0
+    a.cost.annual_savings_low = -4267.09
+    a.cost.annual_savings_high = -1200.0
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    assert "Monthly Cost Increase" in html
+    assert "Annual Cost Increase" in html
+    assert "$356/mo more" in html
+    assert "+$355.59/mo" not in html and "+$356/mo" not in html
+
+
+def test_straddling_delta_range_shows_both_bounds():
+    """When the AWS range straddles BQ (worst case costs more, steady state
+    saves — the Intelligent-Tiering spread), both bounds must be visible."""
+    a = _known_assessment()
+    a.cost.monthly_delta_low = -355.59
+    a.cost.monthly_delta_high = 2082.0
+    a.cost.annual_savings_low = -4267.09
+    a.cost.annual_savings_high = 24984.0
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    assert "Monthly Cost vs BigQuery" in html
+    assert "worst case" in html
+    assert "Save $2,082/mo" in html

@@ -37,7 +37,7 @@ console = Console()
     show_default=True,
     help="Lookback window for INFORMATION_SCHEMA.JOBS in days.",
 )
-@click.option("--reservation-config", default=None, help="Path to BigQuery reservation config YAML/JSON.")
+@click.option("--reservation-config", default=None, hidden=True, help="[DEPRECATED] Reservation details are now auto-read during collection.")
 @click.option("--output", default="bundle-out/", show_default=True, help="Directory the bundle/ is written into.")
 @click.option(
     "--exclude-query-text", is_flag=True, default=False,
@@ -96,6 +96,12 @@ def main(
 
     # Load reservation config if provided (kept file-free inside collect())
     if reservation_config:
+        # Deprecation parity with bq-assess (cli.py _validate_collect_params):
+        # both surfaces of collect() must present the same contract.
+        console.print(
+            "[yellow]⚠ --reservation-config is deprecated. Reservation details are now "
+            "auto-read during collection.[/yellow]"
+        )
         try:
             with open(reservation_config, encoding="utf-8") as f:
                 if reservation_config.endswith(".json"):

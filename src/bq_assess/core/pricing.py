@@ -44,12 +44,16 @@ class PricingDetector:
         client,
         project_id: str,
         reservation_config: dict | None,
-        location: str = "US",
+        location: str | list[str] = "US",
     ) -> PricingDetection:
         """Classify the Source's pricing model. See module docstring for the four outcomes.
 
         ``location`` region-qualifies the JOBS query (``\\`region-<location>\\```); it defaults
-        to ``"US"`` to match the US-only pricing constants (V4). Never raises (R16.3/P20).
+        to ``"US"`` to match the US-only pricing constants (V4). A LIST reads every
+        region and unions the grouped rows — the reservation_id signal is per-region,
+        so a capacity reservation driving a secondary region's workload must not be
+        classified ON_DEMAND just because the primary region runs ad-hoc queries
+        (2026-07-28 review of the multi-region MR). Never raises (R16.3/P20).
         """
         # 1. A supplied --reservation-config is a confidence rung above auto-detection (R16.2):
         #    it forces CAPACITY and carries the figures the Cost Estimator prices from. Read with
@@ -83,7 +87,10 @@ class PricingDetector:
                 source_note=note,
             )
 
-        rows = self._read_jobs(client, project_id, location)
+        locations = [location] if isinstance(location, str) else location
+        rows = []
+        for loc in locations:
+            rows.extend(self._read_jobs(client, project_id, loc))
         # Rows are GROUPED (reservation_id, edition, job_count) — see _read_jobs. Each group
         # summarizes job_count jobs; legacy per-job shaped rows (tests, file import) count
         # as 1 each via the job_count default.
@@ -111,15 +118,21 @@ class PricingDetector:
                  if r.get(k.V5_JOBS_EDITION_COLUMN)),
                 None,
             )
+            reservation_id = next(
+                (r.get(k.V5_JOBS_RESERVATION_ID_COLUMN) for r in capacity_rows
+                 if r.get(k.V5_JOBS_RESERVATION_ID_COLUMN)),
+                None,
+            )
             return PricingDetection(
                 model=BQPricingModel.CAPACITY,
                 confidence=ConfidenceLevel.MEDIUM,
                 edition=edition,
+                reservation_id=reservation_id,
                 source_note=(
                     f"Capacity model detected from INFORMATION_SCHEMA.JOBS."
                     f"{k.V5_JOBS_RESERVATION_ID_COLUMN} (non-null on {n_capacity} of {n} "
                     f"leaf jobs; edition={edition}). Slot figures not auto-detected — supply "
-                    f"--reservation-config for baseline/max/commitment. V5 {k.V5_CONFIRMED_DATE}."
+                    f"--bigquery-monthly-cost for accurate pricing. V5 {k.V5_CONFIRMED_DATE}."
                 ),
             )
 
@@ -132,8 +145,8 @@ class PricingDetector:
                 confidence=ConfidenceLevel.LOW,
                 source_note=(
                     "Could not determine pricing model (no readable, non-SCRIPT job data); "
-                    "defaulting to on-demand at LOW confidence — supply --reservation-config to "
-                    f"classify a capacity Source. V5 {k.V5_CONFIRMED_DATE}."
+                    "defaulting to on-demand at LOW confidence — supply --bigquery-monthly-cost to "
+                    f"override. V5 {k.V5_CONFIRMED_DATE}."
                 ),
             )
 

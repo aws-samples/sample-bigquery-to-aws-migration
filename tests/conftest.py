@@ -11,7 +11,6 @@ from bq_assess import models as m  # normative lakehouse model (issue #3)
 from bq_assess.core.analyzer import JoinPattern, QueryAnalysis
 from bq_assess.models import ColumnSchema
 
-
 # Valid BigQuery types from TYPE_MAP in the design
 BQ_TYPES = [
     "STRING", "INT64", "FLOAT64", "BOOL", "TIMESTAMP", "DATE",

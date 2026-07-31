@@ -4,8 +4,6 @@ Precedence: CLI flags > YAML config > Interactive prompt > Inferred/defaults.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional
-
 from bq_assess.models import EngineConfig
 
 _DEFAULTS = {
@@ -21,10 +19,10 @@ _DEFAULTS = {
 
 
 def resolve_engine_config(
-    cli_params: Optional[Dict] = None,
-    yaml_config: Optional[Dict] = None,
-    prompt_responses: Optional[Dict] = None,
-    inferred: Optional[Dict] = None,
+    cli_params: dict | None = None,
+    yaml_config: dict | None = None,
+    prompt_responses: dict | None = None,
+    inferred: dict | None = None,
 ) -> EngineConfig:
     """Merge config sources by precedence into a resolved EngineConfig.
 
@@ -46,8 +44,8 @@ def resolve_engine_config(
     engine_cli_provided = cli_params.pop("_engine_cli_provided", False)
     region_is_fallback = inferred.pop("_region_is_fallback", False)
 
-    source: Dict[str, str] = {}
-    resolved: Dict = {}
+    source: dict[str, str] = {}
+    resolved: dict = {}
 
     for key, default in _DEFAULTS.items():
         # Explicit CLI engine wins even when it resolves to None ("both")

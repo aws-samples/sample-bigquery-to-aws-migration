@@ -4,14 +4,29 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from bq_assess.report._serialize import (
-    _EFFORT_ROW_KEYS, _QUERY_ROW_KEYS, _to_dict, build_report_rows, serialize_entities,
-)
 from bq_assess.models import (
-    Assessment, AssessmentSummary, CostComparison, CostLine, EntityReport,
-    EntityType, EntityPopulation, EffortCategory, EffortResult,
-    ComplexityCategory, ComplexityResult, ConfidenceLevel, ConfidenceSource,
-    BQPricingModel, ConversionResult,
+    Assessment,
+    AssessmentSummary,
+    BQPricingModel,
+    ComplexityCategory,
+    ComplexityResult,
+    ConfidenceLevel,
+    ConfidenceSource,
+    ConversionResult,
+    CostComparison,
+    CostLine,
+    EffortCategory,
+    EffortResult,
+    EntityPopulation,
+    EntityReport,
+    EntityType,
+)
+from bq_assess.report._serialize import (
+    _EFFORT_ROW_KEYS,
+    _QUERY_ROW_KEYS,
+    _to_dict,
+    build_report_rows,
+    serialize_entities,
 )
 
 
@@ -156,15 +171,20 @@ def test_report_rows_prune_nested_dead_fields():
         home="REDSHIFT", signals=["s"], confidence=ConfidenceLevel.HIGH, refresh_unverified=False
     )
     effort, query = serialize_entities(_minimal_assessment(entities))
-    rows = build_report_rows(effort, query)
+    rows, chunks = build_report_rows(effort, query)
 
     q = rows["query"][0]
     assert "constructs" not in q["complexity"]
     assert "refresh_unverified" not in q["placement"]
+    # Heavy fields move to the detail chunks — pruned there, absent from rows.
     e = rows["effort"][0]
-    assert "success" not in e["conversion"]
+    assert "conversion" not in e
+    assert e["detail_chunk"] == 0
+    detail = chunks[0]["ds.tbl"]
+    assert "success" not in detail["conversion"]
     # Pruning must not mutate the shared dicts the JSON sidecars serialize.
     assert query[0]["complexity"]["constructs"], "sidecar dict was mutated"
+    assert query[0]["conversion"]["success"] is not None, "sidecar dict was mutated"
 
 
 def test_report_rows_drop_unscored_entities():
@@ -174,8 +194,37 @@ def test_report_rows_drop_unscored_entities():
     ]
     entities[1].complexity = None
     effort, query = serialize_entities(_minimal_assessment(entities))
-    rows = build_report_rows(effort, query)
+    rows, _ = build_report_rows(effort, query)
     assert [r["full_name"] for r in rows["query"]] == ["ds.tbl"]
+
+
+def test_detail_chunking_splits_and_indexes():
+    """Heavy fields land in DETAIL_CHUNK_SIZE-entity chunks; each row's detail_chunk
+    points at the chunk holding its payload; entities without heavy fields get none."""
+    from bq_assess.report import _serialize as ser
+
+    entities = [
+        _make_entity(f"ds.tbl{i:03d}", EntityPopulation.TABLE, EntityType.TABLE)
+        for i in range(5)
+    ]
+    entities[3].conversion = None  # no heavy payload → no chunk assignment
+    effort, query = serialize_entities(_minimal_assessment(entities))
+
+    original = ser.DETAIL_CHUNK_SIZE
+    ser.DETAIL_CHUNK_SIZE = 2
+    try:
+        rows, chunks = build_report_rows(effort, query)
+    finally:
+        ser.DETAIL_CHUNK_SIZE = original
+
+    # 4 entities with conversions → chunks of 2
+    assert [len(c) for c in chunks] == [2, 2]
+    with_chunk = [r for r in rows["effort"] if "detail_chunk" in r]
+    assert len(with_chunk) == 4
+    assert "detail_chunk" not in rows["effort"][3]
+    for r in with_chunk:
+        assert r["full_name"] in chunks[r["detail_chunk"]]
+        assert "conversion" in chunks[r["detail_chunk"]][r["full_name"]]
 
 
 def test_report_rows_cover_template_accesses():
@@ -195,7 +244,11 @@ def test_report_rows_cover_template_accesses():
     # DOM event API (e.target, e.preventDefault) that regex can't distinguish from entity fields.
     renderer_owned = {"_nameLower", "target"}
     accessed = set(re.findall(r"\be\.([a-z_]+)\b", script)) - renderer_owned
-    allowed = set(_EFFORT_ROW_KEYS) | set(_QUERY_ROW_KEYS)
+    # Detail builders receive detailFor(e) — row fields merged with the entity's
+    # lazy detail chunk — so heavy _DETAIL_KEYS reads are part of the contract too.
+    from bq_assess.report._serialize import _DETAIL_KEYS
+
+    allowed = set(_EFFORT_ROW_KEYS) | set(_QUERY_ROW_KEYS) | set(_DETAIL_KEYS)
     assert accessed <= allowed, f"JS reads fields missing from allowlists: {accessed - allowed}"
 
 
@@ -203,10 +256,13 @@ def test_serialize_landing_includes_engine_fields():
     """Regression: serialize_landing must include engine_recommendation and migration_plans."""
     import json
     from decimal import Decimal
-    from bq_assess.report._serialize import serialize_landing
+
     from bq_assess.models import (
-        EngineRecommendation, SignalContribution, MigrationDML,
+        EngineRecommendation,
+        MigrationDML,
+        SignalContribution,
     )
+    from bq_assess.report._serialize import serialize_landing
 
     # Build minimal assessment with engine fields
     entities = [_make_entity("ds.tbl", EntityPopulation.TABLE, EntityType.TABLE)]
@@ -255,6 +311,7 @@ def test_athena_one_time_optimize_serializes():
     """Verify athena_one_time_optimize flows through serialization (Decimal → float)."""
     import json
     from decimal import Decimal
+
     from bq_assess.report._serialize import serialize_landing
 
     entities = [_make_entity("ds.tbl", EntityPopulation.TABLE, EntityType.TABLE)]

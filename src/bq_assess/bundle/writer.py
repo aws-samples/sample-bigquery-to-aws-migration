@@ -8,8 +8,9 @@ from dataclasses import asdict
 from datetime import datetime
 from enum import Enum
 
-from bq_assess.bundle.models import Bundle, SCHEMA_VERSION, sha256_file
-from bq_assess.core.disclaimer import FULL_DISCLAIMER, DISCLAIMER_VERSION
+from bq_assess.bundle.models import SCHEMA_VERSION, Bundle, sha256_file
+from bq_assess.core.disclaimer import DISCLAIMER_VERSION, FULL_DISCLAIMER
+from bq_assess.core.storage_stats import ASSUMED_PHYSICAL_RATIO
 from bq_assess.models import EntityType
 
 
@@ -37,29 +38,46 @@ class BundleWriter:
         return bundle_dir
 
     def _write_tables(self, bundle: Bundle, bundle_dir: str) -> str:
-        tables = []
-        for e in bundle.entities:
-            if e.entity_type == EntityType.ROUTINE:
-                continue
-            tables.append({
-                "full_name": e.full_name,
-                "dataset_id": e.dataset_id,
-                "entity_id": e.entity_id,
-                "entity_type": e.entity_type.value,
-                "population": e.population.value,
-                "num_rows": e.num_rows,
-                "num_bytes": e.num_bytes,
-                "physical_bytes": e.physical_bytes,
-                "columns": [self._col_to_dict(c) for c in e.columns],
-                "time_partitioning": self._tp_to_dict(e.time_partitioning),
-                "range_partitioning": self._rp_to_dict(e.range_partitioning),
-                "clustering_fields": e.clustering_fields,
-                "view_query": e.view_query,
-                "mview_query": e.mview_query,
-                "depends_on": e.depends_on,
-                "last_modified": e.last_modified.isoformat() if e.last_modified else None,
-            })
-        return self._dump_json(tables, bundle_dir, "tables.json")
+        # Streamed: one dict serialized per entity, written immediately. The
+        # previous parallel list-of-dicts (plus indent=2) held a second full
+        # copy of the inventory at write time — multi-GB at 500k tables
+        # (2026-07-28 scale review finding #8). Same JSON array on disk,
+        # minus pretty-printing; the loader json.loads() it either way.
+        # One entity per line: still a valid streamed JSON array, but customers
+        # are told to REVIEW this file before sending (it carries their view
+        # SQL) — a single unbroken multi-hundred-MB line defeats every pager
+        # and line-oriented diff (2026-07-28 review).
+        path = os.path.join(bundle_dir, "tables.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[\n")
+            first = True
+            for e in bundle.entities:
+                if e.entity_type == EntityType.ROUTINE:
+                    continue
+                row = {
+                    "full_name": e.full_name,
+                    "dataset_id": e.dataset_id,
+                    "entity_id": e.entity_id,
+                    "entity_type": e.entity_type.value,
+                    "population": e.population.value,
+                    "num_rows": e.num_rows,
+                    "num_bytes": e.num_bytes,
+                    "physical_bytes": e.physical_bytes,
+                    "columns": [self._col_to_dict(c) for c in e.columns],
+                    "time_partitioning": self._tp_to_dict(e.time_partitioning),
+                    "range_partitioning": self._rp_to_dict(e.range_partitioning),
+                    "clustering_fields": e.clustering_fields,
+                    "view_query": e.view_query,
+                    "mview_query": e.mview_query,
+                    "depends_on": e.depends_on,
+                    "last_modified": e.last_modified.isoformat() if e.last_modified else None,
+                }
+                if not first:
+                    f.write(",\n")
+                json.dump(row, f, ensure_ascii=False, default=str)
+                first = False
+            f.write("\n]")
+        return sha256_file(path)
 
     def _write_routines(self, bundle: Bundle, bundle_dir: str) -> str:
         routines = []
@@ -129,8 +147,15 @@ class BundleWriter:
             "project_id": bundle.project_id,
             "bq_location": bundle.bq_location,
             "aws_region": bundle.aws_region,
+            # All dataset locations found (v2). bq_location stays the PRIMARY
+            # region (most datasets) — the single pricing anchor. Never empty:
+            # Bundle.__post_init__ normalizes.
+            "regions": bundle.regions,
             "entity_count": len(bundle.entities),
             "storage_basis": bundle.storage_basis,
+            # Ratio the fallback physical_bytes were baked at — lets the loader
+            # detect (and re-derive past) a stale ratio in "assumed" bundles.
+            "assumed_physical_ratio": ASSUMED_PHYSICAL_RATIO,
             "created_at": bundle.created_at or datetime.utcnow().isoformat(),
             "disclaimer_version": DISCLAIMER_VERSION,
             "disclaimer": FULL_DISCLAIMER,

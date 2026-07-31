@@ -102,6 +102,7 @@ class QueryAnalyzer:
         client,  # google.cloud.bigquery.Client
         project_id: str,
         days: int = 30,
+        location: str = "US",
     ) -> QueryAnalysis:
         """Read and analyze query logs from INFORMATION_SCHEMA.JOBS.
 
@@ -115,6 +116,9 @@ class QueryAnalyzer:
             GCP project whose query logs should be analysed.
         days:
             Number of days of history to read (default 30).
+        location:
+            BigQuery location the datasets live in (e.g. ``"EU"``); the query
+            job is pinned there so the region-qualified view resolves.
 
         Returns
         -------
@@ -128,7 +132,7 @@ class QueryAnalyzer:
         """
         sql = (
             f"SELECT query, total_bytes_processed, creation_time "
-            f"FROM `{project_id}`.`region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT "
+            f"FROM `{project_id}`.`region-{location.lower()}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT "
             f"WHERE job_type = 'QUERY' "
             f"AND state = 'DONE' "
             f"AND creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY) "
@@ -136,7 +140,10 @@ class QueryAnalyzer:
         )
 
         try:
-            rows = client.query(sql).result()
+            # location= pins the query job to the data's region — a region-
+            # qualified view only resolves when the job runs there (the
+            # 2026-07-23 TABLE_STORAGE bug class; was hardcoded region-us).
+            rows = client.query(sql, location=location).result()
         except Exception as exc:
             msg = str(exc)
             if "Access Denied" in msg or "403" in msg or "permission" in msg.lower():

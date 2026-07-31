@@ -17,12 +17,17 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
 
 import click
 import yaml
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -31,29 +36,48 @@ from bq_assess.bundle import Bundle, BundleLoader, BundleWriter
 from bq_assess.bundle.loader import BundleError
 from bq_assess.collector import collect
 from bq_assess.core.disclaimer import CLI_ONE_LINER
-from bq_assess.core.sql_surface import SQLSurfaceAnalyzer
-from bq_assess.core.relationships import RelationshipInferrer
 from bq_assess.core.price_lookup import (
-    PriceLookup, PricingTimeout, apply_live_rates, fetch_live_rates_with_timeout,
+    PriceLookup,
+    PricingTimeout,
+    apply_live_rates,
+    fetch_live_rates_with_timeout,
     rates_from_dict,
 )
+from bq_assess.core.relationships import RelationshipInferrer
+from bq_assess.core.sql_surface import SQLSurfaceAnalyzer
 from bq_assess.core.storage_stats import effective_physical_bytes
-from bq_assess.targets.iceberg.converter import IcebergConverter
-from bq_assess.scoring.effort import EffortScorer
-from bq_assess.scoring.complexity import ComplexityScorer
-from bq_assess.engine.redshift.rewrite import RewriteGuide
-from bq_assess.engine.redshift.placement import PlacementAdvisor
-from bq_assess.engine.redshift.cost import CostEstimator
-from bq_assess.report.json_writer import JSONWriter
-from bq_assess.report.html_writer import HTMLWriter
 from bq_assess.engine.comparison import assemble_cost_comparison
+from bq_assess.engine.redshift.cost import CostEstimator, _window_days
+from bq_assess.engine.redshift.placement import PlacementAdvisor
+from bq_assess.engine.redshift.rewrite import RewriteGuide
 from bq_assess.models import (
-    Assessment, AssessmentSummary, EntityReport, EntityPopulation,
-    EffortResult, ComplexityResult, PlacementRecommendation, TranslationResult,
-    FailureRecord, ConfidenceLevel, CostComparison, BQPricingModel, MigrationDML,
-    EntityMetadata, SlotUtilization, EngineConfig, WorkloadProfile,
+    Assessment,
+    AssessmentSummary,
+    BQPricingModel,
+    ComplexityResult,
+    ConfidenceLevel,
+    CostComparison,
+    EffortResult,
+    EngineConfig,
+    EntityMetadata,
+    EntityPopulation,
+    EntityReport,
+    FailureRecord,
+    MigrationDML,
+    PlacementRecommendation,
     PricingDetection,
+    SlotUtilization,
+    StoragePlacement,
+    StorageTarget,
+    TargetEngine,
+    TranslationResult,
+    WorkloadProfile,
 )
+from bq_assess.report.html_writer import HTMLWriter
+from bq_assess.report.json_writer import JSONWriter
+from bq_assess.scoring.complexity import ComplexityScorer
+from bq_assess.scoring.effort import EffortScorer
+from bq_assess.targets.iceberg.converter import IcebergConverter
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -72,9 +96,8 @@ def _build_workload_profile(
     if not slots or slots.total_queries == 0:
         return WorkloadProfile()
 
-    # Base profile from slots
-    # Use the same window calculation as cost.py to ensure queries_per_day is consistent
-    lookback_days = max(getattr(slots, "lookback_days", slots.days_sampled), slots.days_sampled, 1)
+    # Base profile from slots — use cost.py's canonical window calculation
+    lookback_days = _window_days(slots)
 
     profile = WorkloadProfile(
         has_data=True,
@@ -239,10 +262,10 @@ def _interactive_prompts(params: dict) -> dict:
                 console.print("[yellow]Invalid cost value, will calculate automatically.[/yellow]")
 
     if not params.get("output"):
-        params["output"] = Prompt.ask("Output directory", default="reports/")
+        params["output"] = Prompt.ask("Output directory", default="bq-migration/")
 
     if not params.get("format"):
-        params["format"] = Prompt.ask("Output formats (json,html)", default="json,html")
+        params["format"] = Prompt.ask("Output formats (html,json)", default="html")
 
     return params
 
@@ -303,7 +326,7 @@ def _engine_prompts(params: dict, has_clustering: bool = False) -> dict:
 
 def _validate_report_params(params: dict) -> list[str]:
     """Validate output format params; return the parsed formats list. Exits on error."""
-    output_format: str = params.get("format", "json,html")
+    output_format: str = params.get("format", "html")
     formats = [f.strip().lower() for f in output_format.split(",") if f.strip()]
     for fmt in formats:
         if fmt not in ("json", "html"):
@@ -324,9 +347,14 @@ def _validate_collect_params(params: dict) -> None:
         console.print("[red]Error: provide --credentials or --use-adc[/red]")
         sys.exit(1)
 
-    # Load reservation config if provided (parsed here so collect() stays file-free)
+    # Load reservation config if provided (deprecated — auto-read replaces this)
     reservation_config_path: str | None = params.get("reservation_config")
     if reservation_config_path:
+        console.print(
+            "[yellow]⚠ --reservation-config is deprecated. Reservation details are now "
+            "auto-read during collection. Use --bigquery-monthly-cost to override the "
+            "total BQ cost instead.[/yellow]"
+        )
         try:
             with open(reservation_config_path, encoding="utf-8") as f:
                 if reservation_config_path.endswith(".json"):
@@ -358,7 +386,10 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     cli_engine_params = params.get("_cli_engine_params", {})
 
     bigquery_monthly_cost: float | None = params.get("bigquery_monthly_cost")
-    output_dir: str = params.get("output", "reports/")
+    base_output_dir: str = params.get("output", "bq-migration/")
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    project_folder = f"{gcp_project}_{run_date}"
+    output_dir = str(Path(base_output_dir) / project_folder / "report")
     formats = _validate_report_params(params)
 
     if not entities:
@@ -376,7 +407,17 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         console.print(f"[green]✓ {len(query_log_text)} anonymized statements available for analysis.[/green]")
 
     constructs_by_entity = sql_analyzer.detect_for_entities(entities, query_log_text)
+    # Constructs found in the collected workload (application/BI queries) live in
+    # the __ad_hoc__ bucket — not owned by any entity, surfaced on the report's
+    # Query Complexity tab as a workload-level finding (R10.5).
+    workload_constructs = sorted(
+        c.construct_class for c in constructs_by_entity.pop("__ad_hoc__", [])
+    )
     console.print(f"[green]✓ Detected SQL constructs for {len(constructs_by_entity)} entities.[/green]")
+    if workload_constructs:
+        console.print(
+            f"[green]✓ Workload query logs contain: {', '.join(workload_constructs)}.[/green]"
+        )
 
     # ── Stage 4: Iceberg Conversion ────────────────────────────────
     console.print("\n[bold]Stage 4:[/bold] Converting TABLE entities to Iceberg schemas...")
@@ -551,11 +592,35 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         effort_total = sum(er.score for er in effort_results.values())
 
         try:
+            # Long-term storage anchors to collection time, not report time —
+            # a bundle re-processed months later must not drift tables long-term.
+            as_of = None
+            if bundle.created_at:
+                try:
+                    as_of = datetime.fromisoformat(bundle.created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
             cost_comparison = cost_estimator.estimate(
                 entities, pricing, slots, bigquery_monthly_cost, effort_total,
                 location=detected_location,
                 storage_basis=storage_basis,
+                as_of=as_of,
             )
+            # Multi-region caveat (2026-07-28 review): the v2 collector merges
+            # all regions' bytes and workload into the totals, but both clouds
+            # are priced at the PRIMARY region's rates. Without this note the
+            # report asserts a single-region mapping over multi-region data.
+            other_regions = [r for r in bundle.regions if r != bundle.bq_location]
+            if other_regions:
+                cost_comparison.pricing_notes.append(
+                    f"Multi-region Source: datasets also live in "
+                    f"{', '.join(other_regions)}, and their storage and workload are "
+                    f"INCLUDED in the totals — but both clouds are priced at the "
+                    f"primary region's rates ({bundle.bq_location} / "
+                    f"{bundle.aws_region}). Regional rate differences are not "
+                    f"reflected; treat the comparison as primary-region pricing "
+                    f"applied to the whole estate."
+                )
             console.print("[green]✓ Cost estimation complete.[/green]")
         except Exception as exc:
             console.print(f"[yellow]⚠ Cost estimation failed: {exc}[/yellow]")
@@ -598,72 +663,10 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     # ── Stage 11: (removed — load_sync_dml superseded by engine/athena/migration) ──
 
-    # ── Stage 12: Rewrite Guidance ─────────────────────────────────
-    console.print("\n[bold]Stage 12:[/bold] Generating rewrite guidance...")
-    rewrite_guide = RewriteGuide()
-    guidance_results: dict[str, list[str]] = {}
-
-    for entity in entities:
-        try:
-            constructs = constructs_by_entity.get(entity.full_name, [])
-            if constructs:
-                guidance = rewrite_guide.guide(entity, constructs)
-                guidance_results[entity.full_name] = guidance
-        except Exception as exc:
-            console.print(f"[yellow]⚠ Guidance generation failed for {entity.full_name}: {exc}[/yellow]")
-
-    console.print(f"[green]✓ Generated guidance for {len(guidance_results)} entities.[/green]")
-
-    # ── Stage 12b: Best-Effort SQL Translation ─────────────────────
-    translation_results: dict[str, TranslationResult] = {}
-
-    if params.get("skip_translation"):
-        console.print("\n[bold]Stage 12b:[/bold] SQL translation [yellow]skipped[/yellow] (--skip-translation).")
-    else:
-        console.print("\n[bold]Stage 12b:[/bold] Translating SQL to Redshift...")
-        translation_cache: dict[str, TranslationResult] = {}
-
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Translating...", total=len(entities))
-            for entity in entities:
-                try:
-                    sql = entity.view_query or entity.mview_query or (entity.routine.body if entity.routine else None)
-                    if sql:
-                        if sql in translation_cache:
-                            translation_results[entity.full_name] = translation_cache[sql]
-                        else:
-                            result = rewrite_guide.translate(sql)
-                            translation_cache[sql] = result
-                            translation_results[entity.full_name] = result
-                except Exception as exc:
-                    console.print(f"[yellow]⚠ Translation failed for {entity.full_name}: {exc}[/yellow]")
-                progress.advance(task)
-
-        console.print(f"[green]✓ Translated SQL for {len(translation_results)} entities.[/green]")
-
-    # ── Stage 13: Placement ────────────────────────────────────────
-    console.print("\n[bold]Stage 13:[/bold] Recommending placement for REBUILT entities...")
-    placement_advisor = PlacementAdvisor()
-    placement_results: dict[str, PlacementRecommendation] = {}
-
-    rebuilt_entities = [e for e in entities if e.population == EntityPopulation.REBUILT]
-    for entity in rebuilt_entities:
-        try:
-            placement = placement_advisor.recommend(entity, rel_result, has_query_logs)
-            if placement:
-                placement_results[entity.full_name] = placement
-        except Exception as exc:
-            console.print(f"[yellow]⚠ Placement recommendation failed for {entity.full_name}: {exc}[/yellow]")
-
-    console.print(f"[green]✓ Recommended placement for {len(placement_results)} entities.[/green]")
-
-    # ── Stage 13b: Engine Recommendation ──────────────────────────────
-    console.print("\n[bold]Stage 13b:[/bold] Running engine recommendation...")
-    from bq_assess.engine.recommendation import RecommendationScorer
+    # ── Stage 11b: Engine Recommendation (moved before translation so Stages 12/13 are engine-aware) ──
+    console.print("\n[bold]Stage 11b:[/bold] Running engine recommendation...")
     from bq_assess.core.engine_config import resolve_engine_config
+    from bq_assess.engine.recommendation import RecommendationScorer
 
     # Map CLI "both" sentinel to None so RecommendationScorer runs its 8-signal analysis
     # instead of treating "both" as a user-specified override.
@@ -707,6 +710,178 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     engine_recommendation = recommendation_scorer.recommend(workload_profile, engine_config)
     console.print(f"[green]✓ Recommended engine: {engine_recommendation.primary_engine} (confidence: {engine_recommendation.confidence:.0%})[/green]")
 
+    # ── Engine toolkit selection (Fix 7: consolidated dispatch) ────────────────────
+    # Select rewrite guide, placement advisor, and label ONCE based on recommended engine.
+    if engine_recommendation.primary_engine == TargetEngine.ATHENA:
+        from bq_assess.engine.athena.placement import AthenaPlacementAdvisor
+        from bq_assess.engine.athena.rewrite import AthenaRewriteGuide
+        rewrite_guide = AthenaRewriteGuide()
+        _placement_advisor: AthenaPlacementAdvisor | PlacementAdvisor = AthenaPlacementAdvisor()
+        _engine_label = "Athena"
+        _is_athena = True
+    else:
+        rewrite_guide = RewriteGuide()
+        _placement_advisor = PlacementAdvisor()
+        _engine_label = "Redshift"
+        _is_athena = False
+
+    # ── Stage 12: Rewrite Guidance (engine-aware) ─────────────────────────────────
+    console.print("\n[bold]Stage 12:[/bold] Generating rewrite guidance...")
+
+    guidance_results: dict[str, list[str]] = {}
+
+    for entity in entities:
+        try:
+            constructs = constructs_by_entity.get(entity.full_name, [])
+            if constructs:
+                guidance = rewrite_guide.guide(entity, constructs)
+                guidance_results[entity.full_name] = guidance
+        except Exception as exc:
+            console.print(f"[yellow]⚠ Guidance generation failed for {entity.full_name}: {exc}[/yellow]")
+
+    console.print(f"[green]✓ Generated guidance for {len(guidance_results)} entities ({_engine_label}).[/green]")
+
+    # ── Stage 12b: Best-Effort SQL Translation (engine-aware) ─────────────────────
+    translation_results: dict[str, TranslationResult] = {}
+
+    if params.get("skip_translation"):
+        console.print("\n[bold]Stage 12b:[/bold] SQL translation [yellow]skipped[/yellow] (--skip-translation).")
+    else:
+        console.print(f"\n[bold]Stage 12b:[/bold] Translating SQL to {_engine_label}...")
+        translation_cache: dict[str, TranslationResult] = {}
+
+        with Progress(
+            SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+            BarColumn(), TaskProgressColumn(), console=console,
+        ) as progress:
+            task = progress.add_task("Translating...", total=len(entities))
+            for entity in entities:
+                try:
+                    # A JAVASCRIPT routine's body is JS, not SQL — translating it
+                    # through a SQL transpiler just echoes the JS (or garbage) back.
+                    # Emit an explicit not-translatable result instead.
+                    if entity.routine is not None and entity.routine.language == "JAVASCRIPT":
+                        translation_results[entity.full_name] = TranslationResult(
+                            redshift_sql=(
+                                "-- Not translatable: JavaScript UDF (body is JavaScript, not SQL).\n"
+                                "-- Rewrite by hand: "
+                                + ("as a SQL expression or an Athena/Spark job."
+                                   if _is_athena else
+                                   "as a SQL UDF or a Redshift Lambda UDF (Node.js).")
+                            ),
+                            confidence="LOW",
+                            warnings=["BLOCKER: JavaScript UDF — manual rewrite required"],
+                            target_engine="athena" if _is_athena else "redshift",
+                        )
+                        progress.advance(task)
+                        continue
+                    sql = entity.view_query or entity.mview_query or (entity.routine.body if entity.routine else None)
+                    if sql:
+                        if sql in translation_cache:
+                            translation_results[entity.full_name] = translation_cache[sql]
+                        else:
+                            if _is_athena:
+                                engine_rewrite = rewrite_guide.translate(sql)
+                                merged_warnings = engine_rewrite.warnings + [
+                                    f"BLOCKER: {c}" for c in engine_rewrite.unsupported_constructs
+                                ]
+                                result = TranslationResult(
+                                    redshift_sql=engine_rewrite.translated_sql,
+                                    confidence=engine_rewrite.confidence,
+                                    warnings=merged_warnings,
+                                    target_engine="athena",
+                                )
+                            else:
+                                result = rewrite_guide.translate(sql)
+                            translation_cache[sql] = result
+                            translation_results[entity.full_name] = result
+                except Exception as exc:
+                    console.print(f"[yellow]⚠ Translation failed for {entity.full_name}: {exc}[/yellow]")
+                progress.advance(task)
+
+        console.print(f"[green]✓ Translated SQL for {len(translation_results)} entities ({_engine_label}).[/green]")
+
+    # ── Stage 13: Placement (engine-aware) ────────────────────────────────────────
+    console.print("\n[bold]Stage 13:[/bold] Recommending placement for REBUILT entities...")
+    placement_results: dict[str, PlacementRecommendation] = {}
+
+    rebuilt_entities = [e for e in entities if e.population == EntityPopulation.REBUILT]
+    for entity in rebuilt_entities:
+        try:
+            if _is_athena:
+                athena_placement = _placement_advisor.recommend(entity, has_logs=has_query_logs)
+                if athena_placement:
+                    # Map EnginePlacement → PlacementRecommendation for downstream compat
+                    placement_results[entity.full_name] = PlacementRecommendation(
+                        home=athena_placement.home,
+                        signals=athena_placement.signals,
+                        confidence=ConfidenceLevel[athena_placement.confidence] if isinstance(athena_placement.confidence, str) else athena_placement.confidence,
+                        refresh_unverified=False,
+                    )
+            else:
+                placement = _placement_advisor.recommend(entity, rel_result, has_query_logs)
+                if placement:
+                    placement_results[entity.full_name] = placement
+        except Exception as exc:
+            console.print(f"[yellow]⚠ Placement recommendation failed for {entity.full_name}: {exc}[/yellow]")
+
+    console.print(f"[green]✓ Recommended placement for {len(placement_results)} entities ({_engine_label}).[/green]")
+
+    # ── Stage 13a: Storage Placement (ADR-0005, Redshift path only) ──────────
+    # Iceberg stays the default for every entity; RMS is a per-entity hot-tier
+    # exception, only reachable when Redshift is the primary Query Engine
+    # (Athena cannot query RMS-native tables). RMS entities get a two-phase
+    # load, so their effort is re-scored (+1 rms_two_phase_load).
+    storage_placement_results: dict[str, StoragePlacement] = {}
+    if not _is_athena:
+        from bq_assess.engine.redshift.storage_placement import StoragePlacementAdvisor
+        from bq_assess.scoring.effort import amend_for_rms_placement
+        console.print("\n[bold]Stage 13a:[/bold] Recommending storage placement (Iceberg vs RMS)...")
+        storage_advisor = StoragePlacementAdvisor(query_sla_ms=engine_config.query_sla_ms)
+        rms_count = 0
+        for entity in table_entities:
+            try:
+                sp = storage_advisor.recommend(entity, conversion_results.get(entity.full_name))
+                storage_placement_results[entity.full_name] = sp
+                if sp.target == StorageTarget.RMS:
+                    rms_count += 1
+                    if entity.full_name in effort_results:
+                        effort_results[entity.full_name] = amend_for_rms_placement(
+                            effort_results[entity.full_name]
+                        )
+            except Exception as exc:
+                console.print(f"[yellow]⚠ Storage placement failed for {entity.full_name}: {exc}[/yellow]")
+        console.print(
+            f"[green]✓ Storage placement: {len(storage_placement_results) - rms_count} Iceberg, "
+            f"{rms_count} RMS (hot-tier exception).[/green]"
+        )
+        # Stage 10 priced migration effort BEFORE the RMS amendments above — reprice
+        # so the cost summary agrees with the amended per-entity effort cards, and
+        # split the storage line: RMS-placed bytes bill as RMS (serverless bills RMS
+        # separately by GB/month), not S3 Tables.
+        if rms_count and pricing:
+            from bq_assess.engine.redshift.cost import (
+                apply_rms_storage_split,
+                reprice_migration_effort,
+            )
+            reprice_migration_effort(
+                cost_comparison, sum(er.score for er in effort_results.values())
+            )
+            rms_physical_bytes = sum(
+                effective_physical_bytes(e.num_bytes, e.physical_bytes)
+                for e in table_entities
+                if storage_placement_results.get(e.full_name) is not None
+                and storage_placement_results[e.full_name].target == StorageTarget.RMS
+            )
+            total_physical_bytes = sum(
+                effective_physical_bytes(e.num_bytes, e.physical_bytes)
+                for e in entities
+            )
+            apply_rms_storage_split(
+                cost_comparison, rms_physical_bytes, total_physical_bytes
+            )
+
+    # ── Stage 13b: Engine-Aware Cost Comparison ──────────────────────────────
     # Assemble engine-aware cost comparison with all scenarios in ONE pass (Fix 1/3/4/5)
     # The Athena scenario is built whenever workload data exists, regardless of pricing.
     # When pricing is None (offline bundle without pricing), cost_comparison is a sentinel
@@ -733,12 +908,29 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     # ── Stage 13c: Athena Assessment ──────────────────────────────────
     console.print("\n[bold]Stage 13c:[/bold] Running Athena assessment...")
-    from bq_assess.engine.athena.migration import AthenaMigrationGenerator
+    from bq_assess.engine.athena.migration import (
+        AthenaMigrationGenerator,
+        generate_source_db_setup,
+    )
 
-    athena_migration = AthenaMigrationGenerator()
+    # Generate source database setup DDL (one-time prerequisite for all INSERTs)
+    datasets_used = sorted({e.dataset_id for e in table_entities})
+    source_db_setup: list[str] = []
+    connector_name: str | None = None
+    if datasets_used:
+        primary_dataset = datasets_used[0]
+        setup_stmts, connector_name = generate_source_db_setup(
+            dataset_id=primary_dataset,
+            gcp_project=gcp_project,
+            tables=table_entities,
+            target_region=engine_config.target_region,
+        )
+        source_db_setup = setup_stmts
+
+    athena_migration = AthenaMigrationGenerator(connector_name=connector_name)
 
     # Generate migration DML for all tables
-    migration_plans: Dict[str, MigrationDML] = {}
+    migration_plans: dict[str, MigrationDML] = {}
     for entity in table_entities:
         conversion = conversion_results.get(entity.full_name)
         if conversion:
@@ -790,6 +982,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         complexity_counts=complexity_counts,
         sql_surface_confidence=sql_confidence,
         total_logical_size_gb=round(total_logical_size_gb, 4),
+        workload_constructs=workload_constructs,
     )
 
     # Build entity reports
@@ -816,6 +1009,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             translated_sql=translation_results.get(entity.full_name),
             placement=placement,
             physical_bytes=entity.physical_bytes,
+            storage_placement=storage_placement_results.get(entity.full_name),
         ))
 
     # Generate assessment ID
@@ -834,12 +1028,15 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         failures=failures,
         engine_recommendation=engine_recommendation,
         migration_plans=migration_plans,
+        source_db_setup=source_db_setup or None,
     )
 
     console.print("[green]✓ Assessment assembled.[/green]")
 
-    # ── Stage 15: Write Reports ────────────────────────────────────
-    console.print("\n[bold]Stage 15:[/bold] Writing reports...")
+    # ── Stage 15: Write Deliverables ─────────────────────────────────
+    console.print("\n[bold]Stage 15:[/bold] Writing deliverables...")
+
+    project_dir = str(Path(base_output_dir) / project_folder)
 
     # Ensure output directory exists
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -860,13 +1057,70 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         for path in paths:
             console.print(f"  [green]✓ HTML report: {path}[/green]")
 
+    # Terraform infrastructure files
+    from bq_assess.engine.athena.terraform import generate_terraform
+    datasets_used = sorted({e.dataset_id for e in table_entities})
+    if datasets_used:
+        tf_dir = generate_terraform(
+            project_dir=project_dir,
+            dataset_id=datasets_used[0],
+            gcp_project=gcp_project,
+            tables=table_entities,
+            target_region=engine_config.target_region,
+        )
+        output_files.append(tf_dir)
+        console.print(f"  [green]✓ Terraform: {tf_dir}[/green]")
+
+    # Migration scripts (plan.json + run_migration.py)
+    if migration_plans:
+        from bq_assess.engine.athena.migration_scripts import generate_migration_scripts
+        from bq_assess.engine.athena.naming import workgroup_name as _wg_name
+        # Same derivation generate_terraform uses (single source: engine/athena/naming)
+        tf_workgroup = _wg_name(datasets_used[0]) if datasets_used else None
+        mig_dir = generate_migration_scripts(
+            project_dir=project_dir,
+            migration_plans=migration_plans,
+            connector_name=connector_name,
+            target_region=engine_config.target_region,
+            workgroup_name=tf_workgroup,
+            conversion_results=conversion_results,
+            storage_placements=storage_placement_results,
+            rebuilt_entities=[
+                e for e in entities if e.population is EntityPopulation.REBUILT
+            ],
+            translation_results=translation_results,
+            dataset_id=datasets_used[0] if datasets_used else None,
+        )
+        output_files.append(mig_dir)
+        console.print(f"  [green]✓ Migration scripts: {mig_dir}[/green]")
+
     # Bundle export (replaces the pre-0.3 metadata/ export — the bundle is a strict
     # superset and is re-processable by `bq-assess report`).
     if params.get("export_bundle", True):
         writer = BundleWriter()
-        bundle_dir = writer.write(bundle, output_dir)
+        bundle_dir = writer.write(bundle, project_dir)
         output_files.append(bundle_dir)
         console.print(f"  [green]✓ Bundle exported: {bundle_dir}[/green]")
+
+    # Customer-facing README at the project root
+    from bq_assess.report.readme_writer import write_readme
+    readme_path = write_readme(
+        project_dir=project_dir,
+        gcp_project=gcp_project,
+        has_report="html" in formats or "json" in formats,
+        has_terraform=bool(datasets_used),
+        has_migration=bool(migration_plans),
+        has_bundle=params.get("export_bundle", True),
+        has_rebuilt_entities=bool(rebuilt_entities),
+        has_redshift_phase=bool(
+            storage_placement_results and any(
+                p.target == StorageTarget.RMS
+                for p in storage_placement_results.values()
+            )
+        ),
+    )
+    output_files.append(readme_path)
+    console.print(f"  [green]✓ README: {readme_path}[/green]")
 
     # ── Stage 16: Terminal Summary ─────────────────────────────────
     _print_summary(assessment, output_files)
@@ -1016,7 +1270,7 @@ def main() -> None:
 def _assess_options(f):
     """Click options for the assess subcommand (registered once, here only)."""
     options = [
-        click.option("--gcp-project", default=None, help="GCP project ID (required)."),
+        click.option("--gcp-project", default=None, help="GCP project ID, or 'all' to assess every accessible project."),
         click.option("--credentials", default=None, help="Path to service account JSON."),
         click.option("--use-adc", is_flag=True, default=False, help="Use Application Default Credentials."),
         click.option("--datasets", default=None, help="Comma-separated dataset filter."),
@@ -1029,9 +1283,9 @@ def _assess_options(f):
             help="Lookback window for INFORMATION_SCHEMA.JOBS in days (1-90, default: 30).",
         ),
         click.option("--bigquery-monthly-cost", type=float, default=None, help="Monthly BigQuery spend override."),
-        click.option("--reservation-config", default=None, help="Path to BigQuery reservation config YAML/JSON."),
-        click.option("--output", default=None, help="Output directory (default: reports/)."),
-        click.option("--format", "output_format", default=None, help="Output formats: json,html (default: json,html)."),
+        click.option("--reservation-config", default=None, hidden=True, help="[DEPRECATED] Reservation details are now auto-read. Use --bigquery-monthly-cost instead."),
+        click.option("--output", default=None, help="Output directory (default: bq-migration/)."),
+        click.option("--format", "output_format", default=None, help="Output formats: html,json (default: html)."),
         click.option("--interactive", is_flag=True, default=False, help="Interactive prompt mode."),
         click.option(
             "--export-bundle/--no-export-bundle", "export_bundle", default=True,
@@ -1115,8 +1369,12 @@ def assess_cmd(
     try:
         _validate_collect_params(params)
         _validate_report_params(params)
-        bundle = collect(params)
-        analyze_and_report(bundle, params)
+
+        if str(params.get("gcp_project", "")).lower() == "all":
+            _assess_all_projects(params)
+        else:
+            bundle = collect(params)
+            analyze_and_report(bundle, params)
     except KeyboardInterrupt:
         console.print("\n[yellow]Assessment interrupted by user.[/yellow]")
         sys.exit(1)
@@ -1126,13 +1384,124 @@ def assess_cmd(
         sys.exit(1)
 
 
+def _discover_projects(credentials_path: str | None) -> list[tuple[str, bool]]:
+    """List all GCP projects the caller can access that have BigQuery enabled.
+
+    Uses bigquery.Client.list_projects() — returns only projects visible to the
+    active credentials with the BigQuery API enabled. Each entry is
+    (project_id, has_datasets) so empty projects can be skipped up front.
+    """
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
+    if credentials_path:
+        creds = service_account.Credentials.from_service_account_file(credentials_path)
+        client = bigquery.Client(credentials=creds, project=creds.project_id)
+    else:
+        # ADC: project is irrelevant for list_projects; use any placeholder the
+        # credential resolves. bigquery.Client() picks up the ADC default.
+        client = bigquery.Client()
+
+    projects: list[tuple[str, bool]] = []
+    for p in sorted(client.list_projects(), key=lambda p: p.project_id):
+        try:
+            has_datasets = any(client.list_datasets(project=p.project_id, max_results=1))
+        except Exception:
+            has_datasets = False  # can't list — treated as empty, surfaced as SKIPPED
+        projects.append((p.project_id, has_datasets))
+    return projects
+
+
+def _assess_all_projects(params: dict) -> None:
+    """Discover all accessible projects and run the full pipeline for each.
+
+    Each project gets its own <project>_<date>/ output folder. One project
+    failing does not stop the others; a summary table prints at the end.
+    """
+    console.print("\n[bold]Discovering accessible GCP projects...[/bold]")
+    discovered = _discover_projects(params.get("credentials"))
+
+    if not discovered:
+        console.print("[red]No accessible GCP projects found for these credentials.[/red]")
+        sys.exit(1)
+
+    assessable = [pid for pid, has_data in discovered if has_data]
+    skipped = [pid for pid, has_data in discovered if not has_data]
+
+    console.print(
+        f"[green]✓ Found {len(discovered)} project(s):[/green] "
+        f"{len(assessable)} with BigQuery datasets, {len(skipped)} empty."
+    )
+    for pid in skipped:
+        console.print(f"  [dim]— skipping {pid} (no datasets)[/dim]")
+    console.print()
+
+    results: list[tuple[str, str]] = [(pid, "SKIPPED (no datasets)") for pid in skipped]
+    completed_assessments: list = []
+    for i, project_id in enumerate(assessable, 1):
+        console.print(f"\n[bold cyan]{'═' * 70}[/bold cyan]")
+        console.print(f"[bold cyan]Project {i}/{len(assessable)}: {project_id}[/bold cyan]")
+        console.print(f"[bold cyan]{'═' * 70}[/bold cyan]")
+
+        project_params = dict(params)
+        project_params["gcp_project"] = project_id
+        try:
+            bundle = collect(project_params)
+            assessment = analyze_and_report(bundle, project_params)
+            completed_assessments.append(assessment)
+            results.append((project_id, "OK"))
+        except SystemExit:
+            # collect() calls sys.exit(1) on fatal per-project errors — record
+            # and move on rather than aborting the remaining projects.
+            results.append((project_id, "FAILED"))
+        except Exception as exc:
+            logger.exception("Assessment failed for project %s", project_id)
+            console.print(f"[red]✗ {project_id}: {exc}[/red]")
+            results.append((project_id, "FAILED"))
+
+    # ── Cross-project SUMMARY.html ──────────────────────────────────
+    if completed_assessments:
+        from bq_assess.report.summary_writer import write_summary
+        base_output_dir = params.get("output") or "bq-migration/"
+        try:
+            summary_path = write_summary(completed_assessments, base_output_dir)
+            console.print(f"\n[green]✓ Cross-project summary: {summary_path}[/green]")
+        except Exception as exc:
+            logger.exception("Failed to write cross-project summary")
+            console.print(f"[yellow]⚠ Could not write cross-project summary: {exc}[/yellow]")
+
+    # ── Roll-up summary ─────────────────────────────────────────────
+    console.print(f"\n[bold]{'═' * 70}[/bold]")
+    console.print("[bold]Multi-project assessment summary[/bold]")
+    summary_table = Table(show_header=True)
+    summary_table.add_column("Project")
+    summary_table.add_column("Status")
+    ok_count = 0
+    failed_count = 0
+    for project_id, status in sorted(results):
+        if status == "OK":
+            style = "green"
+            ok_count += 1
+        elif status.startswith("SKIPPED"):
+            style = "dim"
+        else:
+            style = "red"
+            failed_count += 1
+        summary_table.add_row(project_id, f"[{style}]{status}[/{style}]")
+    console.print(summary_table)
+    console.print(f"\n{ok_count} assessed, {failed_count} failed, {len(results) - ok_count - failed_count} skipped.")
+
+    if ok_count == 0:
+        sys.exit(1)
+
+
 @main.command("report")
 @click.option(
     "--bundle", "bundle_path", required=True,
     help="Path to a bundle directory or .zip produced by bq-collect (or bq-assess assess).",
 )
-@click.option("--output", default=None, help="Output directory (default: reports/).")
-@click.option("--format", "output_format", default=None, help="Output formats: json,html (default: json,html).")
+@click.option("--output", default=None, help="Output directory (default: bq-migration/).")
+@click.option("--format", "output_format", default=None, help="Output formats: html,json (default: html).")
 @click.option("--bigquery-monthly-cost", type=float, default=None, help="Monthly BigQuery spend override.")
 @click.option("--skip-translation", is_flag=True, default=False, help="Skip SQL translation stage for faster runs.")
 @click.option(
@@ -1174,8 +1543,8 @@ def report_cmd(
 
     # Build params with CLI precedence (same pattern as assess)
     params: dict = {
-        "output": output or "reports/",
-        "format": output_format or "json,html",
+        "output": output or "bq-migration/",
+        "format": output_format or "html",
         "export_bundle": export_bundle,
         "refresh_pricing": refresh_pricing,
     }
@@ -1307,8 +1676,8 @@ def _build_params(**kwargs) -> dict:
 
     params.setdefault("use_adc", False)
     params.setdefault("include_query_logs", False)
-    params.setdefault("output", "reports/")
-    params.setdefault("format", "json,html")
+    params.setdefault("output", "bq-migration/")
+    params.setdefault("format", "html")
     params.setdefault("interactive", False)
 
     if params.get("interactive"):

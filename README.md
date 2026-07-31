@@ -58,12 +58,17 @@ Assess a specific engine, or let the tool recommend one (default assesses both):
 bq-assess --gcp-project my-project --use-adc --engine athena   # or: redshift | both
 ```
 
-For accurate cost estimates, add reservation details:
+BigQuery reservation details (for capacity-pricing customers) are auto-read during
+collection; override the BigQuery-side baseline explicitly if needed:
 
 ```bash
-bq-assess --gcp-project my-project --use-adc \
-  --reservation-config my-reservation-config.json \
-  --format html,json --output reports/
+bq-assess --gcp-project my-project --use-adc --bigquery-monthly-cost 12000
+```
+
+Assess every project you can access, with a cross-project summary:
+
+```bash
+bq-assess --gcp-project all --use-adc --format html,json --output reports/
 ```
 
 See the [CLI Reference](docs/CLI_REFERENCE.md) for all flags and options.
@@ -75,6 +80,8 @@ See the [CLI Reference](docs/CLI_REFERENCE.md) for all flags and options.
   - **Query Complexity** (PORTABLE / ADAPT / REWRITE) — SQL rewrite difficulty for the target engine
 - **Engine recommendation** — Athena vs Redshift Serverless, justified from your actual
   workload profile (queries/day, bytes scanned, concurrency, latency SLA)
+- **Per-entity storage placement** — S3 Tables (Iceberg) by default, with a Redshift
+  Managed Storage hot-tier exception where the workload justifies it (ADR-0005)
 - S3 Tables (Iceberg) DDL per table — Athena engine v3 and Redshift dialects
 - Directional cost comparison (BigQuery vs AWS), clearly labelled by confidence
 - HTML report (landing summary, effort breakdown, query detail) + matching JSON for automation

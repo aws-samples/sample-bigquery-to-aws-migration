@@ -14,11 +14,13 @@ from __future__ import annotations
 import logging
 import random
 import re
+import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import requests.exceptions
 from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -37,13 +39,52 @@ from bq_assess.models import (
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration for transient BigQuery API errors (R23.1)
+# Retry configuration for transient BigQuery API errors (R23.1, amended
+# 2026-07-28 — see requirements.md R23.1 note). 429s get a deeper ladder than
+# 500/503: throttling is guaranteed-recoverable (the quota refills), and giving
+# up after 7s converts backpressure into silently dropped entities at
+# 100k-table scale. Budgets are tracked PER ERROR CLASS — a 503 arriving after
+# a burst of 429s gets its own full budget, not the 429s' leftovers.
 RETRY_CONFIG = {
     "max_retries": 3,
+    "max_retries_throttled": 8,
     "initial_delay_seconds": 1.0,
-    "backoff_multiplier": 2.0,  # 1s, 2s, 4s
+    "backoff_multiplier": 2.0,  # 1s, 2s, 4s, ...
+    "max_delay_seconds": 60.0,
     "retryable_status_codes": [429, 500, 503],
 }
+
+# Global request budget: just under BigQuery's ~100 req/s/user default quota for
+# tables.get, shared by ALL scanner threads. Keeps 50-way concurrency from
+# sitting in sustained-429 territory on large projects.
+DEFAULT_MAX_REQUESTS_PER_SECOND = 80.0
+
+
+class RateLimiter:
+    """Global request-rate limiter shared across scanner threads.
+
+    ``acquire()`` blocks until the caller's turn. Implementation is a computed
+    sleep-slot rather than a token-bucket spin loop: under the lock each caller
+    atomically claims the next 1/rate-spaced timestamp, then sleeps exactly once
+    until its slot — one lock acquisition and at most one sleep per acquire, no
+    thundering-herd wakeups when many threads are blocked (a spin-loop variant
+    woke every waiter per token; 2026-07-28 review). Allows a 1-second burst
+    (slots may be claimed up to 1s in the past).
+    """
+
+    def __init__(self, max_per_second: float = DEFAULT_MAX_REQUESTS_PER_SECOND) -> None:
+        self._interval = 1.0 / float(max_per_second)
+        self._next_slot = time.monotonic() - 1.0  # allow an initial burst
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            slot = max(self._next_slot, now - 1.0)  # burst window: 1s of backlog
+            self._next_slot = slot + self._interval
+        wait = slot - now
+        if wait > 0:
+            time.sleep(wait)
 
 # BigQuery table_type string -> EntityType (R4.1). Unknown types fall back to TABLE.
 _TABLE_TYPE_MAP: dict[str, EntityType] = {
@@ -56,6 +97,40 @@ _TABLE_TYPE_MAP: dict[str, EntityType] = {
 
 class ScannerError(Exception):
     """Raised when the scanner encounters a fatal error (auth, project-not-found)."""
+
+
+class ScanAbortedError(ScannerError):
+    """Raised mid-scan when the failure rate crosses the abort threshold.
+
+    Lives in the scanner (which owns ``self.failures`` and sees every attempt,
+    including failure-only tails and dataset-listing failures) rather than in a
+    consumer's yield loop, where a failure-only tail never re-enters the loop
+    body (2026-07-28 review). Carries the counts for the caller's message.
+    """
+
+    def __init__(self, message: str, *, entity_failures: int, listing_failures: int,
+                 attempted: int) -> None:
+        super().__init__(message)
+        self.entity_failures = entity_failures
+        self.listing_failures = listing_failures
+        self.attempted = attempted
+
+
+# Abort thresholds: don't judge the rate until a meaningful sample has been
+# attempted — small projects can have a couple of flaky entities. Listing
+# failures are tracked SEPARATELY from entity failures because one failed
+# list_tables hides an unknown number of entities (counting it as one record
+# let a 40-dataset permission revocation slip a 0.08% rate past a 5% wire).
+ABORT_MIN_ATTEMPTED = 500
+ABORT_ENTITY_FAILURE_RATE = 0.05
+ABORT_MAX_LISTING_FAILURES = 3
+
+# Datasets scanned per pipeline chunk: listings for a chunk run in parallel,
+# then its entity fetches stream out before the next chunk starts. Bounds
+# resident Futures/Table objects to one chunk (a single project-wide dict
+# held every result for the whole scan — multi-GB at 100k tables) while still
+# batching listings (serial per-dataset listing cost thousands of round trips).
+DATASET_CHUNK_SIZE = 25
 
 
 def population_for(entity_type: EntityType) -> EntityPopulation:
@@ -81,13 +156,18 @@ class BigQueryScanner:
         credentials_path: str | None = None,
         use_adc: bool = False,
         max_concurrent_requests: int = 16,
+        max_requests_per_second: float = DEFAULT_MAX_REQUESTS_PER_SECOND,
     ) -> None:
         self._project_id = project_id
         self._credentials_path = credentials_path
         self._use_adc = use_adc
         self._max_concurrent = max_concurrent_requests
+        self._rate_limiter = RateLimiter(max_requests_per_second)
         self._client: bigquery.Client | None = None
         self.failures: list[FailureRecord] = []
+        self.dataset_locations: dict[str, str] = {}  # dataset_id → BQ region (from scanned Tables)
+        self._listing_failures = 0
+        self._scanned_count = 0
 
     # ------------------------------------------------------------------
     # Client initialisation
@@ -151,7 +231,10 @@ class BigQueryScanner:
     # ------------------------------------------------------------------
 
     def scan(
-        self, dataset_filter: list[str] | None = None
+        self,
+        dataset_filter: list[str] | None = None,
+        skip_datasets: set[str] | None = None,
+        on_chunk_complete=None,
     ) -> Iterator[EntityMetadata]:
         """Yield :class:`EntityMetadata` for every entity in the project.
 
@@ -160,116 +243,211 @@ class BigQueryScanner:
         ``dataset_filter`` is provided, only those datasets are scanned; otherwise all
         datasets in the project (R3.4).
 
+        Checkpoint/resume support (R5, 2026-07-28): ``skip_datasets`` excludes
+        datasets a prior interrupted scan already completed; ``on_chunk_complete``
+        is called after each dataset chunk fully streams out, with
+        ``(chunk_dataset_ids, chunk_entities)`` — the consistency point at which
+        a caller can durably checkpoint. Chunks contain whole datasets, so a
+        checkpointed dataset is never half-scanned.
+
         Transient API errors are retried (R23.1). Per-entity errors are recorded in
         ``self.failures`` and skipped so one bad entity never aborts the scan (R23.2).
         """
         client = self._get_client()
         self.failures = []
+        self.dataset_locations = {}
+        self._listing_failures = 0
+        self._scanned_count = 0
 
         datasets = self._list_datasets_with_retry(client)
         if dataset_filter:
             filter_set = set(dataset_filter)
             datasets = [ds for ds in datasets if ds.dataset_id in filter_set]
+        if skip_datasets:
+            datasets = [ds for ds in datasets if ds.dataset_id not in skip_datasets]
 
-        for dataset_ref in datasets:
-            dataset_id = dataset_ref.dataset_id
-            yield from self._scan_tables(client, dataset_id)
-            yield from self._scan_routines(client, dataset_id)
-
-    def _scan_tables(
-        self, client: bigquery.Client, dataset_id: str
-    ) -> Iterator[EntityMetadata]:
-        """Yield EntityMetadata for tables/views/mviews/external in a dataset.
-
-        Uses a thread pool to parallelize get_table calls (I/O-bound). On early exit
-        (KeyboardInterrupt, GeneratorExit) pending futures are cancelled immediately.
-        """
-        try:
-            table_items = self._list_tables_with_retry(client, dataset_id)
-        except Exception as exc:  # dataset-level failure → record + continue (R23.2)
-            logger.error("Failed to list tables in %s: %s", dataset_id, exc)
-            self.failures.append(
-                FailureRecord(entity_name=dataset_id, stage="scan", error=str(exc))
-            )
-            return
-
-        yield from self._parallel_fetch(
-            table_items,
-            lambda item: self._get_table_with_retry(client, item.reference),
-            lambda item: f"{item.dataset_id}.{item.table_id}",
-            _to_entity_metadata,
-        )
-
-    def _scan_routines(
-        self, client: bigquery.Client, dataset_id: str
-    ) -> Iterator[EntityMetadata]:
-        """Yield EntityMetadata for persistent routines (UDFs / procedures) — R3.3."""
-        try:
-            routines = self._list_routines_with_retry(client, dataset_id)
-        except Exception as exc:
-            logger.error("Failed to list routines in %s: %s", dataset_id, exc)
-            self.failures.append(
-                FailureRecord(
-                    entity_name=f"{dataset_id} (routines)",
-                    stage="scan",
-                    error=str(exc),
-                )
-            )
-            return
-
-        yield from self._parallel_fetch(
-            routines,
-            lambda r: _retry(lambda: client.get_routine(r.reference)),
-            lambda r: f"{dataset_id}.{r.routine_id}",
-            lambda full_routine: _routine_to_entity(full_routine, dataset_id),
-        )
-
-    # ------------------------------------------------------------------
-    # Parallel fetch helper
-    # ------------------------------------------------------------------
-
-    def _parallel_fetch(self, items, fetch_fn, name_fn, transform_fn) -> Iterator[EntityMetadata]:
-        """Submit fetch_fn for each item via thread pool; yield transform_fn(result).
-
-        On early exit (KeyboardInterrupt, GeneratorExit) pending futures are cancelled
-        immediately — the process never blocks waiting for in-flight work to drain.
-        """
+        # One pool for the whole scan, consumed in DATASET_CHUNK_SIZE chunks:
+        # a chunk's listings run in parallel, then its entity fetches stream out
+        # before the next chunk starts. This keeps listings batched (serial
+        # per-dataset listing was thousands of round trips) while bounding
+        # resident Futures/Table objects to one chunk and keeping entities
+        # flowing to the consumer from the first chunk (a whole-project futures
+        # dict blocked every yield behind ALL listings and held every result
+        # until the scan ended — 2026-07-28 review). On early exit
+        # (KeyboardInterrupt, GeneratorExit) pending futures are cancelled.
         pool = ThreadPoolExecutor(max_workers=self._max_concurrent)
-        futures: dict[Future, str] = {}
         try:
-            for item in items:
-                futures[pool.submit(fetch_fn, item)] = name_fn(item)
-            for future in as_completed(futures):
-                full_name = futures[future]
-                try:
-                    yield transform_fn(future.result())
-                except Exception as exc:
-                    logger.error("Failed to scan entity %s: %s", full_name, exc)
-                    self.failures.append(
-                        FailureRecord(entity_name=full_name, stage="scan", error=str(exc))
+            for start in range(0, len(datasets), DATASET_CHUNK_SIZE):
+                chunk = datasets[start:start + DATASET_CHUNK_SIZE]
+                if on_chunk_complete is None:
+                    yield from self._scan_dataset_chunk(client, pool, chunk)
+                else:
+                    chunk_entities: list[EntityMetadata] = []
+                    for entity in self._scan_dataset_chunk(client, pool, chunk):
+                        chunk_entities.append(entity)
+                        yield entity
+                    on_chunk_complete(
+                        [d.dataset_id for d in chunk], chunk_entities
                     )
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+
+    def _scan_dataset_chunk(
+        self, client: bigquery.Client, pool: ThreadPoolExecutor, datasets: list
+    ) -> Iterator[EntityMetadata]:
+        """List one chunk of datasets in parallel, then stream its entity fetches."""
+        list_futures: dict[Future, tuple[str, str]] = {}
+        for dataset_ref in datasets:
+            ds = dataset_ref.dataset_id
+            list_futures[pool.submit(self._list_tables_with_retry, client, ds)] = ("tables", ds)
+            list_futures[pool.submit(self._list_routines_with_retry, client, ds)] = ("routines", ds)
+
+        fetch_futures: dict[Future, tuple[str, str, str]] = {}
+        for future in as_completed(list_futures):
+            kind, ds = list_futures[future]
+            try:
+                items = future.result()
+            except Exception as exc:  # dataset-level failure → record + continue (R23.2)
+                name = ds if kind == "tables" else f"{ds} (routines)"
+                logger.error("Failed to list %s in %s: %s", kind, ds, exc)
+                self.failures.append(
+                    FailureRecord(entity_name=name, stage="scan", error=str(exc))
+                )
+                if kind == "tables":
+                    self._listing_failures += 1
+                    self._check_abort()
+                continue
+            if kind == "tables":
+                for item in items:
+                    fetch_futures[
+                        pool.submit(self._get_table_with_retry, client, item.reference)
+                    ] = (f"{item.dataset_id}.{item.table_id}", "table", ds)
+            else:
+                for r in items:
+                    fetch_futures[
+                        pool.submit(self._get_routine_with_retry, client, r.reference)
+                    ] = (f"{ds}.{r.routine_id}", "routine", ds)
+
+        for future in as_completed(fetch_futures):
+            full_name, kind, ds = fetch_futures.pop(future)  # free result refs as consumed
+            try:
+                result = future.result()
+                if kind == "table":
+                    # Capture the dataset's region from the Table we already
+                    # fetched — the collector's multi-region routing needs a
+                    # dataset→location map, and deriving it here costs zero
+                    # extra API calls (a per-dataset get_dataset loop was a
+                    # serial, unretried scale regression — 2026-07-28 review).
+                    loc = getattr(result, "location", None)
+                    if loc:
+                        self.dataset_locations.setdefault(ds, loc)
+                    entity = _to_entity_metadata(result)
+                else:
+                    entity = _routine_to_entity(result, ds)
+            except Exception as exc:  # per-entity failure → record + skip (R23.2)
+                logger.error("Failed to scan entity %s: %s", full_name, exc)
+                self.failures.append(
+                    FailureRecord(entity_name=full_name, stage="scan", error=str(exc))
+                )
+                self._check_abort()
+                continue
+            self._scanned_count += 1
+            yield entity
+
+    def _check_abort(self) -> None:
+        """Raise ScanAbortedError when failures cross the abort thresholds.
+
+        Runs on every recorded failure — including failure-only tails that never
+        reach a consumer's yield loop. Entity failures are judged as a rate;
+        dataset-listing failures are judged by count, because each one hides an
+        unknown number of entities and would otherwise be under-weighted.
+        """
+        if self._listing_failures > ABORT_MAX_LISTING_FAILURES:
+            raise ScanAbortedError(
+                f"{self._listing_failures} dataset listings failed — each hides an "
+                "unknown number of entities; the bundle would silently understate "
+                "the estate.",
+                entity_failures=len(self.failures) - self._listing_failures,
+                listing_failures=self._listing_failures,
+                attempted=self._scanned_count + len(self.failures),
+            )
+        entity_failures = len(self.failures) - self._listing_failures
+        attempted = self._scanned_count + entity_failures
+        if (
+            attempted >= ABORT_MIN_ATTEMPTED
+            and entity_failures / attempted > ABORT_ENTITY_FAILURE_RATE
+        ):
+            raise ScanAbortedError(
+                f"{entity_failures} of {attempted} entities failed to scan "
+                f"(>{ABORT_ENTITY_FAILURE_RATE:.0%}).",
+                entity_failures=entity_failures,
+                listing_failures=self._listing_failures,
+                attempted=attempted,
+            )
 
     # ------------------------------------------------------------------
     # Retry wrappers
     # ------------------------------------------------------------------
 
+    # retry=None on every client call: the library's built-in DEFAULT_RETRY
+    # (600s deadline, retries the same 429/transport errors) would otherwise run
+    # INSIDE our _retry — two stacked ladders multiplying worst-case waits
+    # (2026-07-28 review). Exactly one ladder (ours) governs.
+    #
+    # The rate limiter is threaded into _retry so every attempt — first try and
+    # retries alike — consumes a token; for paginated listings each page fetch
+    # is charged so token accounting matches wire traffic.
+
     def _list_datasets_with_retry(self, client: bigquery.Client) -> list:
-        return _retry(lambda: list(client.list_datasets()))
+        return _retry(
+            lambda: self._drain_pages(client.list_datasets(retry=None)),
+            rate_limiter=self._rate_limiter,
+        )
 
     def _list_tables_with_retry(self, client: bigquery.Client, dataset_id: str) -> list:
-        return _retry(lambda: list(client.list_tables(dataset_id)))
+        return _retry(
+            lambda: self._drain_pages(client.list_tables(dataset_id, retry=None)),
+            rate_limiter=self._rate_limiter,
+        )
 
     def _list_routines_with_retry(
         self, client: bigquery.Client, dataset_id: str
     ) -> list:
-        return _retry(lambda: list(client.list_routines(dataset_id)))
+        return _retry(
+            lambda: self._drain_pages(client.list_routines(dataset_id, retry=None)),
+            rate_limiter=self._rate_limiter,
+        )
+
+    def _drain_pages(self, iterator) -> list:
+        """Materialize a paged iterator, charging one token per page fetch.
+
+        The _retry wrapper already charged page 1's token; subsequent pages are
+        separate HTTP requests and must not ride free (a 10k-table dataset is
+        dozens of page fetches under what was a single token).
+        """
+        pages = getattr(iterator, "pages", None)
+        if pages is None:  # plain iterable (test doubles) — nothing paginated
+            return list(iterator)
+        items: list = []
+        for i, page in enumerate(pages):
+            if i > 0:
+                self._rate_limiter.acquire()
+            items.extend(page)
+        return items
 
     def _get_table_with_retry(
         self, client: bigquery.Client, table_ref: bigquery.TableReference
     ) -> bigquery.Table:
-        return _retry(lambda: client.get_table(table_ref))
+        return _retry(
+            lambda: client.get_table(table_ref, retry=None),
+            rate_limiter=self._rate_limiter,
+        )
+
+    def _get_routine_with_retry(self, client: bigquery.Client, routine_ref):
+        return _retry(
+            lambda: client.get_routine(routine_ref, retry=None),
+            rate_limiter=self._rate_limiter,
+        )
 
 
 # ======================================================================
@@ -277,36 +455,84 @@ class BigQueryScanner:
 # ======================================================================
 
 
-def _retry(fn, config: dict | None = None):
-    """Execute *fn* with exponential-backoff retries on transient errors (R23.1)."""
+def _retry_after_seconds(exc: GoogleAPICallError) -> float | None:
+    """Extract a Retry-After hint (seconds) from the API response, if present."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# Raw transport errors (connection reset, socket timeout) — transient like a 503,
+# but they don't subclass GoogleAPICallError so the old retry let them fail the
+# entity on the first attempt (2026-07-27 scale review).
+_TRANSPORT_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def _retry(fn, config: dict | None = None, rate_limiter: RateLimiter | None = None):
+    """Execute *fn* with exponential-backoff retries on transient errors (R23.1).
+
+    - Budgets are tracked per error class (429 vs 500/503 vs transport), so a
+      mixed-code storm can't starve one class of its retries.
+    - 429s use the deeper ``max_retries_throttled`` ladder and honor the
+      server's Retry-After header — clamped to ``max_delay_seconds`` and
+      jittered so synchronized workers don't re-slam the API in one wave.
+    - When *rate_limiter* is given, every attempt (including retries) consumes
+      a token — retry traffic must not bypass the global request budget.
+    """
     cfg = config or RETRY_CONFIG
     max_retries: int = cfg["max_retries"]
+    max_retries_throttled: int = cfg.get("max_retries_throttled", max_retries)
     delay: float = cfg["initial_delay_seconds"]
     multiplier: float = cfg["backoff_multiplier"]
+    max_delay: float = cfg.get("max_delay_seconds", 60.0)
     retryable: set[int] = set(cfg["retryable_status_codes"])
 
-    last_exc: Exception | None = None
-    for attempt in range(max_retries + 1):  # 0 = first try, 1..3 = retries
+    used: dict[str, int] = {"throttled": 0, "server": 0, "transport": 0}
+    while True:
         try:
+            if rate_limiter is not None:
+                rate_limiter.acquire()
             return fn()
-        except GoogleAPICallError as exc:
-            last_exc = exc
-            if exc.code not in retryable or attempt == max_retries:
+        except (GoogleAPICallError, *_TRANSPORT_ERRORS) as exc:
+            is_api = isinstance(exc, GoogleAPICallError)
+            if is_api and exc.code not in retryable:
                 raise
-            jittered = delay * (0.5 + random.random())  # nosec B311 - retry jitter, not cryptographic
+            if is_api and exc.code == 429:
+                klass, budget = "throttled", max_retries_throttled
+            elif is_api:
+                klass, budget = "server", max_retries
+            else:
+                klass, budget = "transport", max_retries
+            if used[klass] >= budget:
+                raise
+            used[klass] += 1
+            hinted = _retry_after_seconds(exc) if is_api else None
+            if hinted is not None:
+                # Hint is a floor: clamp to max_delay, then add upward spread so
+                # simultaneously-throttled workers don't wake in one wave.
+                wait = min(hinted, max_delay) * (1.0 + 0.5 * random.random())  # nosec B311 - retry jitter, not cryptographic
+            else:
+                wait = min(delay, max_delay) * (0.5 + random.random())  # nosec B311 - retry jitter, not cryptographic
             logger.warning(
-                "Transient error (code=%s), retrying in %.1fs (attempt %d/%d)",
-                exc.code,
-                jittered,
-                attempt + 1,
-                max_retries,
+                "Transient error (%s), retrying in %.1fs (%s attempt %d/%d)",
+                exc.code if is_api else type(exc).__name__,
+                wait,
+                klass,
+                used[klass],
+                budget,
             )
-            time.sleep(jittered)
-            delay *= multiplier
-        except Exception:
-            raise
-
-    raise last_exc  # type: ignore[misc]  # unreachable; satisfies type checkers
+            time.sleep(wait)
+            delay = min(delay * multiplier, max_delay)
 
 
 def _describe_auth_error(exc: Exception) -> str:

@@ -6,7 +6,7 @@ No CSV output in the target design (ADR-0001 / R20.8). See
 All legacy code migrated to the normative writers as of Phase 8 (8.1).
 """
 
-from bq_assess.report.html_writer import HTMLWriter  # noqa: F401
-from bq_assess.report.json_writer import JSONWriter  # noqa: F401
+from bq_assess.report.html_writer import HTMLWriter
+from bq_assess.report.json_writer import JSONWriter
 
 __all__ = ["HTMLWriter", "JSONWriter"]

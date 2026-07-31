@@ -6,6 +6,7 @@ zero (R9.3, ADR-0002).
 """
 from __future__ import annotations
 
+from bq_assess.core.units import bytes_to_gb, fmt_size
 from bq_assess.models import (
     ConfidenceLevel,
     ConversionResult,
@@ -19,6 +20,15 @@ _LARGE_THRESHOLD = 1 * _ONE_GB
 _HUGE_THRESHOLD = 100 * _ONE_GB
 
 _SYNC_SIGNALS = {"_partitiontime", "updated_at", "modified_at", "ingestion_time"}
+
+
+def _category_for(points: int) -> EffortCategory:
+    """Single points→category ladder shared by initial scoring and re-scoring."""
+    if points == 0:
+        return EffortCategory.AUTO
+    if points <= 2:
+        return EffortCategory.ASSISTED
+    return EffortCategory.MANUAL
 
 
 class EffortScorer:
@@ -43,11 +53,15 @@ class EffortScorer:
         if size_bytes >= _HUGE_THRESHOLD:
             points += 2
             flags.append("data_volume_huge")
-            reasons.append(f"huge volume ({size_bytes / _ONE_GB:.0f} GB) — partition-wise load (+2)")
+            reasons.append(
+                f"huge volume ({fmt_size(bytes_to_gb(size_bytes))}) — partition-wise load (+2)"
+            )
         elif size_bytes >= _LARGE_THRESHOLD:
             points += 1
             flags.append("data_volume_large")
-            reasons.append(f"large volume ({size_bytes / _ONE_GB:.1f} GB) — staged COPY (+1)")
+            reasons.append(
+                f"large volume ({fmt_size(bytes_to_gb(size_bytes))}) — staged COPY (+1)"
+            )
 
         # Lossy casts
         n_lossy = len(conversion.lossy_casts)
@@ -73,13 +87,7 @@ class EffortScorer:
                 f"{n_decisions} partition/sort decision(s) need review (+{n_decisions})"
             )
 
-        # Category
-        if points == 0:
-            category = EffortCategory.AUTO
-        elif points <= 2:
-            category = EffortCategory.ASSISTED
-        else:
-            category = EffortCategory.MANUAL
+        category = _category_for(points)
 
         # Confidence
         if entity.num_bytes is None:
@@ -104,3 +112,27 @@ class EffortScorer:
             if col.name and col.name.lower() in _SYNC_SIGNALS:
                 return True
         return False
+
+
+def amend_for_rms_placement(result: EffortResult) -> EffortResult:
+    """Re-score an entity whose Storage Target is RMS (ADR-0005).
+
+    RMS entities carry a two-phase load (Athena→Iceberg staging, then Redshift
+    CREATE TABLE + INSERT…SELECT + staging cleanup) — one extra coordinated step
+    over the single-phase Iceberg path. +1 point, re-derive the category with the
+    same thresholds as EffortScorer.score().
+
+    Called after the storage-placement stage; effort itself is scored earlier
+    (Stage 5), before the engine recommendation exists.
+    """
+    points = result.score + 1
+    return EffortResult(
+        category=_category_for(points),
+        score=points,
+        flags=[*result.flags, "rms_two_phase_load"],
+        reasoning=(
+            f"{result.reasoning}; RMS storage placement — two-phase load "
+            f"(Iceberg staging → Redshift native) (+1)"
+        ),
+        confidence=result.confidence,
+    )

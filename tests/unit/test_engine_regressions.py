@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from bq_assess.cli import _build_workload_profile
 from bq_assess.core.engine_config import resolve_engine_config
-from bq_assess.engine.recommendation import RecommendationScorer
 from bq_assess.engine.athena.migration import AthenaMigrationGenerator
+from bq_assess.engine.recommendation import RecommendationScorer
 from bq_assess.models import (
     ColumnSchema,
     ConversionResult,
@@ -20,7 +19,6 @@ from bq_assess.models import (
     TimePartitionConfig,
     WorkloadProfile,
 )
-
 
 # ---- WorkloadProfile missing fields ----
 
@@ -170,7 +168,7 @@ def test_finding_2_template_marker_when_no_date():
 
     full_text = "\n".join(result.statements)
     assert "-- TEMPLATE:" in full_text
-    assert "WARNING" in full_text
+    assert "STEP 0" in full_text
 
 
 # ---- Partition count chunking ----
@@ -430,8 +428,8 @@ def test_finding_6_burstiness_neutral_when_avg_slots_near_zero():
 def _make_entity(
     full_name: str,
     num_bytes: int = 1024**3,
-    time_partitioning: Optional[TimePartitionConfig] = None,
-    last_modified: Optional[datetime] = None,
+    time_partitioning: TimePartitionConfig | None = None,
+    last_modified: datetime | None = None,
 ) -> EntityMetadata:
     """Make a minimal EntityMetadata for testing."""
     parts = full_name.split(".")

@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from bq_assess.models import (
     ColumnSchema,
+    ConfidenceLevel,
     ConversionResult,
     EffortCategory,
     EntityMetadata,
     EntityPopulation,
     EntityType,
-    ConfidenceLevel,
     LossyCast,
     PartitionMapping,
 )
@@ -97,8 +97,8 @@ class TestEffortScorer:
         not literal flag strings (issue #52 MRI-1)."""
         scorer = EffortScorer()
         prose = [
-            "ingestion-time partition (no real column) — "
-            "suggested day(_ingestion_time); review before applying"
+            ("ingestion-time partition (no real column) — "
+            "suggested day(_ingestion_time); review before applying")
         ]
         result = scorer.score(_entity(), _conversion(decision_flags=prose))
         assert result.score >= 1

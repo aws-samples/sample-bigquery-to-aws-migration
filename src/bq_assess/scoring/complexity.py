@@ -55,11 +55,12 @@ class ComplexityScorer:
         seen_classes: set[str] = set()
         for c in constructs:
             weight = _WEIGHTS.get(c.construct_class, 1)
-            # FUNCTION_DRIFT counts per distinct instance; all others count once per class
-            if c.construct_class == "FUNCTION_DRIFT":
-                points += weight
-                reasons.append(f"{c.construct_class} (+{weight})")
-            elif c.construct_class not in seen_classes:
+            # FUNCTION_DRIFT is WEIGHTED per instance in principle, but the only
+            # production feed (sql_surface.detect_for_entities) dedups to one
+            # construct per class before scoring — so per-instance accumulation
+            # fires only for callers passing raw detect() output (tests). All
+            # other classes count once per class either way.
+            if c.construct_class == "FUNCTION_DRIFT" or c.construct_class not in seen_classes:
                 points += weight
                 reasons.append(f"{c.construct_class} (+{weight})")
             if c.construct_class not in seen_classes:
@@ -82,12 +83,16 @@ class ComplexityScorer:
         else:
             category = ComplexityCategory.REWRITE
 
-        # Confidence ladder
+        # Confidence ladder. Query logs corroborate an entity's own SQL surface —
+        # they are NOT attributed per-entity (workload-level analysis is a separate
+        # feature), so logs alone cannot raise a no-surface entity above LOW.
+        # (R11.4 as amended 2026-07-30; previously has_logs marked every entity
+        # HIGH, overstating confidence for plain tables.)
         has_surface = bool(
             entity.view_query or entity.mview_query or
             (entity.routine and entity.routine.body)
         )
-        if has_logs:
+        if has_logs and has_surface:
             confidence = ConfidenceLevel.HIGH
             confidence_source = ConfidenceSource.QUERY_LOGS
         elif has_surface:

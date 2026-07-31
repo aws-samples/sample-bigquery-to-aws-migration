@@ -6,8 +6,8 @@ Validates: Requirements 1.4
 
 from __future__ import annotations
 
-from hypothesis import given, settings
 import hypothesis.strategies as st
+from hypothesis import given, settings
 
 from bq_assess.cli import _merge_config
 

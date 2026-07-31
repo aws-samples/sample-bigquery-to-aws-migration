@@ -20,17 +20,17 @@ from bq_assess.models import (
 
 
 def _config(**overrides) -> EngineConfig:
-    defaults = dict(
-        target_region="ap-southeast-2",
-        query_sla_ms=5000,
-        preferred_engine=None,
-        chunk_days=90,
-        post_optimization=True,
-        compaction_threshold_gb=1.0,
-        peak_concurrency_override=None,
-        idle_hours_override=None,
-        source={},
-    )
+    defaults = {
+        "target_region": "ap-southeast-2",
+        "query_sla_ms": 5000,
+        "preferred_engine": None,
+        "chunk_days": 90,
+        "post_optimization": True,
+        "compaction_threshold_gb": 1.0,
+        "peak_concurrency_override": None,
+        "idle_hours_override": None,
+        "source": {},
+    }
     defaults.update(overrides)
     return EngineConfig(**defaults)
 
@@ -92,12 +92,10 @@ def test_basic_insert_generated(generator):
     assert len(result.statements) >= 1
     assert "INSERT INTO" in result.statements[0]
 
-    # LOW-2: Prerequisites should be in first statement
+    # LOW-2: Prerequisites reference should be in first statement
     first_stmt = result.statements[0]
-    assert "PREREQUISITES" in first_stmt
-    assert "source_db external tables must exist" in first_stmt
+    assert "SOURCE DATABASE SETUP" in first_stmt
     assert "Athena engine v3" in first_stmt
-    assert "fully-qualified names" in first_stmt
 
 
 def test_clustering_triggers_sort_shortcoming(generator):
@@ -144,7 +142,7 @@ def test_regionalized_concurrency_comment(generator):
 
     # Join all statements to search for the comment
     full_text = "\n".join(result.statements)
-    assert "100 in ap-southeast-2" in full_text
+    assert "default 100 in most regions" in full_text
     assert "200 in us-east-1" in full_text
     assert "adjustable" in full_text
     # HRI-2: must guide sequential per-table execution to avoid Iceberg commit conflicts
@@ -169,6 +167,10 @@ def test_dml_timeout_note_in_chunks(generator):
 
 
 def test_clustering_triggers_post_optimization(generator):
+    """Clustered tables get a ONE-TIME Spark sort-order declaration: S3 Tables
+    managed compaction reads it from metadata (auto strategy -> sort) and keeps
+    data sorted from then on — no recurring rewrite_data_files runs, which
+    would race the managed compactor."""
     entity = _entity(
         clustering_fields=["col1"],
         num_bytes=2 * 1024**3,  # 2 GB > threshold
@@ -176,30 +178,22 @@ def test_clustering_triggers_post_optimization(generator):
     result = generator.generate(entity, _conversion(), _config())
     assert any(s.step_type == "sort" for s in result.post_optimization)
     sort_step = next(s for s in result.post_optimization if s.step_type == "sort")
-    assert sort_step.engine == "spark_emr"
-    # Should use Iceberg procedure syntax, not OPTIMIZE...SORT ORDER
-    assert "CALL" in sort_step.command and "rewrite_data_files" in sort_step.command
-    assert "sort_order" in sort_step.command
+    assert sort_step.engine == "spark_emr"  # Athena rejects custom TBLPROPERTIES
+    assert "WRITE ORDERED BY" in sort_step.command
+    assert "col1 ASC NULLS LAST" in sort_step.command
+    # The recurring self-managed rewrite is gone
+    assert "rewrite_data_files" not in sort_step.command
 
 
-def test_compaction_always_emitted(generator):
-    """MRI-3: VACUUM step should follow compact step"""
+def test_no_self_managed_compaction_steps(generator):
+    """Supersedes MRI-3 (compact + VACUUM steps): S3 Tables runs compaction and
+    snapshot management as managed maintenance — Athena's OPTIMIZE/VACUUM are
+    unsupported on the s3tablescatalog and the old steps errored when run
+    (contradicting the generated terraform's own documentation)."""
     result = generator.generate(_entity(), _conversion(), _config())
-    assert any(s.step_type == "compact" for s in result.post_optimization)
-    compact = next(s for s in result.post_optimization if s.step_type == "compact")
-    assert compact.engine == "athena"
-    assert "BIN_PACK" in compact.command
-
-    # MRI-3: VACUUM step should be present after compact
-    assert any(s.step_type == "vacuum" for s in result.post_optimization)
-    vacuum = next(s for s in result.post_optimization if s.step_type == "vacuum")
-    assert vacuum.engine == "athena"
-    assert "VACUUM" in vacuum.command
-    assert "S3 API requests" in vacuum.reason
-    # Verify vacuum comes after compact
-    compact_idx = result.post_optimization.index(compact)
-    vacuum_idx = result.post_optimization.index(vacuum)
-    assert vacuum_idx > compact_idx
+    step_types = {s.step_type for s in result.post_optimization}
+    assert "compact" not in step_types
+    assert "vacuum" not in step_types
 
 
 def test_post_optimization_disabled(generator):
@@ -389,19 +383,46 @@ def test_time_column_emits_cast(generator):
 
 
 def test_bytes_column_emits_cast(generator):
-    """WP2 Fix 1: BYTES columns should emit CAST to varchar with encoding note"""
+    """BYTES columns must use to_base64 — the connector serves them as varbinary
+    and CAST(varbinary AS varchar) is illegal in Trino (live-verified 2026-07-30)."""
     entity = _entity(columns=[
         ColumnSchema(name="id", field_type="INT64", mode="REQUIRED"),
         ColumnSchema(name="binary_data", field_type="BYTES", mode="NULLABLE"),
     ])
     result = generator.generate(entity, _conversion(), _config())
     full_sql = " ".join(result.statements)
-    assert "CAST(binary_data AS varchar)" in full_sql
-    assert "base64" in full_sql.lower()
+    assert "to_base64(binary_data)" in full_sql
+    assert "CAST(binary_data AS varchar)" not in full_sql
 
 
-def test_interval_and_range_columns_emit_cast(generator):
-    """WP2 Fix 1: INTERVAL and RANGE columns should emit CAST to varchar"""
+def test_timestamp_column_gets_iso8601_parse(generator):
+    """The connector serves BQ TIMESTAMP as ISO-8601 varchar — the select list
+    and the chunk WHERE (source side) must parse it; the DELETE (Iceberg side)
+    must not (live-verified 2026-07-30)."""
+    from bq_assess.models import TimePartitionConfig
+    entity = _entity(columns=[
+        ColumnSchema(name="id", field_type="INT64", mode="REQUIRED"),
+        ColumnSchema(name="created_at", field_type="TIMESTAMP", mode="NULLABLE"),
+    ])
+    entity.time_partitioning = TimePartitionConfig(type="DAY", field="created_at")
+    entity.num_bytes = 200 * 1024**3  # force chunked path
+    result = generator.generate(entity, _conversion(), _config())
+    full_sql = " ".join(result.statements)
+    assert "from_iso8601_timestamp(created_at)" in full_sql
+    inserts = [s for s in result.statements if "INSERT INTO" in s]
+    assert inserts and all(
+        "WHERE from_iso8601_timestamp(created_at)" in s for s in inserts
+    )
+    deletes = [s for s in result.statements if "DELETE FROM" in s]
+    assert deletes and all(
+        "WHERE created_at >=" in s for s in deletes
+    )
+
+
+def test_interval_casts_and_range_flags_unreadable(generator):
+    """INTERVAL emits CAST to varchar; RANGE is connector-unreadable so it
+    gets NO cast (the SELECT would fail before a CAST could run) and the
+    table is flagged with the connector-unreadable shortcoming instead."""
     entity = _entity(columns=[
         ColumnSchema(name="id", field_type="INT64", mode="REQUIRED"),
         ColumnSchema(name="duration", field_type="INTERVAL", mode="NULLABLE"),
@@ -410,7 +431,13 @@ def test_interval_and_range_columns_emit_cast(generator):
     result = generator.generate(entity, _conversion(), _config())
     full_sql = " ".join(result.statements)
     assert "CAST(duration AS varchar)" in full_sql
-    assert "CAST(value_range AS varchar)" in full_sql
+    assert "CAST(value_range" not in full_sql
+    unreadable = [
+        s for s in result.shortcomings
+        if "cannot read ARRAY/STRUCT/RANGE" in s.description
+    ]
+    assert unreadable, "RANGE column should raise the connector-unreadable shortcoming"
+    assert "value_range" in unreadable[0].bq_source
 
 
 def test_no_special_types_uses_select_star(generator):
@@ -485,15 +512,20 @@ def test_chunked_plan_has_idempotent_deletes(generator):
         assert deletes[0] == inserts[0]
 
 
-def test_simple_plan_no_delete(generator):
-    """WP2 Fix 3: Non-chunked plans should NOT have DELETE statements"""
+def test_simple_plan_is_idempotent(generator):
+    """Simple (non-chunked) loads DELETE the target first: re-running the
+    orchestrator otherwise appends a full duplicate copy per run (live-verified
+    2026-07-30 — three runs left target = 3x source). Supersedes WP2 Fix 3,
+    which dropped the DELETE before the duplication effect was observed live."""
     entity = _entity(
         num_bytes=50 * 1024**3,  # Small table
         time_partitioning=None,
     )
     result = generator.generate(entity, _conversion(), _config())
     full_sql = " ".join(result.statements)
-    assert "DELETE FROM" not in full_sql
+    assert "DELETE FROM" in full_sql
+    # Unconditional full-table DELETE (no WHERE) right before the INSERT
+    assert full_sql.index("DELETE FROM") < full_sql.index("INSERT INTO")
 
 
 def test_chunked_plan_with_casts_combines_both_fixes(generator):
@@ -597,3 +629,67 @@ def test_reserved_partition_field_in_range_discovery(generator):
 
     # "date" is a reserved word; must be quoted in SELECT MIN/MAX
     assert 'MIN("date")' in full_sql or "MIN(date)" in full_sql  # quote_identifier decides
+
+
+def test_cast_annotations_never_swallow_list_comma(generator):
+    """Per-column cast annotations must be block comments: with `-- comment` the
+    select-list comma landed inside the comment, producing invalid SQL
+    (2026-07-30 live-verification finding #1)."""
+    import sqlglot
+    entity = _entity(columns=[
+        ColumnSchema(name="id", field_type="INT64", mode="REQUIRED"),
+        ColumnSchema(name="payload", field_type="JSON", mode="NULLABLE"),
+        ColumnSchema(name="blob", field_type="BYTES", mode="NULLABLE"),
+        ColumnSchema(name="t", field_type="TIME", mode="NULLABLE"),
+        ColumnSchema(name="name", field_type="STRING", mode="NULLABLE"),
+    ])
+    result = generator.generate(entity, _conversion(), _config())
+    for stmt in result.statements:
+        body = "\n".join(
+            l for l in stmt.splitlines() if not l.strip().startswith("--")
+        ).strip()
+        if not body:
+            continue
+        # every executable statement must parse in the Athena dialect
+        sqlglot.parse(body, read="athena")
+    full_sql = " ".join(result.statements)
+    assert "-- JSON" not in full_sql and "-- BYTES" not in full_sql
+
+
+def test_hyphenated_table_name_quoted_in_dml(generator):
+    """BQ allows hyphens in table names; unquoted they fail Trino parsing.
+    2026-07-31 sandbox validation: 310 DELETE/INSERT statements unparseable.
+    Target AND federated source refs must quote non-standard identifiers."""
+    import sqlglot
+
+    entity = _entity()
+    entity.full_name = "raw.geoip2-city-locations"
+    entity.entity_id = "geoip2-city-locations"
+    entity.dataset_id = "raw"
+    result = generator.generate(entity, _conversion(), _config())
+    joined = " ".join(result.statements)
+    assert '"geoip2-city-locations"' in joined
+    # every non-comment statement parses in the Athena dialect
+    for stmt_sql in result.statements:
+        for part in (p.strip() for p in "\n".join(
+            ln for ln in stmt_sql.split("\n") if not ln.strip().startswith("--")
+        ).split(";")):
+            if part:
+                sqlglot.parse_one(part, dialect="athena")
+
+
+def test_leading_digit_table_name_quoted_in_dml(generator):
+    import sqlglot
+
+    entity = _entity()
+    entity.full_name = "ds.2025_snapshot"
+    entity.entity_id = "2025_snapshot"
+    result = generator.generate(entity, _conversion(), _config())
+    joined = " ".join(result.statements)
+    assert '"2025_snapshot"' in joined
+    for stmt_sql in result.statements:
+        for part in (p.strip() for p in "\n".join(
+            ln for ln in stmt_sql.split("\n") if not ln.strip().startswith("--")
+        ).split(";")):
+            if part:
+                sqlglot.parse_one(part, dialect="athena")

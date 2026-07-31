@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 
 from bq_assess.engine.redshift import cost_constants as k
+from bq_assess.engine.redshift.cost import _line_high, _line_low
 from bq_assess.models import (
     AWSRecommendation,
     AWSScenario,
@@ -21,9 +22,9 @@ from bq_assess.models import (
     CostLine,
     EngineCostEstimate,
     EngineRecommendation,
+    TargetEngine,
     WorkloadProfile,
 )
-
 
 # ================================================================== Public API
 
@@ -252,11 +253,17 @@ def _crossover_assumptions_sentence(crossover: float) -> str:
     )
 
 
+def _athena_dml_quota_phrase() -> str:
+    """Region-accurate Athena active-DML quota default (200 in us-east-1, 100 elsewhere)."""
+    default = 200 if k.AWS_PRICING_REGION == "us-east-1" else 100
+    return f"default {default} in {k.AWS_PRICING_REGION}, adjustable"
+
+
 def _revisit_conditions_sentence(crossover: float) -> str:
     """Shared helper: the revisit-if conditions both justifications reference."""
     return (
         f"Revisit if scan volume approaches {crossover:.2f} TB/day, sustained concurrency "
-        f"approaches your account's Athena DML quota (default 100 in ap-southeast-2, adjustable), "
+        f"approaches your account's Athena DML quota ({_athena_dml_quota_phrase()}), "
         f"or sub-3-second latency SLAs emerge. "
     )
 
@@ -296,6 +303,8 @@ def _build_athena_elaborated_justification(
         f"Your workload scans {monthly_tb:.2f} TB/month ({daily_tb:.2f} TB/day, {qpd:,.0f} queries/day) — "
         f"far below the ~{crossover:.2f} TB/day crossover where Redshift Serverless becomes cheaper. "
     )
+    # The crossover vs Serverless is WHY Athena wins here, so its assumptions (4-RPU
+    # minimum posture, MRI-3 ratchet disclosure) stay in the Athena justification.
     justification += _crossover_assumptions_sentence(crossover)
 
     # Pattern fit
@@ -370,7 +379,11 @@ def _build_redshift_elaborated_justification(
             f"below the ~{crossover:.2f} TB/day crossover, but concurrency and pattern signals "
             f"favor Redshift. "
         )
-    justification += _crossover_assumptions_sentence(crossover)
+    # The crossover-assumptions sentence describes Serverless's 4-RPU minimum posture —
+    # only relevant when the recommended scenario IS Serverless (a provisioned
+    # recommendation mentioning "4 RPU" reads as a contradiction — sandbox feedback).
+    if scenario.category.startswith("SERVERLESS"):
+        justification += _crossover_assumptions_sentence(crossover)
 
     # Pattern fit
     peak_conc = workload_profile.peak_concurrent_queries or workload_profile.avg_concurrent_queries or 5
@@ -451,9 +464,9 @@ def _generate_unified_recommendation(
         or costs_negligible
     )
 
-    primary_engine = engine_recommendation.primary_engine.lower()
+    primary_engine = engine_recommendation.primary_engine
 
-    if primary_engine == "athena" and athena_within_20pct:
+    if primary_engine == TargetEngine.ATHENA and athena_within_20pct:
         if costs_negligible:
             reasoning = _build_athena_reasoning(athena, workload_profile, engine_recommendation, negligible=True)
         else:
@@ -467,7 +480,7 @@ def _generate_unified_recommendation(
             workload_profile=workload_profile,
             alternatives_considered=[s.label for s in scenarios if s.label != athena.label],
         )
-    elif primary_engine == "redshift":
+    elif primary_engine == TargetEngine.REDSHIFT:
         reasoning = _build_redshift_reasoning(cheapest_redshift, workload_profile, bigquery_monthly, redshift_scenarios)
         if athena.monthly_total < cheapest_redshift.monthly_total * 0.5:
             reasoning = (
@@ -613,21 +626,18 @@ def _build_redshift_reasoning(
 
 def _extract_signal_reasons(engine_recommendation: EngineRecommendation) -> str:
     """Extract the top signal reasons from engine recommendation."""
+    recommended = engine_recommendation.primary_engine
     top_signals = sorted(
         engine_recommendation.reasoning,
         key=lambda sig: abs(sig.weight),
         reverse=True,
-    )[:2]
-    reasons = [sig.signal.replace("_", " ") for sig in top_signals if sig.direction == "redshift"]
-    return ", ".join(reasons) if reasons else "high concurrency/volume"
+    )[:3]
+    reasons = [sig.signal.replace("_", " ") for sig in top_signals if sig.direction == recommended]
+    return ", ".join(reasons[:2]) if reasons else "workload characteristics"
 
 
-# ================================================================== Line value helpers
-
-
-def _line_low(line: CostLine) -> float:
-    return line.monthly if line.monthly is not None else (line.monthly_low or 0)
-
-
-def _line_high(line: CostLine) -> float:
-    return line.monthly if line.monthly is not None else (line.monthly_high or 0)
+# Line value helpers: the canonical implementations live in engine/redshift/cost.py
+# and honor CostLine.headline (pattern-based storage totals, 2026-07-31). This module
+# previously carried duplicates that predated `headline` — the engine-recommendation
+# flow rebuilt aws_monthly_low/high from them, silently reverting the single-figure
+# comparison for every report that went through unify_cost_comparison.

@@ -23,7 +23,6 @@ from bq_assess.core.cache import MetadataCache
 from bq_assess.core.scanner import BigQueryScanner
 from bq_assess.models import EntityPopulation, EntityType
 
-
 # ---------------------------------------------------------------------------
 # Fixture: a mock BigQuery client describing one dataset with all four kinds
 # ---------------------------------------------------------------------------
@@ -154,12 +153,14 @@ def mock_scanner() -> BigQueryScanner:
         "active_customers": _view(),
         "daily_totals": _materialized_view(),
     }
-    client.get_table.side_effect = lambda ref: tables_by_key[ref._key]
+    # Accept **kwargs to mirror the real client signature — the scanner
+    # passes retry=None to disable the library's built-in retry ladder.
+    client.get_table.side_effect = lambda ref, **kwargs: tables_by_key[ref._key]
 
     routine_items = [_routine_list_item("js_normalize")]
     client.list_routines.return_value = routine_items
     routines_by_key = {"js_normalize": _js_routine()}
-    client.get_routine.side_effect = lambda ref: routines_by_key[ref._key]
+    client.get_routine.side_effect = lambda ref, **kwargs: routines_by_key[ref._key]
 
     scanner._client = client
     return scanner

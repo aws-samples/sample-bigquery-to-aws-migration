@@ -15,9 +15,7 @@ from hypothesis import given, settings
 from bq_assess.models import Assessment
 from bq_assess.report.html_writer import HTMLWriter
 from bq_assess.report.json_writer import JSONWriter
-
 from tests.conftest import assessment
-
 
 # ---------------------------------------------------------------------------
 # Credential patterns for P26
@@ -57,9 +55,9 @@ def test_p24_json_roundtrip_and_populations(a: Assessment) -> None:
     # Exactly 3 files
     assert len(paths) == 3
 
-    landing_path = [p for p in paths if "landing" in p][0]
-    effort_path = [p for p in paths if "effort" in p][0]
-    query_path = [p for p in paths if "query" in p][0]
+    landing_path = next(p for p in paths if "landing" in p)
+    effort_path = next(p for p in paths if "effort" in p)
+    query_path = next(p for p in paths if "query" in p)
 
     # Valid JSON
     with open(landing_path) as f:

@@ -1,7 +1,6 @@
 """Tests for engine config resolution (CLI > YAML > prompt > inferred)."""
 from __future__ import annotations
 
-
 from bq_assess.core.engine_config import resolve_engine_config
 
 

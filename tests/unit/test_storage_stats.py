@@ -5,11 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import MagicMock
 
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 
-from bq_assess.core.storage_stats import resolve_physical_bytes, effective_physical_bytes
-from bq_assess.engine.redshift.cost import _tiered_s3_tables_usd
+from bq_assess.core.storage_stats import (
+    effective_physical_bytes,
+    resolve_physical_bytes,
+)
 from bq_assess.engine.redshift import cost_constants as k
+from bq_assess.engine.redshift.cost import _tiered_s3_tables_usd
 from bq_assess.models import EntityMetadata, EntityPopulation, EntityType
 
 
@@ -62,8 +66,9 @@ def test_entity_metadata_physical_bytes_set():
 
 def _make_entity(full_name, num_bytes, physical_bytes=None):
     """Helper: minimal EntityMetadata-like object."""
-    from bq_assess.models import EntityMetadata, EntityType, EntityPopulation
     from datetime import datetime
+
+    from bq_assess.models import EntityMetadata, EntityPopulation, EntityType
     return EntityMetadata(
         entity_id=full_name.split(".")[-1], dataset_id=full_name.split(".")[0],
         full_name=full_name, entity_type=EntityType.TABLE,
@@ -152,7 +157,7 @@ def test_resolve_zero_bytes_entities():
 
 def test_effective_physical_bytes():
     """effective_physical_bytes helper uses physical when set, fallback otherwise."""
-    assert effective_physical_bytes(1000, None) == 750
+    assert effective_physical_bytes(1000, None) == 500
     assert effective_physical_bytes(1000, 400) == 400
     assert effective_physical_bytes(1000, 0) == 0
     assert effective_physical_bytes(0, None) == 0
@@ -169,3 +174,32 @@ def test_physical_storage_cost_leq_logical(logical_bytes):
     cost_physical = _tiered_s3_tables_usd(physical_gb)
 
     assert cost_physical <= cost_logical
+
+
+def test_failure_reason_captured_on_error():
+    """The TABLE_STORAGE error text must survive (2026-07-23: three customer
+    bundles hit 100% fallback and the reason was unrecoverable)."""
+    client = MagicMock()
+    client.query.side_effect = Exception("Access Denied: 403 bigquery.tables.list")
+
+    stats = resolve_physical_bytes(client, "p", "eu", [_make_entity("ds.t1", 10)])
+    assert stats.basis == "assumed"
+    assert "Access Denied" in stats.failure_reason
+    assert "Exception" in stats.failure_reason
+
+
+def test_failure_reason_empty_on_success():
+    client = MagicMock()
+    client.query.return_value.result.return_value = []
+    stats = resolve_physical_bytes(client, "p", "eu", [_make_entity("ds.t1", 10)])
+    assert stats.failure_reason == ""
+
+
+def test_query_pinned_to_data_region():
+    """The INFORMATION_SCHEMA job must run in the data's region, not the client
+    default — region mismatch 404s the region-qualified view."""
+    client = MagicMock()
+    client.query.return_value.result.return_value = []
+    resolve_physical_bytes(client, "p", "EU", [_make_entity("ds.t1", 10)])
+    _, kwargs = client.query.call_args
+    assert kwargs.get("location") == "EU"

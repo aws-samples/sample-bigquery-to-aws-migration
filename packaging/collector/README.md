@@ -37,6 +37,13 @@ the directory, and send it to your AWS contact:
 zip -r bundle.zip bundle-out/bundle/
 ```
 
+## Multi-region projects
+
+The collector detects every region your datasets live in and reads workload
+statistics, query statements, and storage stats from each, merging them into
+one bundle. The manifest records all regions; the region holding the most
+datasets anchors pricing. No extra flags needed — one run covers the project.
+
 ## Required permissions
 
 - `roles/bigquery.metadataViewer` (or equivalent) on the project — metadata scan.

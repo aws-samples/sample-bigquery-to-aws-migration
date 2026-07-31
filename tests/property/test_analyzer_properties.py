@@ -16,7 +16,6 @@ import hypothesis.strategies as st
 from hypothesis import given, settings
 
 from bq_assess.core.analyzer import QueryAnalyzer
-
 from tests.conftest import sql_query_with_literals
 
 # Shared identifier strategy for generating table/column names

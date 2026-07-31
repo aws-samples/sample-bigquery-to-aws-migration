@@ -21,7 +21,6 @@ from bq_assess.models import (
     TimePartitionConfig,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -293,7 +292,7 @@ class TestStoreAndLoad:
         loaded = cache.load("multi-project")
         assert loaded is not None and len(loaded) == 5
 
-        key = lambda e: (e.dataset_id, e.entity_id)  # noqa: E731
+        key = lambda e: (e.dataset_id, e.entity_id)
         for orig, back in zip(sorted(entities, key=key), sorted(loaded, key=key)):
             _assert_entity_equal(orig, back)
 
@@ -333,3 +332,89 @@ class TestOverwriteBehavior:
         assert loaded is not None and len(loaded) == 1
         _assert_entity_equal(second[0], loaded[0])
         assert {e.entity_id for e in loaded} == {"orders"}
+
+
+class TestCheckpointResume:
+    """Mid-scan checkpointing (R5, 2026-07-28 scale review finding #5)."""
+
+    def _cache(self, tmp_path) -> MetadataCache:
+        return MetadataCache(db_path=os.path.join(str(tmp_path), "cache.db"))
+
+    def test_fresh_session_returns_no_done_datasets(self, tmp_path) -> None:
+        cache = self._cache(tmp_path)
+        assert cache.begin_scan_session("proj", None) == set()
+
+    def test_resume_returns_checkpointed_datasets_and_entities(self, tmp_path) -> None:
+        """Interrupted scan → new session resumes: done datasets skipped, their
+        entities loadable."""
+        cache = self._cache(tmp_path)
+        cache.begin_scan_session("proj", None)
+        e1 = _simple_table("t1", "ds_a")
+        e2 = _simple_table("t2", "ds_a")
+        e3 = _simple_table("t3", "ds_b")
+        cache.checkpoint_datasets("proj", ["ds_a"], [e1, e2])
+        cache.checkpoint_datasets("proj", ["ds_b"], [e3])
+        # simulate crash: no store() — new collector run begins a session
+        done = cache.begin_scan_session("proj", None)
+        assert done == {"ds_a", "ds_b"}
+        loaded = cache.load_checkpointed("proj", done)
+        assert {e.full_name for e in loaded} == {"ds_a.t1", "ds_a.t2", "ds_b.t3"}
+
+    def test_different_filter_discards_checkpoint(self, tmp_path) -> None:
+        """A resume with a different --datasets selection must start clean —
+        merging two scopes would silently mix snapshots."""
+        cache = self._cache(tmp_path)
+        cache.begin_scan_session("proj", ["ds_a"])
+        cache.checkpoint_datasets("proj", ["ds_a"], [_simple_table("t1", "ds_a")])
+        done = cache.begin_scan_session("proj", ["ds_a", "ds_b"])
+        assert done == set()
+        assert cache.load_checkpointed("proj", {"ds_a"}) == []
+
+    def test_stale_checkpoint_discarded(self, tmp_path) -> None:
+        """A checkpoint older than CHECKPOINT_MAX_AGE_HOURS is not resumed —
+        finishing yesterday's scan would stitch two inconsistent snapshots."""
+        import sqlite3
+        from datetime import timedelta
+
+        cache = self._cache(tmp_path)
+        cache.begin_scan_session("proj", None)
+        cache.checkpoint_datasets("proj", ["ds_a"], [_simple_table("t1", "ds_a")])
+        # age the session past the TTL
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        conn = sqlite3.connect(os.path.join(str(tmp_path), "cache.db"))
+        conn.execute("UPDATE scan_session SET started_at = ?", (old,))
+        conn.commit()
+        conn.close()
+        assert cache.begin_scan_session("proj", None) == set()
+
+    def test_completed_store_clears_session(self, tmp_path) -> None:
+        """store() (a finished scan) removes the session + progress markers —
+        the next run must not 'resume' a scan that already completed."""
+        cache = self._cache(tmp_path)
+        cache.begin_scan_session("proj", None)
+        e = _simple_table("t1", "ds_a")
+        cache.checkpoint_datasets("proj", ["ds_a"], [e])
+        cache.store("proj", [e])
+        assert cache.has_cache("proj")
+        assert cache.begin_scan_session("proj", None) == set()
+
+    def test_fresh_session_invalidates_completed_cache(self, tmp_path) -> None:
+        """Starting a new checkpointed scan drops the completed cache — partial
+        checkpoint rows must never mix with a prior completed snapshot."""
+        cache = self._cache(tmp_path)
+        cache.store("proj", [_simple_table("old", "ds_a")])
+        assert cache.has_cache("proj")
+        cache.begin_scan_session("proj", None)
+        assert not cache.has_cache("proj")
+        assert cache.load("proj") is None
+
+    def test_checkpoint_survives_new_cache_instance(self, tmp_path) -> None:
+        """Resume works across process restarts (fresh MetadataCache object)."""
+        path = os.path.join(str(tmp_path), "cache.db")
+        c1 = MetadataCache(db_path=path)
+        c1.begin_scan_session("proj", None)
+        c1.checkpoint_datasets("proj", ["ds_a"], [_simple_table("t1", "ds_a")])
+        c2 = MetadataCache(db_path=path)
+        done = c2.begin_scan_session("proj", None)
+        assert done == {"ds_a"}
+        assert len(c2.load_checkpointed("proj", done)) == 1

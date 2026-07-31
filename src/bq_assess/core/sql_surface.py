@@ -198,6 +198,7 @@ class SQLSurfaceAnalyzer:
         are omitted (callers treat absence as "no constructs", not failure).
         """
         result: dict[str, list[DetectedConstruct]] = {}
+        n_classes = len(CONSTRUCT_CLASSES)
         for full_name, sqls in self.assemble(entities, query_log_text).items():
             found: list[DetectedConstruct] = []
             seen: set[str] = set()
@@ -206,6 +207,13 @@ class SQLSurfaceAnalyzer:
                     if c.construct_class not in seen:
                         seen.add(c.construct_class)
                         found.append(c)
+                # Early exit once every construct class is seen — further SQL in
+                # this bucket cannot change the result. Matters for the
+                # __ad_hoc__ bucket at query-log scale: without it, all 5 regex
+                # passes ran over the ENTIRE corpus even after all classes were
+                # found (2026-07-28 scale review finding #10).
+                if len(seen) == n_classes:
+                    break
             if found:
                 result[full_name] = found
         return result

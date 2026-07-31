@@ -55,6 +55,34 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 """
 
+# Mid-scan checkpointing (2026-07-28 scale review, finding #5): an interrupted
+# scan of a large project must not restart from zero. A scan_session row exists
+# while a scan is in flight (deleted on completion); scan_progress marks each
+# dataset whose chunk finished. A leftover session + progress rows = a resumable
+# partial scan. filter_key pins the resume to the same --datasets selection —
+# resuming a differently-filtered scan would silently merge two scopes.
+_CREATE_SCAN_SESSION = """\
+CREATE TABLE IF NOT EXISTS scan_session (
+    project_id  TEXT PRIMARY KEY,
+    filter_key  TEXT NOT NULL,
+    started_at  TIMESTAMP NOT NULL
+);
+"""
+
+_CREATE_SCAN_PROGRESS = """\
+CREATE TABLE IF NOT EXISTS scan_progress (
+    project_id   TEXT NOT NULL,
+    dataset_id   TEXT NOT NULL,
+    completed_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (project_id, dataset_id)
+);
+"""
+
+# A partial scan older than this is discarded rather than resumed: metadata
+# drifts (tables created/dropped/modified), and finishing yesterday's scan
+# would stitch two inconsistent snapshots into one bundle.
+CHECKPOINT_MAX_AGE_HOURS = 24
+
 
 # ---------------------------------------------------------------------------
 # (De)serialization helpers
@@ -109,56 +137,159 @@ class MetadataCache:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(_CREATE_SCAN_METADATA)
         self._conn.execute(_CREATE_ENTITIES)
+        self._conn.execute(_CREATE_SCAN_SESSION)
+        self._conn.execute(_CREATE_SCAN_PROGRESS)
         self._conn.commit()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    _INSERT_ENTITY = (
+        "INSERT OR REPLACE INTO entities "
+        "(project_id, dataset_id, entity_id, full_name, entity_type, population, "
+        "num_rows, num_bytes, columns_json, time_part_json, range_part_json, "
+        "clustering_json, view_query, mview_query, routine_json, depends_on_json, "
+        "last_modified) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    @staticmethod
+    def _entity_row(project_id: str, e: EntityMetadata) -> tuple:
+        return (
+            project_id,
+            e.dataset_id,
+            e.entity_id,
+            e.full_name,
+            e.entity_type.value,
+            e.population.value,
+            e.num_rows,
+            e.num_bytes,
+            json.dumps([_column_schema_to_dict(c) for c in e.columns]),
+            MetadataCache._dump_time_part(e.time_partitioning),
+            MetadataCache._dump_range_part(e.range_partitioning),
+            json.dumps(e.clustering_fields) if e.clustering_fields is not None else None,
+            e.view_query,
+            e.mview_query,
+            json.dumps(_routine_to_dict(e.routine)) if e.routine is not None else None,
+            json.dumps(e.depends_on),
+            e.last_modified.isoformat() if e.last_modified is not None else None,
+        )
+
     def store(self, project_id: str, entities: list[EntityMetadata]) -> None:
-        """Store scanned metadata, replacing any existing data for the project (R5.1)."""
+        """Store scanned metadata, replacing any existing data for the project (R5.1).
+
+        Also clears any in-flight checkpoint session — a completed store IS the
+        finished scan, so partial progress markers must not survive it.
+        """
         cur = self._conn.cursor()
         cur.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
         cur.execute("DELETE FROM scan_metadata WHERE project_id = ?", (project_id,))
-
-        for e in entities:
-            cur.execute(
-                "INSERT INTO entities "
-                "(project_id, dataset_id, entity_id, full_name, entity_type, population, "
-                "num_rows, num_bytes, columns_json, time_part_json, range_part_json, "
-                "clustering_json, view_query, mview_query, routine_json, depends_on_json, "
-                "last_modified) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    project_id,
-                    e.dataset_id,
-                    e.entity_id,
-                    e.full_name,
-                    e.entity_type.value,
-                    e.population.value,
-                    e.num_rows,
-                    e.num_bytes,
-                    json.dumps([_column_schema_to_dict(c) for c in e.columns]),
-                    self._dump_time_part(e.time_partitioning),
-                    self._dump_range_part(e.range_partitioning),
-                    json.dumps(e.clustering_fields) if e.clustering_fields is not None else None,
-                    e.view_query,
-                    e.mview_query,
-                    json.dumps(_routine_to_dict(e.routine)) if e.routine is not None else None,
-                    json.dumps(e.depends_on),
-                    e.last_modified.isoformat() if e.last_modified is not None else None,
-                ),
-            )
-
+        cur.executemany(
+            self._INSERT_ENTITY,
+            (self._entity_row(project_id, e) for e in entities),
+        )
         cur.execute(
             "INSERT INTO scan_metadata (project_id, scanned_at, entity_count) VALUES (?, ?, ?)",
             (project_id, datetime.now(timezone.utc).isoformat(), len(entities)),
         )
+        self._clear_session(cur, project_id)
         self._conn.commit()
 
-    def load(self, project_id: str) -> list[EntityMetadata] | None:
-        """Load cached metadata for a project; None if no cache exists (R5.3)."""
-        if not self.has_cache(project_id):
+    # ------------------------------------------------------------------
+    # Mid-scan checkpointing (resume support)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_key(dataset_filter: list[str] | None) -> str:
+        return ",".join(sorted(dataset_filter)) if dataset_filter else "*"
+
+    def begin_scan_session(
+        self, project_id: str, dataset_filter: list[str] | None
+    ) -> set[str]:
+        """Start (or resume) a checkpointed scan; return dataset_ids already done.
+
+        Returns the completed-dataset set of a resumable prior session — same
+        project, same dataset filter, younger than CHECKPOINT_MAX_AGE_HOURS.
+        Anything else (different filter, stale, none) starts clean: progress and
+        partial entities for the project are discarded first.
+        """
+        cur = self._conn.cursor()
+        key = self._filter_key(dataset_filter)
+        cur.execute(
+            "SELECT filter_key, started_at FROM scan_session WHERE project_id = ?",
+            (project_id,),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            prior_key, started_at = row
+            age_hours = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(started_at)
+            ).total_seconds() / 3600
+            if prior_key == key and age_hours <= CHECKPOINT_MAX_AGE_HOURS:
+                cur.execute(
+                    "SELECT dataset_id FROM scan_progress WHERE project_id = ?",
+                    (project_id,),
+                )
+                return {r[0] for r in cur.fetchall()}
+
+        # No resumable session — start clean. Checkpoints write into the same
+        # entities table, so a fresh session invalidates any completed cache
+        # too: mixing a new partial snapshot over old completed rows would let
+        # an interrupted scan corrupt the "completed" cache. The operator chose
+        # to rescan; a successful store() rebuilds the completed cache anyway.
+        self._clear_session(cur, project_id)
+        cur.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM scan_metadata WHERE project_id = ?", (project_id,))
+        cur.execute(
+            "INSERT INTO scan_session (project_id, filter_key, started_at) VALUES (?, ?, ?)",
+            (project_id, key, datetime.now(timezone.utc).isoformat()),
+        )
+        self._conn.commit()
+        return set()
+
+    def checkpoint_datasets(
+        self, project_id: str, dataset_ids: list[str], entities: list[EntityMetadata]
+    ) -> None:
+        """Persist one finished chunk: its entities + per-dataset progress markers.
+
+        Committed atomically — a crash mid-checkpoint loses at most this chunk.
+        """
+        cur = self._conn.cursor()
+        cur.executemany(
+            self._INSERT_ENTITY,
+            (self._entity_row(project_id, e) for e in entities),
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        cur.executemany(
+            "INSERT OR REPLACE INTO scan_progress (project_id, dataset_id, completed_at) "
+            "VALUES (?, ?, ?)",
+            ((project_id, ds, now) for ds in dataset_ids),
+        )
+        self._conn.commit()
+
+    def load_checkpointed(
+        self, project_id: str, dataset_ids: set[str]
+    ) -> list[EntityMetadata]:
+        """Load the entities of already-completed datasets for a resumed scan."""
+        if not dataset_ids:
+            return []
+        all_rows = self.load(project_id, include_partial=True) or []
+        return [e for e in all_rows if e.dataset_id in dataset_ids]
+
+    def _clear_session(self, cur, project_id: str) -> None:
+        cur.execute("DELETE FROM scan_session WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM scan_progress WHERE project_id = ?", (project_id,))
+
+    def load(
+        self, project_id: str, include_partial: bool = False
+    ) -> list[EntityMetadata] | None:
+        """Load cached metadata for a project; None if no cache exists (R5.3).
+
+        ``include_partial=True`` skips the completed-scan gate so a resumed scan
+        can read its checkpointed rows (no scan_metadata row exists mid-scan).
+        """
+        if not include_partial and not self.has_cache(project_id):
             return None
 
         cur = self._conn.cursor()

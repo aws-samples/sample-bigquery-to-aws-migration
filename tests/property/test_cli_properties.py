@@ -10,8 +10,8 @@ Property 2 (P2): Credential mode exclusivity
 
 from __future__ import annotations
 
-from hypothesis import given, settings, assume
 import hypothesis.strategies as st
+from hypothesis import assume, given, settings
 
 from bq_assess.cli import _merge_config
 

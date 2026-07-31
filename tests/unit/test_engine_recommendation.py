@@ -1,24 +1,22 @@
 """Tests for the engine recommendation scorer."""
 from __future__ import annotations
 
-
-
 from bq_assess.engine.recommendation import RecommendationScorer
 from bq_assess.models import EngineConfig, WorkloadProfile
 
 
 def _default_config(**overrides) -> EngineConfig:
-    defaults = dict(
-        target_region="ap-southeast-2",
-        query_sla_ms=5000,
-        preferred_engine=None,
-        chunk_days=90,
-        post_optimization=True,
-        compaction_threshold_gb=1.0,
-        peak_concurrency_override=None,
-        idle_hours_override=None,
-        source={},
-    )
+    defaults = {
+        "target_region": "ap-southeast-2",
+        "query_sla_ms": 5000,
+        "preferred_engine": None,
+        "chunk_days": 90,
+        "post_optimization": True,
+        "compaction_threshold_gb": 1.0,
+        "peak_concurrency_override": None,
+        "idle_hours_override": None,
+        "source": {},
+    }
     defaults.update(overrides)
     return EngineConfig(**defaults)
 
@@ -234,7 +232,10 @@ def test_athena_recommended_aws_lines_contain_athena_no_redshift():
     in aws_scenarios (defects 1, 2, 5 regression guard)."""
     from bq_assess.engine.comparison import _generate_unified_recommendation
     from bq_assess.models import (
-        AWSScenario, CostLine, ConfidenceLevel, EngineRecommendation,
+        AWSScenario,
+        ConfidenceLevel,
+        CostLine,
+        EngineRecommendation,
         SignalContribution,
     )
 
