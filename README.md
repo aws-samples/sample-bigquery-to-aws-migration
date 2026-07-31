@@ -9,21 +9,33 @@ load guidance, an engine recommendation, and a directional BigQuery-vs-AWS cost
 comparison as HTML + JSON reports.
 
 It **assesses; it does not execute the migration** — and it needs no AWS account to run.
-Migration execution driven from the assessment output is on the roadmap.
 
-## Quick Start (Claude Code)
+> **Beta.** Cost figures are directional estimates, not a pricing quote, and are labelled
+> by confidence in the report. Assessments are best reviewed with your AWS specialist
+> team before they inform a decision.
 
-The guided way to run an assessment. The skill handles setup, execution, and report
-interpretation.
+## Two Ways to Run
 
+**1. Collect, then report — recommended when working with an AWS team**
+
+Run the lightweight collector where your BigQuery credentials live. It writes a
+plain-JSON, checksummed bundle you can inspect before sharing; your AWS team generates
+the report from it, fully offline.
+
+➡️ **[Collect and Share — customer guide](docs/COLLECT.md)** — the three commands to run,
+what's in the bundle, and how to review it.
+
+```bash
+bq-collect --gcp-project my-project --use-adc --output bundle-out/
+# then, on the analyst side:
+bq-assess report --bundle bundle-out/ --output reports/
 ```
-/plugin marketplace add aws-samples/sample-bigquery-to-aws-migration
-/plugin install bq-assess@sample-bigquery-to-aws-migration
-```
 
-Then ask:
+**2. Full assessment — scan and report in one step**
 
-> "Assess BigQuery migration for project my-project"
+Run the whole pipeline yourself, in the environment that has BigQuery access. Given the
+beta caveat above, we suggest looping in your AWS specialist team to interpret the
+output.
 
 ## Prerequisites
 
@@ -38,9 +50,22 @@ Then ask:
 - IAM role on the target project: `roles/bigquery.metadataViewer`
 - For query log analysis (optional, higher confidence): `roles/bigquery.resourceViewer`
 
-## CLI Usage
+## Full Assessment — Claude Code
 
-Prefer the command line? Install directly:
+The guided path. The skill handles setup, execution, and report interpretation.
+
+```
+/plugin marketplace add aws-samples/sample-bigquery-to-aws-migration
+/plugin install bq-assess@sample-bigquery-to-aws-migration
+```
+
+Then ask:
+
+> "Assess BigQuery migration for project my-project"
+
+## Full Assessment — CLI
+
+Install directly:
 
 ```bash
 pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git"
@@ -97,17 +122,9 @@ Preflight → Scan → Interpret
 3. **Interpret** — reads the JSON report, highlights top effort/complexity entities and
    cost findings, points to the HTML report
 
-## Two Ways to Run
-
-- **Direct** (`bq-assess`) — scan and generate the report in one step, inside the
-  environment that has BigQuery access.
-- **Collect, then report** (`bq-collect` + `bq-assess report`) — run the lightweight
-  collector where the BigQuery credentials live; it writes a plain-JSON, checksummed
-  bundle you can review before sharing. Generate the report later, anywhere, fully
-  offline: `bq-assess report --bundle <dir-or-zip>`.
-
 ## Documentation
 
+- [Collect and Share](docs/COLLECT.md) — customer-facing collector guide
 - [CLI Reference](docs/CLI_REFERENCE.md) — all flags, options, and examples
 - [Migration Complexity Guide](docs/MIGRATION_COMPLEXITY_GUIDE.md) — two-axis scoring rules explained
 - [Architecture Decision Records](docs/adr/) — why Iceberg storage, two scoring axes, partition mapping, per-entity placement
@@ -118,7 +135,7 @@ Preflight → Scan → Interpret
 
 ```bash
 pip3 install -e ".[dev]"
-pytest                           # 700+ tests (unit + property-based)
+pytest                           # 900+ tests (unit + property-based)
 bash tests/plugin/structure.sh   # plugin structural checks
 ```
 
