@@ -432,3 +432,58 @@ def test_rebuilt_view_names_quoted(tmp_path):
     assert summary["views"] == 1
     sql = (tmp_path / "rebuilt_entities.sql").read_text()
     assert 'CREATE OR REPLACE VIEW sandbox."Inf Count Switches" AS' in sql
+
+
+def test_rebuilt_entities_redshift_dialect_header(tmp_path):
+    """2026-08-04 audit: the header said 'run in the Athena workgroup' around
+    Redshift-dialect SQL. Instructions must match TranslationResult.target_engine."""
+    entities = [_rebuilt("ds.v1", EntityType.VIEW, view_query="SELECT 1")]
+    translations = {
+        "ds.v1": TranslationResult(redshift_sql="SELECT 1", confidence="HIGH",
+                                   warnings=[], target_engine="redshift"),
+    }
+    generate_migration_scripts(
+        project_dir=str(tmp_path), migration_plans={"ds.t1": _dml("ds.t1")},
+        connector_name="bq-conn", target_region="eu-west-1",
+        rebuilt_entities=entities, translation_results=translations,
+    )
+    sql = (tmp_path / "migration" / "rebuilt_entities.sql").read_text()
+    assert "Redshift Serverless" in sql
+    assert "do NOT" in sql and "Athena workgroup" in sql
+    assert "Athena accepts one per call" not in sql
+
+
+def test_rebuilt_entities_athena_dialect_header(tmp_path):
+    entities = [_rebuilt("ds.v1", EntityType.VIEW, view_query="SELECT 1")]
+    translations = {
+        "ds.v1": TranslationResult(redshift_sql="SELECT 1", confidence="HIGH",
+                                   warnings=[], target_engine="athena"),
+    }
+    generate_migration_scripts(
+        project_dir=str(tmp_path), migration_plans={"ds.t1": _dml("ds.t1")},
+        connector_name="bq-conn", target_region="eu-west-1",
+        rebuilt_entities=entities, translation_results=translations,
+    )
+    sql = (tmp_path / "migration" / "rebuilt_entities.sql").read_text()
+    assert "Dialect: Athena (Trino)" in sql
+
+
+def test_rebuilt_view_missing_dependency_flagged(tmp_path):
+    """A view depending on a table absent from the plan can never validate —
+    it must carry a WARNING naming the missing table."""
+    v = _rebuilt("ds.v1", EntityType.VIEW, view_query="SELECT 1")
+    v.depends_on = ["curated.not_migrated", "ds.t1"]
+    translations = {
+        "ds.v1": TranslationResult(redshift_sql="SELECT 1", confidence="HIGH",
+                                   warnings=[], target_engine="redshift"),
+    }
+    generate_migration_scripts(
+        project_dir=str(tmp_path), migration_plans={"ds.t1": _dml("ds.t1")},
+        connector_name="bq-conn", target_region="eu-west-1",
+        rebuilt_entities=[v], translation_results=translations,
+    )
+    sql = (tmp_path / "migration" / "rebuilt_entities.sql").read_text()
+    assert "depends on curated.not_migrated" in sql
+    assert "NOT in this migration plan" in sql
+    # the satisfied dependency is not flagged
+    assert "depends on ds.t1" not in sql

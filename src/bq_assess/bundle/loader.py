@@ -152,14 +152,14 @@ class BundleLoader:
                 raise BundleError(
                     f"Bundle file listed in manifest is missing: {filename} — "
                     f"the bundle is incomplete (truncated zip or partial copy). "
-                    f"Ask the bundle provider to re-send it."
+                    f"Ask the customer to re-send it."
                 )
             actual_sha = sha256_file(fpath)
             if actual_sha != expected_sha:
                 raise BundleError(
                     f"Checksum mismatch for {filename}: bundle may be corrupt or "
                     f"tampered (expected {expected_sha[:12]}…, got {actual_sha[:12]}…). "
-                    f"Ask the bundle provider to re-send the bundle."
+                    f"Ask the customer to re-send the bundle."
                 )
 
         return manifest
@@ -188,6 +188,8 @@ class BundleLoader:
             rates=rates,
             queries=queries,
             storage_basis=manifest.get("storage_basis", "assumed"),
+            egress_sessions=manifest.get("egress_sessions"),
+            egress_gib=manifest.get("egress_gib"),
             regions=manifest.get("regions") or [],  # [] → __post_init__ defaults to [bq_location]
             collector_version=manifest.get("collector_version", ""),
             created_at=manifest.get("created_at", ""),
@@ -311,6 +313,15 @@ class BundleLoader:
         if data is None:
             return None
         try:
+            # Auto-reader marker keys: absent from ALL of them ⇒ bundle predates the
+            # reservation auto-reader (collector < 0.8) — the data was never collected,
+            # which is a different customer message than permission-denied.
+            _auto_reader_keys = (
+                "reservation_readable", "autoscale_slot_seconds",
+                "timeline_window_seconds", "assigned_count", "commitments",
+            )
+            reservation_data_collected = any(key in data for key in _auto_reader_keys)
+
             return PricingDetection(
                 model=BQPricingModel(data.get("model", "UNKNOWN")),
                 confidence=ConfidenceLevel(data.get("confidence", "LOW")),
@@ -320,6 +331,14 @@ class BundleLoader:
                 max_slots=data.get("max_slots"),
                 commitment_slots=data.get("commitment_slots"),
                 commitment_plan=data.get("commitment_plan"),
+                reservation_id=data.get("reservation_id"),
+                reservation_readable=data.get("reservation_readable", True),
+                reservation_data_collected=reservation_data_collected,
+                autoscale_slot_seconds=data.get("autoscale_slot_seconds"),
+                timeline_window_seconds=data.get("timeline_window_seconds"),
+                assigned_projects=data.get("assigned_projects") or [],
+                assigned_count=data.get("assigned_count", 0),
+                commitments=data.get("commitments") or [],
             )
         except (TypeError, ValueError) as exc:
             raise BundleError(f"Malformed pricing.json: {exc}") from exc
@@ -338,10 +357,13 @@ class BundleLoader:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue  # skip malformed lines rather than fail the whole load
+                # `or 0`, not a .get default: external/hand-edited bundles carry
+                # explicit "total_slot_ms": null, which .get passes through and
+                # later sum() calls crash on (TypeError on None + int).
                 records.append(QueryRecord(
                     query=row.get("query", ""),
-                    total_slot_ms=row.get("total_slot_ms", 0),
-                    total_bytes_processed=row.get("total_bytes_processed", 0),
+                    total_slot_ms=row.get("total_slot_ms") or 0,
+                    total_bytes_processed=row.get("total_bytes_processed") or 0,
                     total_bytes_billed=row.get("total_bytes_billed"),
                     statement_type=row.get("statement_type"),
                     creation_time=row.get("creation_time"),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bq-collect"
-version = "0.6.0"
+version = "0.8.0"
 description = "Read-only BigQuery metadata collector (beta): runs in the customer environment and produces an auditable bundle for offline lakehouse-migration assessment. No report generation, scoring, or conversion code included."
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ dependencies = [
     "rich>=13.0",
     "pyyaml>=6.0",
     "google-cloud-bigquery>=3.11",
+    "google-cloud-monitoring>=2.16",
 ]
 
 [project.scripts]

@@ -4,8 +4,7 @@ Per detected construct, emit a human-readable required change + effort indicatio
 For entities with SQL surface, also produce a best-effort Redshift translation using
 sqlglot (illustrative only — requires validation before production use).
 
-Translation pipeline (2026-07-16 rework — see
-the 2026-07-16 translation deep-audit notes):
+Translation pipeline (2026-07-16 rework, from the translation deep-audit):
 sqlglot's Redshift generator emits BigQuery's DATETIME()/TIMESTAMP() and STRUCT()
 silently (no ``unsupported()`` call), so ``transpile()`` alone shipped SQL that cannot
 run on Redshift at HIGH confidence. We now parse per statement, rewrite temporal
@@ -167,6 +166,7 @@ class RewriteGuide:
                     continue
                 try:
                     stmt = _rewrite_to_fixpoint(stmt, warnings)
+                    _strip_project_qualifiers(stmt, warnings)
                     _scan_residuals(stmt, warnings)
                     parts.append(stmt.sql(dialect="redshift"))
                 except Exception as e:
@@ -207,6 +207,22 @@ def _resolve_confidence(warnings: list[str]) -> str:
     if all(w.startswith(_AUTO) for w in warnings):
         return "MEDIUM"
     return "LOW"
+
+
+def _strip_project_qualifiers(tree: exp.Expression, warnings: list[str]) -> None:
+    """Drop the BigQuery project (catalog) part from 3-part table refs, in place.
+
+    `project.dataset.table` is how BQ views reference tables; on the target the
+    migrated tables are addressed as `dataset.table` (Athena resolves via the
+    workgroup's QueryExecutionContext catalog; Redshift via the external
+    schema). Leaving the GCP project name as a catalog qualifier makes every
+    CREATE VIEW fail with an unknown-database error (2026-08-04 audit: all
+    shipped views). Silent by design — a mechanical, always-correct
+    normalization, the same class as backtick→double-quote conversion.
+    """
+    for table in tree.find_all(exp.Table):
+        if table.args.get("catalog") is not None:
+            table.set("catalog", None)
 
 
 def _rewrite_to_fixpoint(tree: exp.Expression, warnings: list[str]) -> exp.Expression:
@@ -250,6 +266,20 @@ def _rewrite_temporal(node: exp.Expression, warnings: list[str]) -> exp.Expressi
         # DATETIME(date, time) two-part form — no clean equivalent
         warnings.append(_W_DATETIME_TWO_PART)
         return node
+
+    # BQ TIMESTAMP_ADD/SUB(ts, INTERVAL n unit) → Redshift DATEADD(unit, ±n, ts).
+    # sqlglot's Redshift generator passes TimestampAdd/Sub through VERBATIM
+    # ("TIMESTAMP_SUB(GETDATE(), '1', HOUR)" — invalid Redshift, shipped
+    # unflagged in a real deliverable, 2026-08-04 audit).
+    if isinstance(node, (exp.TimestampAdd, exp.TimestampSub)):
+        n = node.expression
+        if isinstance(n, exp.Literal):
+            # sqlglot parses the interval count as a string literal; DATEADD
+            # needs a bare number.
+            n = exp.Literal.number(n.name)
+        if isinstance(node, exp.TimestampSub):
+            n = exp.Neg(this=n)
+        return exp.DateAdd(this=node.this, expression=n, unit=node.unit)
 
     if isinstance(node, exp.Timestamp):
         tz = node.args.get("zone")

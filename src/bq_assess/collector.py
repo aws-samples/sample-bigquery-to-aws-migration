@@ -47,6 +47,7 @@ from bq_assess.core.price_lookup import (
 from bq_assess.core.pricing import PricingDetector
 from bq_assess.core.region_mapping import bq_location_to_aws_region
 from bq_assess.core.reservation_reader import (
+    ReservationCache,
     parse_admin_project,
     read_reservation_details,
 )
@@ -76,8 +77,29 @@ def _apply_reservation_result(pricing, read_result, source_note: str) -> None:
     pricing.commitment_plan = read_result.commitment_plan
     if read_result.edition:
         pricing.edition = read_result.edition
+    pricing.reservation_readable = True
+    pricing.autoscale_slot_seconds = read_result.autoscale_slot_seconds
+    pricing.timeline_window_seconds = read_result.timeline_window_seconds
+    pricing.assigned_projects = read_result.assigned_projects
+    pricing.assigned_count = read_result.assigned_count
+    pricing.commitments = [
+        {"slot_count": c.slot_count, "plan": c.plan, "edition": c.edition}
+        for c in read_result.commitments
+    ]
     pricing.confidence = ConfidenceLevel.HIGH
     pricing.source_note = source_note
+
+
+def _edition_requires_commitment(pricing) -> bool:
+    """True if this edition cannot be priced without readable reservation details.
+
+    ENTERPRISE/ENTERPRISE_PLUS require commitment data to determine the plan rate;
+    STANDARD uses a single PAYG rate and can fall back to a measured-slot-usage range.
+    Unknown edition is treated as ENTERPRISE (the downstream default).
+    """
+    if pricing.edition:
+        return pricing.edition in pk.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS
+    return True  # Unknown edition → treat as ENTERPRISE
 
 
 def collect(params: dict) -> Bundle:
@@ -86,7 +108,11 @@ def collect(params: dict) -> Bundle:
     credentials: str | None = params.get("credentials")
     use_adc: bool = params.get("use_adc", False)
     datasets_str: str | None = params.get("datasets")
-    include_query_logs: bool = params.get("include_query_logs", False)
+    # Query-log analysis is ALWAYS ON (2026-08-03 parity decision): the opt-outs
+    # are --skip-workload (no JOBS reads at all) and --exclude-query-text
+    # (no statements in the bundle). include_query_logs=False survives only as
+    # an internal override for tests/config.
+    include_query_logs: bool = params.get("include_query_logs", True)
     query_logs_path: str | None = params.get("query_logs")
     query_log_days: int = int(params.get("query_log_days") or 30)
     reservation_config: dict | None = params.get("reservation_config_data")
@@ -242,12 +268,12 @@ def collect(params: dict) -> Bundle:
         console.print(f"[yellow]⚠ Pricing detection failed: {exc}[/yellow]")
         pricing = None
 
-    # ── Stage 3b: Auto-read reservation details (ENTERPRISE only) ──
+    # ── Stage 3b: Auto-read reservation details (all capacity editions) ──
+    reservation_cache: ReservationCache | None = params.get("reservation_cache")
     if (
         pricing is not None
         and pricing.model is BQPricingModel.CAPACITY
         and pricing.baseline_slots is None
-        and pricing.edition in pk.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS
     ):
         # Detection already read the grouped JOBS rows and carries the
         # reservation_id — re-querying INFORMATION_SCHEMA here doubled the
@@ -271,11 +297,25 @@ def collect(params: dict) -> Bundle:
             console.print(
                 f"[dim]  Reservation: {admin_proj}:{res_location}.{res_name}[/dim]"
             )
-            console.print(
-                f"[dim]  Attempting to read reservation details from project "
-                f"'{admin_proj}'...[/dim]"
-            )
-            read_result = read_reservation_details(client, admin_proj, res_location, res_name)
+
+            # Check cache first (fleet mode: avoid re-querying the same reservation)
+            read_result = None
+            if reservation_cache:
+                read_result = reservation_cache.get(admin_proj, res_location, res_name)
+                if read_result:
+                    console.print("[dim]  (cached from prior project read)[/dim]")
+
+            if read_result is None:
+                console.print(
+                    f"[dim]  Attempting to read reservation details from project "
+                    f"'{admin_proj}'...[/dim]"
+                )
+                read_result = read_reservation_details(
+                    client, admin_proj, res_location, res_name,
+                    lookback_days=query_log_days,
+                )
+                if reservation_cache:
+                    reservation_cache.put(admin_proj, res_location, res_name, read_result)
 
             if read_result.success:
                 _apply_reservation_result(pricing, read_result,
@@ -290,19 +330,33 @@ def collect(params: dict) -> Bundle:
                     f"({read_result.commitment_plan})[/green]"
                 )
             elif read_result.permission_denied:
+                # Branch messaging: ENTERPRISE/ENTERPRISE_PLUS require commitments (hard stop),
+                # STANDARD has a fallback (modelled range from measured slot usage).
+                is_commitment_required = _edition_requires_commitment(pricing)
+
                 console.print()
                 console.print(
                     f"[yellow]⚠️  Permission denied on project '{admin_proj}'.[/yellow]"
                 )
                 console.print()
-                console.print(
-                    "[bold]For accurate BigQuery cost estimation, we need "
-                    "reservation details.[/bold]"
-                )
-                console.print(
-                    "Without this, the cost comparison will show an estimate "
-                    "(±25-60% accuracy)."
-                )
+
+                if is_commitment_required:
+                    console.print(
+                        "[bold]BigQuery capacity cost CANNOT be estimated without "
+                        "reservation details.[/bold]"
+                    )
+                    console.print(
+                        "The report will show this project's capacity cost as "
+                        "UNAVAILABLE (not estimated)."
+                    )
+                else:
+                    console.print(
+                        "[bold]Reservation details unreadable — the estimate will fall back to "
+                        "a modelled range[/bold]\n"
+                        "[bold]from measured slot usage (MEDIUM confidence; actual bill can "
+                        "exceed it for bursty workloads).[/bold]"
+                    )
+
                 console.print()
                 console.print("[bold]To fix (takes ~30 seconds):[/bold]")
                 console.print(
@@ -310,6 +364,19 @@ def collect(params: dict) -> Bundle:
                     f"  [cyan]gcloud projects add-iam-policy-binding {admin_proj} \\\n"
                     f"    --member=\"user:<your-email>\" \\\n"
                     f"    --role=\"roles/bigquery.resourceViewer\"[/cyan]"
+                )
+                if is_commitment_required:
+                    console.print(
+                        "  Or supply [cyan]--bigquery-monthly-cost[/cyan] to override."
+                    )
+                else:
+                    console.print(
+                        "  (Grant access for an exact billed-capacity figure.)"
+                    )
+                console.print(
+                    "  Tip: if a Cloud Billing BigQuery export already exists, read "
+                    "access to that\n  dataset typically suffices to get the exact "
+                    "billed amount for [cyan]--bigquery-monthly-cost[/cyan]."
                 )
                 console.print()
 
@@ -319,29 +386,55 @@ def collect(params: dict) -> Bundle:
                 )
                 if retry:
                     read_result = read_reservation_details(
-                        client, admin_proj, res_location, res_name
+                        client, admin_proj, res_location, res_name,
+                        lookback_days=query_log_days,
                     )
                     if read_result.success:
                         _apply_reservation_result(pricing, read_result,
                             f"Capacity model auto-read from {admin_proj} RESERVATIONS "
                             f"(retry succeeded)."
                         )
+                        if reservation_cache:
+                            reservation_cache.put(admin_proj, res_location, res_name, read_result)
                         console.print("[green]✓ Reservation details read on retry.[/green]")
                     else:
-                        console.print(
-                            "[yellow]Still denied. Continuing — cost will be "
-                            "estimated from slot usage.[/yellow]"
-                        )
+                        pricing.reservation_readable = False
+                        if is_commitment_required:
+                            console.print(
+                                "[yellow]Still denied. Capacity cost will be "
+                                "reported as UNAVAILABLE.[/yellow]"
+                            )
+                        else:
+                            console.print(
+                                "[yellow]Still denied. Capacity cost will be estimated as a range "
+                                "from measured slot usage.[/yellow]"
+                            )
                 else:
-                    console.print(
-                        "[dim]  Continuing without reservation details — "
-                        "cost will be estimated from slot usage.[/dim]"
-                    )
+                    pricing.reservation_readable = False
+                    if is_commitment_required:
+                        console.print(
+                            "[dim]  Capacity cost will be reported as UNAVAILABLE.[/dim]"
+                        )
+                    else:
+                        console.print(
+                            "[dim]  Capacity cost will be estimated as a range from measured slot usage.[/dim]"
+                        )
             else:
+                # Non-permission read error (API failure, etc.)
+                is_commitment_required = _edition_requires_commitment(pricing)
+                pricing.reservation_readable = False
                 console.print(
                     f"[yellow]⚠ Could not read reservation details: "
                     f"{read_result.error_message}[/yellow]"
                 )
+                if is_commitment_required:
+                    console.print(
+                        "[dim]  Capacity cost will be reported as UNAVAILABLE.[/dim]"
+                    )
+                else:
+                    console.print(
+                        "[dim]  Capacity cost will be estimated as a range from measured slot usage.[/dim]"
+                    )
 
     # ── Stage 4: Workload Analysis ─────────────────────────────────
     # The live path reads HOURLY aggregates (≤ 24×days rows server-side) — bounded memory
@@ -512,6 +605,35 @@ def collect(params: dict) -> Bundle:
 
     storage_basis = storage_stats.basis if storage_stats else "assumed"
 
+    # ── Storage Read API egress estimation (Cloud Monitoring) ─────────
+    egress_sessions: int | None = None
+    egress_gib: float | None = None
+    try:
+        from bq_assess.core.egress_estimator import estimate_storage_api_egress
+
+        total_logical_bytes = sum(e.num_bytes for e in entities if e.population.value == "TABLE")
+        table_count = sum(1 for e in entities if e.population.value == "TABLE")
+        if total_logical_bytes > 0 and table_count > 0:
+            egress = estimate_storage_api_egress(
+                gcp_project, total_logical_bytes, table_count,
+            )
+            if egress is not None:
+                egress_sessions = egress.read_sessions
+                egress_gib = egress.estimated_egress_gib
+                console.print(
+                    f"[green]✓ Storage Read API egress: {egress.read_sessions} sessions, "
+                    f"~{egress.estimated_egress_gib:,.1f} GiB/month.[/green]"
+                )
+            else:
+                console.print(
+                    "[yellow]⚠ Storage Read API egress: no sessions detected or "
+                    "roles/monitoring.viewer unavailable — egress cost excluded from estimate.[/yellow]"
+                )
+    except Exception as exc:
+        console.print(
+            f"[yellow]⚠ Storage Read API egress estimation skipped: {exc}[/yellow]"
+        )
+
     return Bundle(
         project_id=gcp_project,
         bq_location=detected_location,
@@ -524,6 +646,8 @@ def collect(params: dict) -> Bundle:
         rates=rates_snapshot,
         queries=queries,
         storage_basis=storage_basis,
+        egress_sessions=egress_sessions,
+        egress_gib=egress_gib,
         collector_version=__version__,
         created_at=datetime.now(timezone.utc).isoformat(),
     )

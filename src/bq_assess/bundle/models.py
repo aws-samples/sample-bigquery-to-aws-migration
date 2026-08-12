@@ -53,6 +53,8 @@ class Bundle:
     rates: dict | None = None  # PricingRates serialized via price_lookup.rates_to_dict
     queries: list[QueryRecord] | None = None
     storage_basis: str = "assumed"  # measured | mixed | assumed (from StorageStats.basis)
+    egress_sessions: int | None = None       # Storage Read API sessions (Cloud Monitoring)
+    egress_gib: float | None = None          # Estimated monthly egress in GiB
     collector_version: str = ""
     created_at: str = ""
     regions: list[str] = field(default_factory=list)  # ALL dataset locations (v2)

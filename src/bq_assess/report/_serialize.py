@@ -144,6 +144,9 @@ _QUERY_ROW_KEYS = (
     "full_name", "entity_type", "population",
     "complexity", "depends_on", "rewrite_guidance", "placement", "detail_chunk",
     "has_translated_sql",  # row-level flag; the SQL itself lives in the detail chunk
+    "query_workload",      # lightweight summary: {query_count, slot_hours, statement_types, num_shapes}
+    "has_workload",        # boolean flag for JS: true if this entity has attributed query logs
+    "query_chunk",         # index of the query-sample chunk holding this entity's samples
 )
 
 # Heavy per-entity fields moved out of the row payload into lazy detail chunks.
@@ -249,5 +252,65 @@ def build_report_rows(
         ],
     }
     return rows, detail_chunks
+
+
+QUERY_SAMPLE_CHUNK_SIZE = 100
+
+# Per-sample SQL clip for the HTML embed. With no per-estate entity cap
+# (2026-08-04), report size is bounded per SAMPLE instead: 3 shapes/entity ×
+# ≤2×4 KB each ≈ 24 KB worst case per entity, dominated in practice by short
+# production queries. The untruncated SQL is always in query-workload/.
+MAX_SAMPLE_SQL_CHARS = 4_000
+_CLIP_NOTE = "\n-- … truncated for the report; full query in query-workload/"
+
+
+def _clip_sql(sql: str) -> str:
+    if len(sql) <= MAX_SAMPLE_SQL_CHARS:
+        return sql
+    return sql[:MAX_SAMPLE_SQL_CHARS] + _CLIP_NOTE
+
+
+def build_query_sample_chunks(
+    query_workloads: dict[str, dict],
+) -> tuple[list[dict], dict[str, int]]:
+    """Build chunked query-sample JSON for lazy loading in the report.
+
+    Each chunk is a dict of {entity_full_name: [{o, t, s, m}, ...]} holding
+    the top-N query samples per entity, SQL clipped at MAX_SAMPLE_SQL_CHARS.
+    Chunks are capped at QUERY_SAMPLE_CHUNK_SIZE entities so each one-time
+    JSON.parse (on first expand of a row in that chunk) stays small.
+
+    Returns ``(chunks, entity_to_chunk)``: the index map lets the JS parse
+    ONLY the chunk holding the expanded entity. Without it, getQuerySamples
+    walked and parsed EVERY chunk until it found the entity — one expand
+    could parse the entire sample payload (~26 MB at 4,247 entities),
+    blocking the UI exactly on the large estates chunking exists for
+    (2026-08-04 review).
+
+    The query_workloads dict maps entity full_name → {samples: [{query, translated, statement_type, total_slot_ms}]}.
+    """
+    chunks: list[dict] = []
+    entity_to_chunk: dict[str, int] = {}
+    current: dict = {}
+    for entity_name, wl in query_workloads.items():
+        samples = wl.get("samples", [])
+        if not samples:
+            continue
+        current[entity_name] = [
+            {
+                "o": _clip_sql(s["query"]),
+                "t": _clip_sql(s["translated"]),
+                "s": s["statement_type"],
+                "m": s["total_slot_ms"],
+            }
+            for s in samples
+        ]
+        entity_to_chunk[entity_name] = len(chunks)
+        if len(current) >= QUERY_SAMPLE_CHUNK_SIZE:
+            chunks.append(current)
+            current = {}
+    if current:
+        chunks.append(current)
+    return chunks, entity_to_chunk
 
 

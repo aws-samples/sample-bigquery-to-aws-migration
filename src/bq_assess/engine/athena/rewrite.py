@@ -284,6 +284,14 @@ class AthenaRewriteGuide:
                     continue
                 try:
                     self._scan_unsupported(stmt, unsupported, warnings)
+                    # Strip the BQ project (catalog) qualifier: migrated tables
+                    # are dataset.table on the target; the workgroup's
+                    # QueryExecutionContext catalog resolves them. Shared reason
+                    # with engine/redshift/rewrite._strip_project_qualifiers.
+                    from bq_assess.engine.redshift.rewrite import (
+                        _strip_project_qualifiers,
+                    )
+                    _strip_project_qualifiers(stmt, warnings)
                     self._quote_reserved_identifiers(stmt, warnings)
                     translated = stmt.sql(dialect="trino")
                     parts.append(translated)

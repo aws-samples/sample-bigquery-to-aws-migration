@@ -30,8 +30,13 @@
       </svg>
       <div class="donut__center">
         {% if total > 0 %}
-        <span class="donut__center-value">{{ ((segments[0].count / total) * 100) | round | int }}%</span>
-        <span class="donut__center-label">{{ segments[0].label }}</span>
+        {# Headline = the DOMINANT segment, so the center always agrees with the
+           biggest slice and the legend (2026-08-03: an all-Adapt estate read
+           "0% Portable" inside an all-amber ring). Ties keep the earlier
+           segment — segment order runs best-news first. #}
+        {% set dominant = segments | sort(attribute="count", reverse=true) | first %}
+        <span class="donut__center-value">{{ ((dominant.count / total) * 100) | round | int }}%</span>
+        <span class="donut__center-label">{{ dominant.label }}</span>
         {% else %}
         <span class="donut__center-value">&mdash;</span>
         <span class="donut__center-label">no data</span>

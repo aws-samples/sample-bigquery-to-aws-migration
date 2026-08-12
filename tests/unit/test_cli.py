@@ -82,7 +82,7 @@ class TestLoadConfig:
         assert result["use_adc"] is False
         assert result["datasets"] == "analytics,marketing"
         assert result["include_query_logs"] is True
-        assert result["query_logs"] == "/tmp/logs.json"  # nosec B108 - asserting CLI arg passthrough, no file created
+        assert result["query_logs"] == "/tmp/logs.json"
         assert result["query_log_days"] == 7
         assert result["bigquery_monthly_cost"] == 5000.0
         assert result["reservation_config"] == "/path/to/res.yaml"

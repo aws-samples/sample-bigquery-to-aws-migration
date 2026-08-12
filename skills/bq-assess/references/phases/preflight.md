@@ -83,11 +83,12 @@ Once all preflight checks pass (`bq_assess_installed`, `gcloud_installed`, and `
   - Accepts a comma-separated list of dataset names.
   - If left blank, the CLI scans all datasets in the project.
 
-- **`include_query_logs`** — Ask: "Include query log analysis for higher confidence? (yes/no)"
-  - Default: **yes**
-  - If the user declines, note that the assessment will run with LOW confidence (heuristic-only scoring).
+- **`skip_workload`** — Ask: "Query-log analysis runs by default and produces the most accurate cost estimate. Skip it? (yes/no)"
+  - Default: **no** (i.e. let the workload analysis run)
+  - Answer yes only when the account is known to lack `bigquery.jobs.listAll`, or reading job history is not permitted. If skipped, note that the cost comparison becomes a rough range and complexity scoring is heuristic-only.
+  - Opting out uses `--skip-workload`. There is no `--include-query-logs` flag to pass.
 
-- **`query_log_days`** — Only ask if `include_query_logs` is yes.
+- **`query_log_days`** — Only ask if `skip_workload` is no.
   - Ask: "How many days of query logs to analyze? (default: 30, range: 1–90)"
   - Default: **30**
   - Accepted range: 1 to 90. If the user provides a value outside this range, ask them to correct it.
@@ -106,7 +107,7 @@ If any condition is not met, do **NOT** advance. Loop back to the relevant step 
 When all conditions are satisfied, pass the collected parameters to the Scan phase:
 - `gcp_project`
 - `datasets` (if provided)
-- `include_query_logs`
+- `skip_workload`
 - `query_log_days` (if applicable)
 
 ## Critical Constraints

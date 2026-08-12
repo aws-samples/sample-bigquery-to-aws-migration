@@ -95,13 +95,15 @@ def test_estimate_signature_matches_contract() -> None:
     sig = inspect.signature(CostEstimator.estimate)
     params = list(sig.parameters)
     assert params == ["self", "entities", "pricing", "slots", "bq_monthly_override",
-                      "effort_total", "location", "storage_basis", "as_of"]
+                      "effort_total", "location", "storage_basis", "as_of", "egress_gib"]
     assert sig.parameters["location"].kind is inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["location"].default is None
     assert sig.parameters["storage_basis"].kind is inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["storage_basis"].default == "assumed"
     assert sig.parameters["as_of"].kind is inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["as_of"].default is None
+    assert sig.parameters["egress_gib"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["egress_gib"].default is None
 
 
 def test_returns_costcomparison() -> None:
@@ -221,6 +223,14 @@ def test_bq_breakdown_sums_to_bigquery_monthly() -> None:
     assert round(total, 4) == round(r.bigquery_monthly, 4)
 
 
+def test_ondemand_proxy_fallback_mentions_override_flag() -> None:
+    """No logs → LOW proxy estimate must tell the customer how to supply the real bill."""
+    result = _estimate(pricing=ondemand_pricing(), slots=None)
+    scan_line = next(ln for ln in result.bigquery_breakdown if "scanned" in ln.label.lower())
+    assert scan_line.confidence is ConfidenceLevel.LOW
+    assert "--bigquery-monthly-cost" in scan_line.source_note
+
+
 def test_capacity_prices_from_reservation_figures() -> None:
     """R18.2b: capacity priced from edition × plan-rate × slots × 730 + storage; no on-demand scan."""
     pricing = capacity_pricing(edition="ENTERPRISE", commitment_slots=100, commitment_plan="ANNUAL")
@@ -237,28 +247,30 @@ def test_capacity_plan_maps_to_rate_key() -> None:
     storage = 100.0 * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
     for plan, key in [("ANNUAL", "commit_1yr"), ("THREE_YEAR", "commit_3yr"),
                       ("MONTHLY", "payg"), ("FLEX", "payg")]:
-        r = _estimate(pricing=capacity_pricing(commitment_slots=10, commitment_plan=plan))
+        r = _estimate(pricing=capacity_pricing(baseline_slots=10, commitment_slots=10, commitment_plan=plan))
         assert round(r.bigquery_monthly, 4) == round(10 * ent[key] * k.HOURS_PER_MONTH + storage, 4)
 
 
-def test_capacity_slot_basis_falls_back_commitment_then_baseline_then_max() -> None:
-    """D5 precedence: commitment_slots → baseline_slots → max_slots."""
+def test_capacity_baseline_is_billing_basis() -> None:
+    """Baseline slots are what's always allocated and billed — the billing basis."""
     ent_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
     storage = 100.0 * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
-    # commitment present and positive → used
+    # baseline present → used as billing basis
     r1 = _estimate(pricing=capacity_pricing(commitment_slots=50, baseline_slots=10, max_slots=200))
-    assert round(r1.bigquery_monthly, 4) == round(50 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
-    # commitment None → baseline used
-    r2 = _estimate(pricing=capacity_pricing(commitment_slots=None, baseline_slots=10, max_slots=200))
-    assert round(r2.bigquery_monthly, 4) == round(10 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
-    # commitment + baseline None → max used
-    r3 = _estimate(pricing=capacity_pricing(commitment_slots=None, baseline_slots=None, max_slots=200))
-    assert round(r3.bigquery_monthly, 4) == round(200 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
+    assert round(r1.bigquery_monthly, 4) == round(10 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
+    # baseline None → falls back to commitment_slots
+    r2 = _estimate(pricing=capacity_pricing(commitment_slots=50, baseline_slots=None, max_slots=200))
+    assert round(r2.bigquery_monthly, 4) == round(50 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
+    # baseline + commitment None, but autoscale present → zero baseline (only autoscale matters)
+    p3 = capacity_pricing(commitment_slots=None, baseline_slots=None, max_slots=200)
+    p3.autoscale_slot_seconds = 0  # Has reservation data (zero autoscale usage), so priceable
+    p3.timeline_window_seconds = int(k.HOURS_PER_MONTH * 3600)
+    r3 = _estimate(pricing=p3)
+    assert round(r3.bigquery_monthly, 4) == round(0 * ent_rate * k.HOURS_PER_MONTH + storage, 4)
 
 
 def test_commitment_slots_zero_falls_through_to_baseline() -> None:
-    """commitment_slots=0 means 'no commitment purchased' — must NOT shadow a valid baseline.
-    Regression guard for _first_positive (round-2 review fix #1)."""
+    """commitment_slots=0 means 'no commitment purchased' — must NOT shadow a valid baseline."""
     ent_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
     storage = 100.0 * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
     r = _estimate(pricing=capacity_pricing(commitment_slots=0, baseline_slots=100, max_slots=200))
@@ -340,52 +352,343 @@ def test_capacity_includes_storage_line() -> None:
     assert storage_lines[0].monthly == pytest.approx(expected, rel=0.01)
 
 
-def test_capacity_fallback_standard_uses_slot_ms() -> None:
-    """STANDARD with no reservation figures uses slot-ms × 1.25 × rate."""
+def test_capacity_standard_no_reservation_data_uses_slot_ms() -> None:
+    """STANDARD with no reservation data estimates a modelled range (2026-08-10)."""
     pricing = capacity_pricing(
         edition="STANDARD", commitment_slots=None, baseline_slots=None, max_slots=None,
     )
     slots = slot_util(total_slot_ms=100 * 3_600_000, days_sampled=30, active_fraction=0.9)
     r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=slots)
-    rate = v4.V4_EDITION_SLOT_HOUR_USD["STANDARD"]["payg"]
-    # 100 slot-hours / 30 days × 30 DAYS_PER_MONTH × 1.25 correction × rate
-    monthly_slot_hours = 100.0 / 30 * k.DAYS_PER_MONTH
-    expected_compute = monthly_slot_hours * 1.25 * rate
-    assert r.bigquery_monthly == pytest.approx(expected_compute, rel=0.01)
     compute_line = next(x for x in r.bigquery_breakdown if "capacity" in x.label.lower())
+    # Now a range, not a point
+    assert compute_line.monthly is None
+    assert compute_line.monthly_low is not None
+    assert compute_line.monthly_high is not None
+    assert compute_line.monthly_high >= compute_line.monthly_low
+    # Confidence capped at MEDIUM (slot→billing reconstruction)
     assert compute_line.confidence is ConfidenceLevel.MEDIUM
-    assert "estimated" in compute_line.source_note.lower()
 
 
-def test_capacity_fallback_enterprise_uses_active_fraction() -> None:
-    """ENTERPRISE with no reservation figures uses slot-ms × max(1/active_fraction, 1.25) × rate."""
+class TestStandardCapacityRange:
+    """STANDARD capacity: slot_ms is a billing FLOOR, not the bill (2026-08-10).
+
+    Google bills scaled capacity (50-slot steps, 1-min minimum), not consumed
+    slot-ms — 'don't use the jobs information schema to match the billing'.
+    """
+
+    def _standard_no_reservation_data(self) -> PricingDetection:
+        return PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="capacity (test)", edition="STANDARD",
+            baseline_slots=None, max_slots=None, commitment_slots=None,
+            commitment_plan=None,
+        )
+
+    def _compute_line(self, result):
+        return next(ln for ln in result.bigquery_breakdown if "capacity" in ln.label.lower())
+
+    def test_standard_estimates_a_range_not_a_point(self) -> None:
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=100 * 3_600_000, days_sampled=14,
+                            avg=0.3, peak=40.0, active_fraction=0.2),
+        )
+        assert result.bq_cost_available is True
+        line = self._compute_line(result)
+        assert line.monthly is None
+        assert line.monthly_low is not None and line.monthly_high is not None
+        assert line.monthly_high >= line.monthly_low > 0
+
+    def test_ceiling_reflects_50_slot_autoscale_floor(self) -> None:
+        # bursty: avg 0.5 slots but only 10% active hours → busy concurrency 5,
+        # billed >= 50 slots during busy hours → ceiling far above the floor
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=int(0.5 * 730 * 3_600_000), days_sampled=30,
+                            avg=0.5, peak=20.0, active_fraction=0.1),
+        )
+        line = self._compute_line(result)
+        assert line.monthly_high > line.monthly_low * 2
+
+    def test_standard_confidence_never_high_without_timeline(self) -> None:
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(days_sampled=30),
+        )
+        line = self._compute_line(result)
+        assert line.confidence is not ConfidenceLevel.HIGH
+
+    def test_wide_range_adds_flag_guidance(self) -> None:
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=int(0.5 * 730 * 3_600_000), days_sampled=30,
+                            avg=0.5, peak=20.0, active_fraction=0.05),
+        )
+        line = self._compute_line(result)
+        assert line.monthly_high > 3 * line.monthly_low
+        assert "--bigquery-monthly-cost" in line.source_note
+
+    def test_range_always_discloses_burst_and_fluid_scaling_limits(self) -> None:
+        # The bursty-workload + fluid-scaling caveat is always-on, not spread-gated:
+        # the two-sided error is uncorrelated with the range's width (2026-08-10 review)
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=100 * 3_600_000, days_sampled=14,
+                            avg=0.3, peak=40.0, active_fraction=0.2),
+        )
+        line = self._compute_line(result)
+        assert "can exceed this range" in line.source_note
+        assert "fluid-scaling" in line.source_note
+        assert "--bigquery-monthly-cost" in line.source_note
+
+    def test_range_basis_savings_floor_uses_bq_minimum(self) -> None:
+        """monthly_delta_low is computed against the BQ measured minimum, not the
+        modelled upper estimate — savings anchored to the upper figure alone
+        flatter AWS one-sidedly (2026-08-11 MRI-1)."""
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=int(0.5 * 730 * 3_600_000), days_sampled=30,
+                            avg=0.5, peak=20.0, active_fraction=0.1),
+        )
+        line = self._compute_line(result)
+        assert result.bigquery_monthly_low is not None
+        assert result.bigquery_monthly_low < result.bigquery_monthly
+        # bigquery_monthly_low = storage points + the range line's low
+        point_sum = sum(
+            ln.monthly for ln in result.bigquery_breakdown
+            if ln.monthly is not None
+        )
+        assert result.bigquery_monthly_low == pytest.approx(
+            point_sum + line.monthly_low, rel=0.01
+        )
+        # and the committable delta is anchored to it
+        assert result.monthly_delta_low == pytest.approx(
+            result.bigquery_monthly_low - result.aws_monthly_high, rel=0.01
+        )
+        assert result.monthly_delta_high == pytest.approx(
+            result.bigquery_monthly - result.aws_monthly_low, rel=0.01
+        )
+
+    def test_point_basis_has_no_bigquery_monthly_low(self) -> None:
+        """Point-estimate bases (on-demand, reservation path) leave the range
+        basis unset so the template renders a single hero figure."""
+        result = _estimate(slots=slot_util())    # default on-demand pricing
+        assert result.bigquery_monthly_low is None
+
+    def test_headline_uses_ceiling(self) -> None:
+        # conservative: understating BQ cost overstates nothing — the headline
+        # (totals basis) is the reconstruction, the floor stays visible as the low
+        result = _estimate(
+            pricing=self._standard_no_reservation_data(),
+            slots=slot_util(total_slot_ms=100 * 3_600_000, days_sampled=14,
+                            avg=0.3, peak=40.0, active_fraction=0.2),
+        )
+        line = self._compute_line(result)
+        assert line.headline == line.monthly_high
+
+    def test_no_workload_data_still_prompts_not_prices(self) -> None:
+        result = _estimate(pricing=self._standard_no_reservation_data(), slots=None)
+        assert result.bq_cost_available is True     # storage still modelled
+        line = self._compute_line(result)
+        assert (line.monthly in (None, 0.0)) and not line.monthly_high
+        assert "--bigquery-monthly-cost" in line.source_note
+
+    def test_standard_with_timeline_data_uses_reservation_path(self) -> None:
+        p = PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.HIGH,
+            source_note="capacity (test)", edition="STANDARD",
+            baseline_slots=None, max_slots=None, commitment_slots=None,
+            commitment_plan=None, autoscale_slot_seconds=360_000,
+            timeline_window_seconds=604_800,
+        )
+        result = _estimate(pricing=p, slots=slot_util())
+        line = next(ln for ln in result.bigquery_breakdown if "capacity" in ln.label.lower())
+        assert "autoscale" in line.source_note          # reservation path, not from_slots
+        assert line.monthly is not None                 # point, not range
+
+
+def test_capacity_enterprise_no_reservation_data_is_unavailable() -> None:
+    """ENTERPRISE with no reservation data → UNAVAILABLE (commitment type unknown)."""
     pricing = capacity_pricing(
         edition="ENTERPRISE", commitment_slots=None, baseline_slots=None, max_slots=None,
+    )
+    slots = slot_util(total_slot_ms=100 * 3_600_000, days_sampled=30, active_fraction=0.9)
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=slots)
+    compute_line = next(x for x in r.bigquery_breakdown if "capacity" in x.label.lower())
+    assert "UNAVAILABLE" in compute_line.label
+    assert compute_line.confidence is ConfidenceLevel.LOW
+    assert compute_line.monthly is None
+
+
+def test_capacity_autoscale_adds_to_baseline() -> None:
+    """Autoscale slot-seconds are priced at PAYG rate on top of baseline."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", commitment_slots=100, baseline_slots=100,
         commitment_plan="ANNUAL",
     )
-    slots = slot_util(total_slot_ms=200 * 3_600_000, days_sampled=30, active_fraction=0.4)
-    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=slots)
-    # ANNUAL → commit_1yr rate (capacity_pricing default)
+    # 1000 autoscale slot-seconds over 86400 seconds (1 day)
+    pricing.autoscale_slot_seconds = 1000
+    pricing.timeline_window_seconds = 86400
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing)
     rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
-    # 200 slot-hours / 30 days × 30 DAYS_PER_MONTH × max(1/0.4, 1.25) × rate
-    monthly_slot_hours = 200.0 / 30 * k.DAYS_PER_MONTH
-    correction = max(1.0 / 0.4, 1.25)  # 2.5
-    expected_compute = monthly_slot_hours * correction * rate
-    assert r.bigquery_monthly == pytest.approx(expected_compute, rel=0.01)
+    payg_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["payg"]
+    baseline_monthly = 100 * rate * k.HOURS_PER_MONTH
+    # autoscale: (1000 / 86400) * (730*3600) * payg / 3600
+    autoscale_monthly = 1000 / 86400 * (k.HOURS_PER_MONTH * 3600) * payg_rate / 3600
+    assert r.bigquery_monthly == pytest.approx(baseline_monthly + autoscale_monthly, rel=0.01)
+
+
+def test_capacity_proration_usage_based() -> None:
+    """Shared reservations prorate by this project's slot-ms share of total capacity."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", commitment_slots=100, baseline_slots=100,
+        commitment_plan="ANNUAL",
+    )
+    # Reservation shared by 3 assignees, timeline window = 30 days
+    pricing.assigned_count = 3
+    pricing.assigned_projects = ["proj-a", "proj-b", "proj-c"]
+    pricing.timeline_window_seconds = 30 * 86400
+    pricing.autoscale_slot_seconds = 0
+
+    # This project used 50% of the reservation's total allocated capacity
+    # (above the 1/3 headcount floor, so the usage share governs).
+    # Total reservation slot-ms = baseline × window_seconds × 1000
+    # = 100 × 30×86400 × 1000 = 259_200_000_000
+    project_slot_ms = int(100 * 30 * 86400 * 1000 * 0.50)
+    slots = slot_util(total_slot_ms=project_slot_ms, days_sampled=30)
+
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=slots)
+    rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    full_monthly = 100 * rate * k.HOURS_PER_MONTH
+    expected = full_monthly * 0.50  # 50% share
+    assert r.bigquery_monthly == pytest.approx(expected, rel=0.01)
+
+
+def test_capacity_proration_floored_at_equal_headcount() -> None:
+    """Usage share below 1/assigned_count is floored at equal headcount (2026-08-11).
+
+    Consumed-slot-ms ÷ allocated-capacity shares sum to the reservation's
+    utilization ratio, not 1.0 — a low-utilization reservation would attribute
+    most of its (fully billed) cost to no project, understating BQ cost and
+    overstating AWS savings. The equal-headcount floor keeps the idle-capacity
+    cost carried.
+    """
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", commitment_slots=100, baseline_slots=100,
+        commitment_plan="ANNUAL",
+    )
+    pricing.assigned_count = 4
+    pricing.assigned_projects = ["a", "b", "c", "d"]
+    pricing.timeline_window_seconds = 30 * 86400
+    pricing.autoscale_slot_seconds = 0
+
+    # Project consumed only 5% of allocated capacity — below the 25% headcount floor
+    project_slot_ms = int(100 * 30 * 86400 * 1000 * 0.05)
+    slots = slot_util(total_slot_ms=project_slot_ms, days_sampled=30)
+
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=slots)
+    rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    full_monthly = 100 * rate * k.HOURS_PER_MONTH
+    expected = full_monthly / 4  # floored at 1/assigned_count, not 5%
+    assert r.bigquery_monthly == pytest.approx(expected, rel=0.01)
     compute_line = next(x for x in r.bigquery_breakdown if "capacity" in x.label.lower())
-    assert compute_line.confidence is ConfidenceLevel.LOW
+    assert "floored at equal headcount" in compute_line.source_note
 
 
-def test_capacity_fallback_not_used_when_figures_present() -> None:
-    """When reservation figures exist, slot-ms fallback is NOT used."""
-    pricing = capacity_pricing(commitment_slots=100)
+def test_capacity_proration_fallback_equal_without_slots() -> None:
+    """Without workload data, proration falls back to 1/assigned_count."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", commitment_slots=100, baseline_slots=100,
+        commitment_plan="ANNUAL",
+    )
+    pricing.assigned_count = 4
+    pricing.assigned_projects = ["a", "b", "c", "d"]
+    pricing.timeline_window_seconds = 30 * 86400
+    pricing.autoscale_slot_seconds = 0
+
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, slots=None)
+    rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    full_monthly = 100 * rate * k.HOURS_PER_MONTH
+    expected = full_monthly / 4  # equal share fallback
+    assert r.bigquery_monthly == pytest.approx(expected, rel=0.01)
+
+
+def test_capacity_unavailable_when_unreadable() -> None:
+    """reservation_readable=False → compute line shows UNAVAILABLE, 0 cost."""
+    pricing = capacity_pricing(commitment_slots=100, baseline_slots=100)
+    pricing.reservation_readable = False
+    pricing.reservation_id = "admin-proj:us-central1.my-reservation"
+    r = _estimate(entities=[entity(size_gb=100)], pricing=pricing)
+    compute_line = next(x for x in r.bigquery_breakdown if "capacity" in x.label.lower())
+    assert "UNAVAILABLE" in compute_line.label
+    assert compute_line.monthly is None
+    # Storage is still reported
+    storage_lines = [x for x in r.bigquery_breakdown if "storage" in x.label.lower()]
+    assert len(storage_lines) == 1
+
+
+def test_capacity_baseline_used_even_with_slot_ms() -> None:
+    """When reservation figures exist, slot-ms data does NOT override them."""
+    pricing = capacity_pricing(commitment_slots=100, baseline_slots=100)
     slots = slot_util(total_slot_ms=9999 * 3_600_000)
     r = _estimate(pricing=pricing, slots=slots)
     rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
-    # default entity is size_gb=100 → storage = 100 GiB × rate
     storage = 100.0 * v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH
     expected = round(100 * rate * k.HOURS_PER_MONTH + storage, 4)
     assert r.bigquery_monthly == pytest.approx(expected, rel=0.001)
+
+
+def test_capacity_blended_rate_mixed_commitments() -> None:
+    """Mixed commitments (ANNUAL + FLEX) price each tier at its own rate, not one rate for all."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", baseline_slots=700, commitment_slots=700,
+        commitment_plan="ANNUAL",
+    )
+    # 500 ANNUAL + 200 FLEX — each billed at its own rate
+    pricing.commitments = [
+        {"slot_count": 500, "plan": "ANNUAL", "edition": "ENTERPRISE"},
+        {"slot_count": 200, "plan": "FLEX", "edition": "ENTERPRISE"},
+    ]
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing)
+    annual_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    payg_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["payg"]
+    expected = (500 * annual_rate + 200 * payg_rate) * k.HOURS_PER_MONTH
+    assert r.bigquery_monthly == pytest.approx(expected, rel=0.001)
+
+
+def test_capacity_blended_rate_excess_at_payg() -> None:
+    """Baseline exceeding total commitments charges excess at PAYG."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", baseline_slots=300, commitment_slots=200,
+        commitment_plan="ANNUAL",
+    )
+    pricing.commitments = [
+        {"slot_count": 200, "plan": "ANNUAL", "edition": "ENTERPRISE"},
+    ]
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing)
+    annual_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    payg_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["payg"]
+    expected = (200 * annual_rate + 100 * payg_rate) * k.HOURS_PER_MONTH
+    assert r.bigquery_monthly == pytest.approx(expected, rel=0.001)
+
+
+def test_capacity_autoscale_uses_calendar_window() -> None:
+    """Autoscale extrapolation uses the calendar window (lookback_days × 86400),
+    not the sparse per_second_details count."""
+    pricing = capacity_pricing(
+        edition="ENTERPRISE", baseline_slots=100, commitment_slots=100,
+        commitment_plan="ANNUAL",
+    )
+    # 10000 autoscale slot-seconds over 7 days (calendar window = 7*86400 = 604800s)
+    pricing.autoscale_slot_seconds = 10000
+    pricing.timeline_window_seconds = 7 * 86400  # calendar-based, not COUNT(*)
+    r = _estimate(entities=[entity(size_gb=0)], pricing=pricing)
+    rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["commit_1yr"]
+    payg_rate = v4.V4_EDITION_SLOT_HOUR_USD["ENTERPRISE"]["payg"]
+    baseline_monthly = 100 * rate * k.HOURS_PER_MONTH
+    monthly_seconds = k.HOURS_PER_MONTH * 3600
+    autoscale_monthly = 10000 / (7 * 86400) * monthly_seconds * payg_rate / 3600
+    assert r.bigquery_monthly == pytest.approx(baseline_monthly + autoscale_monthly, rel=0.01)
 
 
 def test_override_takes_precedence() -> None:
@@ -1363,3 +1666,194 @@ def test_comparison_module_honors_headline() -> None:
                   confidence=ConfidenceLevel.MEDIUM, source_note="x", headline=1246.0)
     assert comparison._line_low(ln) == 1246.0
     assert comparison._line_high(ln) == 1246.0
+
+
+class TestRangeLineTotalsSafety:
+    """No cost-total arithmetic may read CostLine.monthly directly — a range
+    line (monthly=None) silently contributes $0 (2026-08-03: pdp22's Athena
+    scenario showed $2,223 '92% cheaper' with $18,900 storage missing)."""
+
+    def test_no_raw_monthly_arithmetic_in_engine(self) -> None:
+        """Structural guard: engine code must total lines via _line_value/
+        _line_low/_line_high (which honor headline/range), never `.monthly or 0`
+        or `.monthly +`. The helpers' own definitions are the sole exception."""
+        import re
+        from pathlib import Path
+
+        engine_dir = Path(__file__).resolve().parents[2] / "src" / "bq_assess" / "engine"
+        offenders = []
+        pattern = re.compile(r"\.monthly\s*(?:or\s+0|[+*])|[+]\s*\w+_line\.monthly\b")
+        for py in engine_dir.rglob("*.py"):
+            for i, line in enumerate(py.read_text().splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if "def _line_" in stripped:
+                    continue
+                if pattern.search(line):
+                    offenders.append(f"{py.relative_to(engine_dir)}:{i}: {stripped[:80]}")
+        assert not offenders, (
+            "Raw CostLine.monthly arithmetic (breaks on range lines) — use "
+            f"_line_value/_line_low/_line_high: {offenders}"
+        )
+
+    def test_athena_scenario_includes_range_storage(self) -> None:
+        """The Athena scenario's total must include storage when the storage
+        line is an Intelligent-Tiering range."""
+        from decimal import Decimal
+
+        from bq_assess.engine.comparison import _build_athena_scenario
+        from bq_assess.models import (
+            CostLine,
+            EngineCostEstimate,
+            WorkloadProfile,
+        )
+
+        storage = CostLine(
+            label="S3 Tables storage", monthly=None,
+            monthly_low=18900.0, monthly_high=18947.0,
+            confidence=ConfidenceLevel.MEDIUM, source_note="range",
+            headline=18900.0,
+        )
+        est = EngineCostEstimate(
+            engine_id="athena", monthly_total=Decimal(2223),
+            monthly_compute=Decimal(2223), monthly_storage=Decimal(0),
+            pricing_mode="on_demand", confidence="MEDIUM", source_note="t",
+            one_time_migration=Decimal(0),
+        )
+        profile = WorkloadProfile()
+        scenario = _build_athena_scenario(est, storage, profile)
+        assert scenario.monthly_total == pytest.approx(2223 + 18900)
+
+    def test_rms_split_applies_to_range_storage_line(self) -> None:
+        """apply_rms_storage_split must not silently no-op when the storage
+        line is a range — RMS-placed tables need their RMS line either way."""
+        from bq_assess.engine.redshift.cost import apply_rms_storage_split
+        from bq_assess.models import CostComparison, CostLine
+
+        storage = CostLine(
+            label="S3 Tables storage", monthly=None,
+            monthly_low=1000.0, monthly_high=3000.0,
+            confidence=ConfidenceLevel.MEDIUM, source_note="range",
+            headline=1000.0,
+        )
+        cc = CostComparison(
+            bq_pricing_model=BQPricingModel.ON_DEMAND, bigquery_monthly=5000.0,
+            bigquery_breakdown=[], aws_lines=[storage],
+            aws_monthly_low=1000.0, aws_monthly_high=1000.0,
+            monthly_delta_low=4000.0, monthly_delta_high=4000.0,
+            annual_savings_low=48000.0, annual_savings_high=48000.0,
+            migration_onetime=100.0, breakeven_months_low=1.0,
+            breakeven_months_high=1.0, compute_confidence=ConfidenceLevel.MEDIUM,
+        )
+        one_tb = 1024 ** 4
+        apply_rms_storage_split(cc, rms_physical_bytes=one_tb,
+                                total_physical_bytes=10 * one_tb)
+        rms_lines = [ln for ln in cc.aws_lines if "RMS" in ln.label]
+        assert rms_lines, "RMS line missing — split no-opped on a range line"
+        assert "moved to RMS" in storage.source_note
+        # range bounds and headline all shifted down, never negative
+        assert storage.monthly_low < 1000.0
+        assert storage.headline == storage.monthly_low
+
+
+class TestBQCostAvailability:
+    """CostComparison must be able to represent 'BQ cost unknowable' (2026-08-10)."""
+
+    def test_defaults_available_modelled(self) -> None:
+        result = _estimate(pricing=ondemand_pricing(), slots=slot_util())
+        assert result.bq_cost_available is True
+        assert result.bq_cost_basis == "modelled"
+        assert result.bq_cost_unavailable_reason == ""
+
+    def test_override_sets_customer_provided_basis(self) -> None:
+        result = _estimate(pricing=ondemand_pricing(), slots=slot_util(), override=5000.0)
+        assert result.bq_cost_available is True
+        assert result.bq_cost_basis == "customer_provided"
+
+
+class TestEnterpriseUnavailableHardStop:
+    """ENTERPRISE/EP capacity without reservation data: no BQ figure, no savings (2026-08-10)."""
+
+    def _unavailable_pricing(self, edition="ENTERPRISE") -> PricingDetection:
+        return PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="capacity (test)", edition=edition,
+            baseline_slots=None, max_slots=None, commitment_slots=None,
+            commitment_plan=None,
+        )
+
+    def test_enterprise_no_data_is_unavailable(self) -> None:
+        result = _estimate(pricing=self._unavailable_pricing(), slots=slot_util())
+        assert result.bq_cost_available is False
+        assert result.bq_cost_basis == "unavailable"
+        assert result.bigquery_monthly == 0.0          # storage must NOT leak into the headline
+        assert result.monthly_delta_low == 0.0
+        assert result.annual_savings_low == 0.0
+        assert result.breakeven_months_low == k.BREAKEVEN_NEVER
+
+    def test_enterprise_plus_no_data_is_unavailable(self) -> None:
+        result = _estimate(pricing=self._unavailable_pricing("ENTERPRISE_PLUS"), slots=slot_util())
+        assert result.bq_cost_available is False
+
+    def test_unreadable_reservation_is_unavailable_with_permission_reason(self) -> None:
+        p = self._unavailable_pricing()
+        p.reservation_readable = False
+        result = _estimate(pricing=p, slots=slot_util())
+        assert result.bq_cost_available is False
+        assert "permission" in result.bq_cost_unavailable_reason.lower()
+
+    def test_old_bundle_reason_names_recollection_not_permissions(self) -> None:
+        p = self._unavailable_pricing()
+        p.reservation_data_collected = False
+        result = _estimate(pricing=p, slots=slot_util())
+        assert result.bq_cost_available is False
+        reason = result.bq_cost_unavailable_reason.lower()
+        assert "older collector" in reason or "re-collect" in reason
+        assert "permission denied" not in reason
+
+    def test_flag_override_restores_comparison(self) -> None:
+        result = _estimate(pricing=self._unavailable_pricing(), slots=slot_util(), override=8000.0)
+        assert result.bq_cost_available is True
+        assert result.bq_cost_basis == "customer_provided"
+        assert result.bigquery_monthly == 8000.0
+        assert result.monthly_delta_low != 0.0
+
+    def test_enterprise_with_reservation_data_still_prices(self) -> None:
+        result = _estimate(pricing=capacity_pricing(edition="ENTERPRISE"), slots=slot_util())
+        assert result.bq_cost_available is True
+        assert result.bigquery_monthly > 0
+
+    def test_standard_edition_with_unreadable_reservation_still_priceable_from_slots(self) -> None:
+        """STANDARD with permission-denied reservation → from-slots range path, NOT unavailable."""
+        p = PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="capacity (test)", edition="STANDARD",
+            baseline_slots=None, max_slots=None, commitment_slots=None,
+            commitment_plan=None, reservation_readable=False,
+        )
+        result = _estimate(pricing=p, slots=slot_util())
+        assert result.bq_cost_available is True, "STANDARD without reservation should be priceable from slots"
+        assert result.bq_cost_basis == "modelled"
+        # Check that compute line is a range, not UNAVAILABLE
+        compute = next((l for l in result.bigquery_breakdown if "capacity" in l.label.lower()), None)
+        assert compute is not None
+        assert compute.monthly is None, "from-slots path returns a range (monthly=None)"
+        assert compute.monthly_low is not None
+        assert compute.monthly_high is not None
+        assert "UNAVAILABLE" not in compute.label
+        # Total bigquery_monthly should be > 0 (uses headline from compute + storage)
+        assert result.bigquery_monthly > 0
+
+    def test_enterprise_with_unreadable_reservation_still_hard_stops(self) -> None:
+        """ENTERPRISE + reservation_readable=False → UNAVAILABLE (commitment type unknown)."""
+        p = PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="capacity (test)", edition="ENTERPRISE",
+            baseline_slots=None, max_slots=None, commitment_slots=None,
+            commitment_plan=None, reservation_readable=False,
+        )
+        result = _estimate(pricing=p, slots=slot_util())
+        assert result.bq_cost_available is False
+        assert result.bq_cost_basis == "unavailable"
+        assert "permission" in result.bq_cost_unavailable_reason.lower()

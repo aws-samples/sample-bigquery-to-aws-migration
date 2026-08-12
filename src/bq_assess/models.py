@@ -236,6 +236,16 @@ class PricingDetection:             # R16 — what PricingDetector.detect() retu
     reservation_id: str | None = None       # "project:location.name" from JOBS — lets the
                                             # collector's auto-read reuse detection's rows
                                             # instead of re-querying INFORMATION_SCHEMA
+    reservation_readable: bool = True       # False = permission denied, cost not estimable
+    # False = bundle predates the reservation auto-reader (collector < 0.8): the
+    # fields were never collected, as opposed to collected-but-denied. Drives the
+    # cause-specific unavailable message (old-bundle vs permission-denied).
+    reservation_data_collected: bool = True
+    autoscale_slot_seconds: int | None = None
+    timeline_window_seconds: int | None = None
+    assigned_projects: list[str] = field(default_factory=list)
+    assigned_count: int = 0
+    commitments: list[dict] = field(default_factory=list)  # [{slot_count, plan, edition}]
 
 
 @dataclass
@@ -347,6 +357,22 @@ class CostComparison:               # R18
     # Region provenance: which geography each side was priced in (2026-07-02 region cascade).
     bq_pricing_region: str = "us"           # BigQuery dataset location the BQ rates reflect
     aws_pricing_region: str = "us-east-1"   # AWS region the AWS rates reflect
+    # BQ-cost availability (2026-08-10): Enterprise/EP capacity without reservation
+    # data has BOTH rate (~2× commitment spread) and quantity (24/7 baseline) unknown —
+    # no defensible estimate exists. When available=False the report suppresses the
+    # entire cost-comparison section; bigquery_monthly holds 0.0 only so legacy math
+    # doesn't crash — every consumer must check the flag first.
+    bq_cost_available: bool = True
+    # "modelled" | "customer_provided" (--bigquery-monthly-cost) | "unavailable"
+    bq_cost_basis: str = "modelled"
+    # Range-basis BQ cost (2026-08-11): when the BQ side is itself a modelled range
+    # (STANDARD capacity from slots), this holds the measured-minimum total while
+    # bigquery_monthly holds the upper estimate. monthly_delta_low is computed
+    # against THIS value so the headline savings is the committable floor-based
+    # figure, not one anchored to the upper estimate. None = point-estimate basis.
+    bigquery_monthly_low: float | None = None
+    # Cause shown to the customer when unavailable: old-bundle vs permission-denied.
+    bq_cost_unavailable_reason: str = ""
     # Cost narrative (2026-07-16 restructure: the cost-section callout moved into the
     # "Assumptions & Methodology" section; each statement now has exactly one home —
     # see SCRUM_NOTES).
@@ -371,6 +397,11 @@ class CostComparison:               # R18
     # what the estimate was priced from (uncertainties live in key_uncertainties).
     estimate_basis_level: ConfidenceLevel = ConfidenceLevel.LOW
     estimate_basis: str = ""
+    # Pristine all-Iceberg storage line, stashed by apply_rms_storage_split before
+    # it moves RMS-resident bytes out of the Redshift scenarios' S3 lines. The
+    # Athena scenario (engine/comparison.py) must price the FULL estate as S3
+    # Tables — on an Athena deployment nothing lives in RMS. None when no split ran.
+    all_iceberg_storage_line: CostLine | None = None
 
 
 # ---- Report ----------------------------------------------------------------
@@ -404,6 +435,12 @@ class EntityReport:
     placement: PlacementRecommendation | None = None
     physical_bytes: int | None = None  # measured physical storage; None = not available/measured
     storage_placement: StoragePlacement | None = None  # ADR-0005; None for non-tables / Athena-primary
+    # Attributed production workload from INFORMATION_SCHEMA.JOBS (query
+    # attribution, 2026-08-03): {query_count, total_slot_ms, slot_hours,
+    # num_shapes, statement_types}. Summary only — sample SQL is delivered via
+    # the HTML embed (top N) and the query-workload/ sidecar (all shapes), not
+    # the model. None when the entity has no attributed queries.
+    query_workload: dict | None = None
 
 
 @dataclass
@@ -512,6 +549,10 @@ class MigrationDML:
     shortcomings: list[MigrationShortcoming]
     post_optimization: list[PostMigrationStep]
     estimated_scan_bytes: int | None
+    # Post-load row-count check: SELECT comparing source (federated connector)
+    # vs target (Iceberg) counts in one query. Additive default (2026-08-04
+    # audit: validation existed only as prose).
+    validation_query: str | None = None
 
 
 @dataclass

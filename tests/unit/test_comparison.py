@@ -10,6 +10,7 @@ in ONE pass with no post-hoc patching. Covers:
 """
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
 
 from bq_assess.engine.comparison import (
@@ -444,6 +445,34 @@ class TestDeriveEstimateBasis:
             [], rs_scenario, _low_volume_profile()
         )
         assert "Redshift" in text
+
+
+# ---- Task 3: BQ cost unavailable state survives engine comparison ----
+
+
+class TestUnavailableBQCost:
+
+    def test_unavailable_bq_cost_survives_engine_comparison(self):
+        """BQ cost unavailable state survives assemble_cost_comparison."""
+        base = _base_comparison()
+        base = dataclasses.replace(
+            base,
+            bq_cost_available=False,
+            bq_cost_basis="unavailable",
+            bq_cost_unavailable_reason="test reason",
+            bigquery_monthly=0.0,
+        )
+        result = assemble_cost_comparison(
+            base, _athena_estimate(), _low_volume_profile(), _athena_recommendation()
+        )
+        assert result.bq_cost_available is False
+        assert result.bq_cost_basis == "unavailable"
+        assert result.bq_cost_unavailable_reason == "test reason"
+        assert result.monthly_delta_low == 0.0
+        assert result.annual_savings_low == 0.0
+        reasoning = (result.recommendation.reasoning if result.recommendation else "").lower()
+        assert "cheaper than" not in reasoning
+        assert "savings" not in reasoning
 
 
 # ---- MRI-1: tension sentence on fallthrough branch ----

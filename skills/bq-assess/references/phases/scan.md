@@ -7,7 +7,7 @@ The Preflight phase has completed successfully. All of the following are true:
 - `gcp_project` is set and non-empty.
 - GCP authentication is confirmed (`adc_present` was `true` in preflight).
 - `bq-assess` CLI is installed and on PATH.
-- Optional parameters may also be present: `datasets`, `include_query_logs`, `query_log_days`.
+- Optional parameters may also be present: `datasets`, `skip_workload`, `query_log_days`.
 - If the user says "stop" or "cancel" at any point during this phase, exit the skill immediately without running any further commands.
 
 ## Step 1: Construct CLI Command
@@ -27,25 +27,30 @@ bq-assess --gcp-project {gcp_project} --use-adc --format json,html --output repo
   --datasets {datasets}
   ```
 
-- If `include_query_logs` is `false`: do NOT append any query-log flag. The CLI defaults to not analyzing query logs when `--include-query-logs` is absent. (The CLI does NOT have a `--no-query-logs` flag — do not invent one.)
+- Query-log analysis is **always on** (since v0.6.2, for collection parity with `bq-collect`). There is NO `--include-query-logs` flag — passing it fails with a usage error. There is no `--no-query-logs` flag either; do not invent one.
 
-- If `include_query_logs` is `true`:
+- If `skip_workload` is `true` (the user opted out of workload analysis):
   ```
-  --include-query-logs
+  --skip-workload
   ```
 
-- If `include_query_logs` is `true` AND `query_log_days` was provided:
+- If `query_log_days` was provided (only meaningful when `skip_workload` is `false`):
   ```
   --query-log-days {query_log_days}
+  ```
+
+- If the user already has query logs exported to a JSON file (instead of reading `INFORMATION_SCHEMA.JOBS` live):
+  ```
+  --query-logs {path}
   ```
 
 **Example — full command with all options:**
 
 ```bash
-bq-assess --gcp-project my-project --use-adc --format json,html --output reports/ --datasets prod_data,analytics --include-query-logs --query-log-days 60
+bq-assess --gcp-project my-project --use-adc --format json,html --output reports/ --datasets prod_data,analytics --query-log-days 60
 ```
 
-**Example — minimal command (no query logs, no dataset filter):**
+**Example — minimal command (no dataset filter; query logs are read automatically):**
 
 ```bash
 bq-assess --gcp-project my-project --use-adc --format json,html --output reports/
@@ -74,22 +79,25 @@ The CLI has completed successfully and written reports to the output directory. 
    - `effort_json` — matches `reports/assessment-effort-*.json` (holds Migration Effort `entities[]` + Iceberg DDL)
    - `query_json` — matches `reports/assessment-query-*.json` (holds Query Complexity `entities[]`)
 2. Verify each file exists and is non-empty. If `landing_json` is missing or empty, treat this as a generic fatal error (see below). If only `effort_json`/`query_json` is missing, note it and continue with what is present.
-3. Tell the user the assessment completed successfully and show the output directory path.
-4. Advance to the **Interpret phase**, passing `landing_json`, `effort_json`, and `query_json`.
+3. **Check for silently degraded workload data** — see "Workload Data Unavailable" below. Do this BEFORE describing the run as clean.
+4. Tell the user the assessment completed successfully and show the output directory path.
+5. Advance to the **Interpret phase**, passing `landing_json`, `effort_json`, and `query_json`.
 
 ---
 
-### Permission Denied — Missing `bigquery.jobs.listAll`
+### Workload Data Unavailable (exit code 0, but no query-log data)
 
-**Detection:** stderr contains `AnalyzerError` AND the string `bigquery.jobs.listAll`.
+**Detection:** after a successful run, read the `cost` block of `landing_json`. Workload data is missing when `cost.estimate_basis` contains the string `"No workload data"` (the CLI's own wording).
 
-This means the authenticated account lacks the IAM permission needed to read query logs from `INFORMATION_SCHEMA.JOBS`.
+**Why this needs handling:** query-log analysis is always attempted and **degrades silently**. A missing `bigquery.jobs.listAll` permission does NOT fail the run — the CLI exits 0 and writes a complete-looking report whose cost figures are unmeasured. There is no `AnalyzerError` to catch. Do not present this as a clean result.
 
-Present the user with **three options:**
+Tell the user plainly:
 
-#### Option 1: Grant the IAM permission and retry
+- "The assessment completed, but query-log analysis returned no data — most often a missing `bigquery.jobs.listAll` permission. The cost comparison is a rough range rather than a measured estimate, and Query Complexity scoring is heuristic-only."
 
-Show the user the exact command to grant the required role:
+Then offer **two options:**
+
+#### Option 1: Grant the permission and re-run for a measured estimate
 
 ```bash
 gcloud projects add-iam-policy-binding {gcp_project} \
@@ -97,24 +105,17 @@ gcloud projects add-iam-policy-binding {gcp_project} \
   --role="roles/bigquery.resourceViewer"
 ```
 
-> Replace `{sa_email}` with the user's GCP identity. They can find it with `gcloud auth list`.
+> Replace `{sa_email}` with the user's GCP identity (`gcloud auth list` shows it). `roles/bigquery.resourceViewer` carries `bigquery.jobs.listAll`.
 
-Ask the user to run this command, then **retry the same `bq-assess` command** from Step 2.
+After the grant lands, re-run the same command from Step 2.
 
-#### Option 2: Re-run without query logs
+#### Option 2: Continue with the current report
 
-Re-run the CLI without the `--include-query-logs` flag (simply omit it from the original command). This skips query log analysis entirely — the CLI defaults to metadata-only when the flag is absent.
+Advance to the Interpret phase, and carry the caveat forward: the Interpret summary MUST state that cost confidence is reduced because no workload data was available.
 
-Warn the user: "The assessment will still run, but the **cost comparison drops to a LOW-confidence range** (no observed slot usage), and Query Complexity confidence is lower without query history. Iceberg partition/sort-order and placement hints will be heuristic-only."
+Ask: **"Would you like to (1) grant the permission and re-run for measured numbers, or (2) continue with this report as-is?"**
 
-#### Option 3: Export logs manually and pass them to the CLI
-
-The user can export query logs to a JSON file themselves and provide the path. Steps:
-
-1. The user exports query logs from BigQuery (e.g., via `bq query` or the BigQuery console) to a local JSON file.
-2. Re-run the CLI with `--query-logs {path_to_exported_logs}` instead of relying on the API.
-
-Ask: **"Which option would you like? (1) Grant the permission, (2) Re-run without query logs, or (3) Export logs manually?"**
+If the user already has logs exported to a file, a third path exists: re-run with `--query-logs {path}`.
 
 ---
 

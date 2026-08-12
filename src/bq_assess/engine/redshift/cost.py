@@ -15,6 +15,7 @@ Justification text references the customer's actual numbers, never generic assum
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -83,6 +84,7 @@ class CostEstimator:
         location: str | None = None,
         storage_basis: str = "assumed",
         as_of: datetime | None = None,
+        egress_gib: float | None = None,
     ) -> CostComparison:
         # ---- Region cascade: price BOTH clouds in the Source's geography (2026-07-02) ----
         # BigQuery rates re-resolve to the detected dataset location; AWS rates re-resolve
@@ -140,9 +142,27 @@ class CostEstimator:
         self._int_tiers = _int_tier_breakdown(entities, as_of)
 
         # ---- BigQuery side: per detected model, override wins (R18.2) ----
-        bigquery_monthly, bq_breakdown = self._bigquery_runrate(
+        bigquery_monthly, bq_breakdown, bq_avail = self._bigquery_runrate(
             total_bytes, pricing, slots, bq_monthly_override
         )
+
+        # ---- Egress: add BQ egress line if Cloud Monitoring data was collected ----
+        if egress_gib is not None and egress_gib > 0:
+            bq_egress_usd = egress_gib * v4.V4_EGRESS_USD_PER_GIB
+            bq_breakdown.append(CostLine(
+                label="BigQuery Storage Read API egress",
+                monthly=round(bq_egress_usd, 4),
+                monthly_low=None, monthly_high=None,
+                confidence=ConfidenceLevel.MEDIUM,
+                source_note=(
+                    f"{egress_gib:,.1f} GiB/mo × ${v4.V4_EGRESS_USD_PER_GIB}/GiB "
+                    f"({v4.V4_PRICING_REGION}) — inferred from Cloud Monitoring "
+                    f"CreateReadSession count × avg table size"
+                ),
+            ))
+            if bq_avail["available"]:
+                bigquery_monthly = round(bigquery_monthly + bq_egress_usd, 4)
+        self._egress_gib = egress_gib
 
         # ---- AWS side: evaluate all scenarios ----
         profile = self._build_workload_profile(slots, total_bytes)
@@ -170,11 +190,23 @@ class CostEstimator:
         aws_monthly_high = sum(_line_high(ln) for ln in best.lines)
 
         # ---- deltas / annual / break-even ----
-        monthly_delta_low = bigquery_monthly - aws_monthly_high
-        monthly_delta_high = bigquery_monthly - aws_monthly_low
+        # Range-basis BQ cost (2026-08-11): when the BQ side is a modelled range
+        # (STANDARD capacity), the committable savings floor must be computed
+        # against the BQ measured minimum, not the upper estimate — anchoring
+        # savings to the upper figure alone flatters AWS one-sidedly.
+        bigquery_monthly_low = _bq_breakdown_low(bq_breakdown, bigquery_monthly)
+        if bq_avail["available"]:
+            bq_low_basis = (
+                bigquery_monthly_low if bigquery_monthly_low is not None
+                else bigquery_monthly
+            )
+            monthly_delta_low = bq_low_basis - aws_monthly_high
+            monthly_delta_high = bigquery_monthly - aws_monthly_low
+        else:
+            monthly_delta_low = 0.0
+            monthly_delta_high = 0.0
         annual_savings_low = monthly_delta_low * 12
         annual_savings_high = monthly_delta_high * 12
-
         migration_onetime = _safe_num(effort_total) * k.MIGRATION_USD_PER_EFFORT_POINT
         breakeven_low = _breakeven(migration_onetime, monthly_delta_low)
         breakeven_high = _breakeven(migration_onetime, monthly_delta_high)
@@ -186,6 +218,7 @@ class CostEstimator:
         return CostComparison(
             bq_pricing_model=pricing.model,
             bigquery_monthly=bigquery_monthly,
+            bigquery_monthly_low=bigquery_monthly_low,
             bigquery_breakdown=bq_breakdown,
             aws_lines=best.lines,
             aws_monthly_low=aws_monthly_low,
@@ -202,6 +235,9 @@ class CostEstimator:
             recommendation=recommendation,
             bq_pricing_region=v4.V4_PRICING_REGION,
             aws_pricing_region=k.AWS_PRICING_REGION,
+            bq_cost_available=bq_avail["available"],
+            bq_cost_basis=bq_avail["basis"],
+            bq_cost_unavailable_reason=bq_avail["reason"],
             scope_notes=self._scope_notes(),
             pricing_notes=self._pricing_notes(bq_location, region_known, bq_monthly_override),
             key_uncertainties=self._key_uncertainties(slots),
@@ -354,13 +390,28 @@ class CostEstimator:
         appear on the same BigQuery bill but are NOT in this figure. The AWS-side
         exclusions sit next to them so out-of-scope is one list, not two.
         """
+        egress_gib = getattr(self, "_egress_gib", None)
+        if egress_gib is not None and egress_gib > 0:
+            bq_scope = (
+                "BigQuery side: covers on-demand analysis (bytes billed), active logical "
+                "storage, and Storage Read API egress (from Cloud Monitoring). Not modeled: "
+                "streaming inserts, Storage Write API, BI Engine, Data Transfer Service — "
+                "these appear on the BigQuery bill and can be significant for ingestion-heavy "
+                "projects. The on-demand free tier (1 TiB scan + 10 GiB storage/month) and "
+                "negotiated discounts are also excluded."
+            )
+        else:
+            bq_scope = (
+                "BigQuery side: covers on-demand analysis (bytes billed) and active logical "
+                "storage only. Not modeled: streaming inserts, Storage Read/Write API egress "
+                "(roles/monitoring.viewer unavailable or no sessions detected), "
+                "BI Engine, Data Transfer Service — these appear on the BigQuery bill and can "
+                "be significant for ingestion- or extract-heavy projects. The on-demand free "
+                "tier (1 TiB scan + 10 GiB storage/month) and negotiated discounts are also "
+                "excluded."
+            )
         return [
-            ("BigQuery side: covers on-demand analysis (bytes billed) and active logical "
-            "storage only. Not modeled: streaming inserts, Storage Read/Write API, "
-            "BI Engine, Data Transfer Service — these appear on the BigQuery bill and can "
-            "be significant for ingestion- or extract-heavy projects. The on-demand free "
-            "tier (1 TiB scan + 10 GiB storage/month) and negotiated discounts are also "
-            "excluded."),
+            bq_scope,
             ("AWS side: one-time migration data transfer is not included; Redshift "
             "Spectrum, ML features, and cross-region replication are not modeled. "
             "Glue Data Catalog request charges and S3 request charges are not modeled for either Query Engine."),
@@ -405,6 +456,29 @@ class CostEstimator:
                 )
                 self._apply_dominance_demotion(prov, serverless_od_total)
                 scenarios.append(prov)
+
+        # Append AWS Data Transfer Out line to all scenarios if egress was estimated
+        egress_gib = getattr(self, "_egress_gib", None)
+        if egress_gib is not None and egress_gib > 0:
+            egress_gb = egress_gib * (1024 ** 3) / (1000 ** 3)  # GiB → GB (AWS bills decimal)
+            dt_out_usd = round(egress_gb * k.V8_DATA_TRANSFER_OUT_USD_PER_GB, 4)
+            dt_source_note = (
+                f"{egress_gb:,.1f} GB/mo × ${k.V8_DATA_TRANSFER_OUT_USD_PER_GB}/GB "
+                f"({k.AWS_PRICING_REGION}) — mirrors BQ Storage Read API egress "
+                f"(assumes consumers access data over internet; within-VPC = $0)"
+            )
+            for scenario in scenarios:
+                dt_line = CostLine(
+                    label="Data Transfer Out (internet)",
+                    monthly=dt_out_usd,
+                    monthly_low=None, monthly_high=None,
+                    confidence=ConfidenceLevel.MEDIUM,
+                    source_note=dt_source_note,
+                )
+                scenario.lines.append(dt_line)
+                scenario.monthly_total = round(
+                    scenario.monthly_total + dt_out_usd, 4
+                )
 
         return scenarios
 
@@ -601,7 +675,7 @@ class CostEstimator:
         )
 
         return AWSScenario(
-            label=f"Provisioned {config_label} ({label_suffix})",
+            label=f"Redshift Provisioned {config_label} ({label_suffix})",
             category=category,
             lines=[storage_line, compute_line],
             monthly_total=total,
@@ -816,6 +890,7 @@ class CostEstimator:
                 f"({_fmt_usd((serverless.monthly_total - recommended.monthly_total) * 12)}/year). "
                 f"The steady query volume makes the commitment predictable and low-risk."
             )
+            # Cost-parity sentence: bq_monthly=0.0 (unavailable) harmlessly makes this False.
             if cheapest_3yr and cheapest_3yr.monthly_total < bq_monthly * 1.1:
                 reasoning += (
                     f" A 3-year RI at {_fmt_usd(cheapest_3yr.monthly_total)}/month achieves near "
@@ -1133,18 +1208,27 @@ class CostEstimator:
     # ================================================================== BigQuery
 
     def _bigquery_runrate(self, total_bytes, pricing, slots, override):
-        """BigQuery monthly run-rate + explaining breakdown lines (R18.2 / R16.4)."""
+        """BigQuery monthly run-rate + breakdown + availability (R18.2 / R16.4 / 2026-08-10)."""
         if override is not None:
             line = CostLine(
-                label="BigQuery (operator override)", monthly=round(float(override), 4),
+                label="BigQuery (customer-provided)", monthly=round(float(override), 4),
                 monthly_low=None, monthly_high=None, confidence=ConfidenceLevel.HIGH,
-                source_note="operator-supplied via --bigquery-monthly-cost (no price-list date)",
+                source_note=(
+                    "customer-supplied total monthly BigQuery bill via "
+                    "--bigquery-monthly-cost (no price-list date; not decomposable "
+                    "into compute vs storage)"
+                ),
             )
-            return float(override), [line]
+            return float(override), [line], {"available": True, "basis": "customer_provided", "reason": ""}
 
         if pricing.model is BQPricingModel.CAPACITY:
-            return self._bq_capacity(pricing, total_bytes, slots)
-        return self._bq_ondemand(total_bytes, slots)
+            monthly, lines, unavailable_reason = self._bq_capacity(pricing, total_bytes, slots)
+            if unavailable_reason is not None:
+                return monthly, lines, {"available": False, "basis": "unavailable", "reason": unavailable_reason}
+            return monthly, lines, {"available": True, "basis": "modelled", "reason": ""}
+
+        monthly, lines = self._bq_ondemand(total_bytes, slots)
+        return monthly, lines, {"available": True, "basis": "modelled", "reason": ""}
 
     def _bq_storage_line(self, total_bytes: int) -> CostLine:
         """BigQuery storage cost line — shared by on-demand and capacity paths.
@@ -1210,7 +1294,8 @@ class CostEstimator:
             scan_note = (
                 f"BigQuery on-demand @ ${v4.V4_ONDEMAND_USD_PER_TIB}/TiB ({region}); scan volume "
                 f"estimated at {k.BQ_DAILY_SCAN_FRACTION:.0%}/day of stored bytes (LOW-confidence "
-                f"proxy, no logs) (verified {v4.V4_CONFIRMED_DATE})"
+                f"proxy, no logs) (verified {v4.V4_CONFIRMED_DATE}); supply --bigquery-monthly-cost "
+                f"for an exact figure"
             )
 
         lines = [
@@ -1221,13 +1306,32 @@ class CostEstimator:
                 source_note=scan_note,
             ),
         ]
-        return round(storage_line.monthly + scanned_usd, 4), lines
+        return round(_line_value(storage_line) + scanned_usd, 4), lines
 
     def _bq_capacity(self, pricing: PricingDetection, total_bytes: int,
-                     slots: SlotUtilization | None):
-        """Price a capacity Source from its reservation figures or slot-ms fallback."""
+                     slots: SlotUtilization | None = None):
+        """Price a capacity Source from reservation data (baseline + autoscale).
+
+        Returns (monthly, lines, unavailable_reason) where unavailable_reason is
+        None on success or a human-readable string when the cost cannot be computed.
+
+        When reservation details are unreadable (permission denied), returns a
+        hard-stop "unavailable" state — no fabricated estimates.
+
+        For STANDARD edition (no true commitments): always priceable from measured
+        slot utilization at the single PAYG rate — reservation data is nice-to-have
+        but not required.
+
+        For ENTERPRISE/EP without reservation data: commitment type unknown →
+        UNAVAILABLE (can't determine rate without knowing the plan).
+
+        For shared reservations (assigned_count > 1), prorates by this project's
+        measured slot-ms share of total reservation capacity. Falls back to equal
+        headcount (1/assigned_count) if workload data is unavailable.
+        """
         caveats: list[str] = []
 
+        # Resolve edition first to determine whether reservation_readable hard-stops
         edition = pricing.edition if pricing.edition in v4.V4_EDITION_SLOT_HOUR_USD else None
         edition_known = edition is not None
         if not edition_known:
@@ -1236,66 +1340,325 @@ class CostEstimator:
             edition = "ENTERPRISE"
         edition_rates = v4.V4_EDITION_SLOT_HOUR_USD[edition]
 
-        rate_key = k.COMMITMENT_PLAN_TO_RATE_KEY.get(pricing.commitment_plan or "FLEX", "payg")
-        if edition not in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS and rate_key != "payg":
-            caveats.append(
-                f"{edition} has no true slot commitments — {pricing.commitment_plan} priced at PAYG"
-            )
-            rate_key = "payg"
-        slot_hour_usd = edition_rates.get(rate_key)
-        if slot_hour_usd is None:
-            slot_hour_usd = edition_rates["payg"]
+        # Check reservation_readable only for editions that require reservation data
+        if not pricing.reservation_readable and edition in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS:
+            # ENTERPRISE/EP without readable reservation → commitment type unknown
+            return self._bq_capacity_unavailable(pricing, total_bytes)
+        # STANDARD with unreadable reservation falls through to from-slots path below
 
-        slots_n, basis = _first_positive(
-            ("commitment", pricing.commitment_slots),
-            ("baseline", pricing.baseline_slots),
-            ("max", pricing.max_slots),
+        payg_rate = edition_rates["payg"]
+
+        # Determine whether reservation data is truly absent (pre-auto-reader bundles)
+        _has_reservation_data = (
+            pricing.baseline_slots is not None
+            or pricing.commitment_slots is not None
+            or pricing.autoscale_slot_seconds is not None
         )
-        if slots_n is None:
-            if slots is not None and slots.total_slot_ms > 0:
-                consumed_slot_hours = slots.total_slot_ms / _MS_PER_HOUR
-                window_days = _window_days(slots)
-                monthly_slot_hours = consumed_slot_hours / window_days * k.DAYS_PER_MONTH
 
-                if edition in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS:
-                    # Cap at 10x: beyond that the estimate is too unreliable
-                    correction = min(max(1.0 / max(slots.active_hour_fraction, 0.01), 1.25), 10.0)
-                    conf = ConfidenceLevel.LOW
-                    basis = "slot-ms (enterprise estimate)"
-                else:
-                    correction = 1.25
-                    conf = ConfidenceLevel.MEDIUM
-                    basis = "slot-ms (standard estimate)"
+        if not _has_reservation_data:
+            # No reservation data at all — edition determines path
+            if edition not in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS:
+                # STANDARD: single PAYG rate, no commitments — derive from slot-ms
+                monthly, lines = self._bq_capacity_from_slots(
+                    edition, edition_rates, slots, total_bytes, caveats
+                )
+                return monthly, lines, None
+            else:
+                # ENTERPRISE/EP: commitment type unknown → cannot price
+                return self._bq_capacity_unavailable(pricing, total_bytes)
 
-                slots_n = monthly_slot_hours * correction / k.HOURS_PER_MONTH
+        baseline = pricing.baseline_slots
+        if baseline is None:
+            try:
+                baseline = int(pricing.commitment_slots) if pricing.commitment_slots else 0
+            except (TypeError, ValueError):
+                baseline = 0
+            if baseline:
+                caveats.append("baseline_slots unavailable, using commitment_slots as proxy")
+        else:
+            try:
+                baseline = int(baseline)
+            except (TypeError, ValueError):
+                baseline = 0
+
+        # -- Baseline cost: blended rate across all commitments --
+        # Each commitment covers its slot_count at its own plan rate; excess at PAYG.
+        baseline_monthly = self._blended_baseline_cost(
+            baseline, pricing, edition, edition_rates, caveats
+        )
+
+        # -- Autoscale cost: billed slot-seconds × PAYG rate / 3600 --
+        autoscale_monthly = 0.0
+        if pricing.autoscale_slot_seconds and pricing.timeline_window_seconds:
+            window_seconds = pricing.timeline_window_seconds
+            monthly_seconds = k.HOURS_PER_MONTH * 3600
+            autoscale_monthly = (
+                pricing.autoscale_slot_seconds / window_seconds
+                * monthly_seconds * payg_rate / 3600
+            )
+            caveats.append(
+                f"autoscale: {pricing.autoscale_slot_seconds:,.0f} slot-seconds over "
+                f"{window_seconds / 86400:.1f} days → ${autoscale_monthly:,.2f}/mo @ PAYG"
+            )
+
+        total_monthly = baseline_monthly + autoscale_monthly
+
+        # -- Proration for shared reservations (usage-based) --
+        proration = 1.0
+        if pricing.assigned_count > 1:
+            # Compute reservation's total allocated slot-ms over the window
+            window_seconds = pricing.timeline_window_seconds or int(k.HOURS_PER_MONTH * 3600)
+            reservation_total_slot_ms = (
+                baseline * window_seconds * 1000
+                + (pricing.autoscale_slot_seconds or 0) * 1000
+            )
+            project_slot_ms = slots.total_slot_ms if slots else 0
+
+            if reservation_total_slot_ms > 0 and project_slot_ms > 0:
+                # consumed-slot-ms ÷ allocated-capacity shares sum to the reservation's
+                # utilization ratio, not 1.0 — at low utilization most of the cost would
+                # be attributed to nobody, understating BQ cost (and overstating AWS
+                # savings). Floor each share at equal headcount so the idle-capacity
+                # cost is still carried (verified 2026-08-10).
+                usage_share = min(project_slot_ms / reservation_total_slot_ms, 1.0)
+                headcount_share = 1.0 / pricing.assigned_count
+                proration = max(usage_share, headcount_share)
+                total_monthly *= proration
+                basis = (
+                    f"usage share {usage_share:.1%}"
+                    if proration == usage_share
+                    else f"usage share {usage_share:.1%}, floored at equal "
+                    f"headcount 1/{pricing.assigned_count}"
+                )
                 caveats.append(
-                    f"estimated from {consumed_slot_hours:,.0f} measured slot-hours × "
-                    f"{correction:.2f} correction ({basis})"
+                    f"reservation shared by {pricing.assigned_count} assignees — "
+                    f"prorated {proration:.1%} ({basis} of "
+                    f"{reservation_total_slot_ms / _MS_PER_HOUR:,.0f} allocated slot-hours)"
                 )
             else:
-                slots_n, conf = 0, ConfidenceLevel.LOW
+                proration = 1.0 / pricing.assigned_count
+                total_monthly *= proration
                 caveats.append(
-                    "no reservation figures and no workload data — supply --bigquery-monthly-cost"
+                    f"reservation shared by {pricing.assigned_count} assignees — "
+                    f"prorated 1/{pricing.assigned_count} (no usage data for share calc)"
                 )
-        else:
-            conf = ConfidenceLevel.HIGH if basis in ("commitment", "baseline") else ConfidenceLevel.MEDIUM
+
+        conf = ConfidenceLevel.HIGH if baseline > 0 else ConfidenceLevel.MEDIUM
         if not edition_known:
             conf = ConfidenceLevel.LOW
 
-        monthly = slots_n * slot_hour_usd * k.HOURS_PER_MONTH
         note = (
-            f"BigQuery {edition} slot-hour @ ${slot_hour_usd} ({rate_key}, "
-            f"{v4.V4_PRICING_REGION}) × {slots_n:,.1f} slots × "
-            f"{k.HOURS_PER_MONTH:g}h (verified {v4.V4_CONFIRMED_DATE})"
+            f"BigQuery {edition} capacity: baseline {baseline} slots "
+            f"= ${baseline_monthly:,.2f}/mo ({v4.V4_PRICING_REGION})"
         )
+        if autoscale_monthly > 0:
+            note += f" + autoscale ${autoscale_monthly:,.2f}/mo @ PAYG ${payg_rate}"
+        if proration < 1.0:
+            note += f" (prorated ×{proration:.3f})"
+        note += f" (verified {v4.V4_CONFIRMED_DATE})"
         if caveats:
             note += " ⚠️ " + "; ".join(caveats)
+
         compute_line = CostLine(
-            label=f"BigQuery capacity ({edition})", monthly=round(monthly, 4),
+            label=f"BigQuery capacity ({edition})", monthly=round(total_monthly, 4),
             monthly_low=None, monthly_high=None, confidence=conf, source_note=note,
         )
         storage_line = self._bq_storage_line(total_bytes)
-        return round(monthly + storage_line.monthly, 4), [storage_line, compute_line]
+        return round(total_monthly + _line_value(storage_line), 4), [storage_line, compute_line], None
+
+    def _blended_baseline_cost(
+        self, baseline: int, pricing: PricingDetection,
+        edition: str, edition_rates: dict, caveats: list[str],
+    ) -> float:
+        """Compute baseline cost using blended rate across all commitments.
+
+        Each commitment covers up to slot_count at its plan rate; slots beyond
+        total commitments bill at PAYG. If no commitment list is available, falls
+        back to the single-plan approach.
+        """
+        payg_rate = edition_rates["payg"]
+
+        if not baseline:
+            return 0.0
+
+        commitments = pricing.commitments
+        if not commitments:
+            rate_key = k.COMMITMENT_PLAN_TO_RATE_KEY.get(
+                pricing.commitment_plan or "FLEX", "payg"
+            )
+            if edition not in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS and rate_key != "payg":
+                caveats.append(
+                    f"{edition} has no true slot commitments — "
+                    f"{pricing.commitment_plan} priced at PAYG"
+                )
+                rate_key = "payg"
+            rate = edition_rates.get(rate_key)
+            if rate is None:
+                rate = payg_rate
+            return baseline * rate * k.HOURS_PER_MONTH
+
+        # Blended: allocate slots to each commitment at its rate, remainder at PAYG.
+        remaining = baseline
+        total_cost = 0.0
+        rate_parts: list[str] = []
+
+        for c in commitments:
+            if remaining <= 0:
+                break
+            slots_covered = min(c.get("slot_count", 0), remaining)
+            if slots_covered <= 0:
+                continue
+            plan = c.get("plan", "FLEX")
+            rate_key = k.COMMITMENT_PLAN_TO_RATE_KEY.get(plan, "payg")
+            if edition not in v4.V4_EDITIONS_WITH_CAPACITY_COMMITMENTS:
+                rate_key = "payg"
+            rate = edition_rates.get(rate_key)
+            if rate is None:
+                rate = payg_rate
+            total_cost += slots_covered * rate * k.HOURS_PER_MONTH
+            remaining -= slots_covered
+            rate_parts.append(f"{slots_covered}@{plan}")
+
+        if remaining > 0:
+            total_cost += remaining * payg_rate * k.HOURS_PER_MONTH
+            rate_parts.append(f"{remaining}@PAYG(uncovered)")
+
+        if len(rate_parts) > 1:
+            caveats.append(f"blended rate: {', '.join(rate_parts)}")
+
+        return total_cost
+
+    def _bq_capacity_from_slots(
+        self, edition: str, edition_rates: dict,
+        slots: SlotUtilization | None, total_bytes: int, caveats: list[str],
+    ):
+        """Price STANDARD capacity as a modelled range from measured slot use.
+
+        STANDARD has a single public PAYG rate (no commitments exist), so the rate
+        is certain — but Google bills SCALED capacity, not consumed slot-ms:
+        autoscale steps are multiples of 50 slots with a 1-minute minimum, and the
+        docs say not to reconcile billing from JOBS. slot_ms × rate is a measured
+        minimum; the upper figure models 50-slot steps spread over busy hours.
+        Neither endpoint is a hard bound: billing follows per-minute scaled peaks,
+        so a bursty workload's real bill can EXCEED the upper estimate, and hourly
+        aggregates can't distinguish that case (verified 2026-08-10). Totals
+        use the upper estimate (headline) as the less-flattering-to-AWS anchor.
+        HIGH confidence is reserved for the reservation-timeline path.
+        """
+        payg_rate = edition_rates["payg"]
+        storage_line = self._bq_storage_line(total_bytes)
+
+        if not slots or slots.total_slot_ms <= 0:
+            caveats.append("no workload data — cannot estimate slot consumption")
+            compute_line = CostLine(
+                label=f"BigQuery capacity ({edition})", monthly=0.0,
+                monthly_low=None, monthly_high=None,
+                confidence=ConfidenceLevel.LOW,
+                source_note=(
+                    f"BigQuery {edition} capacity detected but no workload data to "
+                    f"estimate slot consumption. Supply --bigquery-monthly-cost for "
+                    f"an exact figure."
+                ),
+            )
+            return round(_line_value(storage_line), 4), [storage_line, compute_line]
+
+        # Measured minimum: consumed slot-hours at PAYG (what JOBS proves was used).
+        consumed_slot_hours = slots.total_slot_ms / _MS_PER_HOUR
+        window_days = max(slots.days_sampled, 1)
+        floor_monthly = consumed_slot_hours / window_days * k.DAYS_PER_MONTH * payg_rate
+
+        # Modelled upper estimate: 50-slot autoscale steps spread over busy hours.
+        # NOT a hard ceiling — billing follows per-minute scaled peaks, which hourly
+        # aggregates cannot reconstruct; a bursty workload's real bill can exceed it.
+        active_frac = min(max(slots.active_hour_fraction, 1.0 / 720.0), 1.0)
+        busy_concurrency = slots.avg_slots / active_frac
+        billed_slots = max(50.0, math.ceil(busy_concurrency / 50.0) * 50.0)
+        ceiling_monthly = max(
+            billed_slots * active_frac * k.HOURS_PER_MONTH * payg_rate,
+            floor_monthly,
+        )
+
+        caveats.append(
+            f"billed capacity ≥ consumed: minimum = {consumed_slot_hours:,.0f} measured "
+            f"slot-hrs over {window_days}d @ PAYG ${payg_rate}/slot-hr; upper estimate "
+            f"models 50-slot autoscale steps ({billed_slots:.0f} slots × {active_frac:.0%} "
+            f"active hours); {edition} has no commitment discounts"
+        )
+        caveats.append(
+            "actual bill can exceed this range for bursty workloads — Google bills "
+            "per-minute scaled peaks, not hourly averages; assumes standard "
+            "autoscaling (1-minute minimum; fluid-scaling opt-in bills less). "
+            "Supply --bigquery-monthly-cost for an exact figure"
+        )
+
+        note = (
+            f"BigQuery {edition} capacity, modelled range: "
+            f"${floor_monthly:,.2f}–${ceiling_monthly:,.2f}/mo "
+            f"@ PAYG ${payg_rate}/slot-hr ({v4.V4_PRICING_REGION}, verified "
+            f"{v4.V4_CONFIRMED_DATE})"
+        )
+        if caveats:
+            note += " ⚠️ " + "; ".join(caveats)
+
+        compute_line = CostLine(
+            label=f"BigQuery capacity ({edition})", monthly=None,
+            monthly_low=round(floor_monthly, 4), monthly_high=round(ceiling_monthly, 4),
+            confidence=ConfidenceLevel.MEDIUM, source_note=note,
+            headline=round(ceiling_monthly, 4),
+        )
+        total = round(_line_value(storage_line) + _line_value(compute_line), 4)
+        return total, [storage_line, compute_line]
+
+    def _bq_capacity_unavailable(self, pricing: PricingDetection, total_bytes: int):
+        """Hard stop: capacity detected but rate AND quantity are unknowable — no estimate.
+
+        Returns (0.0, lines, reason). The 0.0 is deliberate: the storage figure must
+        not masquerade as the BigQuery bill in the comparison (2026-08-10 sandbox validation:
+        storage-only $2,986 rendered as 'BigQuery (Current)' and produced a fabricated
+        'Save $412/mo'). Storage is still shown as a line inside the notice.
+        """
+        admin_project = None
+        if pricing.reservation_id:
+            from bq_assess.core.reservation_reader import parse_admin_project
+            parsed = parse_admin_project(pricing.reservation_id)
+            if parsed:
+                admin_project = parsed[0]
+
+        edition = pricing.edition
+        edition_phrase = f"{edition} " if edition else ""
+        # Cheapest remedy first where applicable: reading an EXISTING Cloud Billing
+        # BigQuery export typically needs only dataset-level read access — far easier
+        # to grant than admin-project reservation permissions (2026-08-10 review).
+        billing_export_hint = (
+            " If a Cloud Billing BigQuery export already exists, read access to that "
+            "dataset typically suffices to obtain the exact billed amount."
+        )
+        if not pricing.reservation_data_collected:
+            reason = (
+                f"This Source uses BigQuery {edition_phrase}capacity pricing, but this bundle was "
+                "produced by an older collector that did not capture reservation details "
+                "(baseline slots, commitments, autoscale usage). Re-collect with "
+                "bq-collect >= 0.8, or supply your total monthly BigQuery bill via "
+                "--bigquery-monthly-cost." + billing_export_hint
+            )
+        else:
+            reason = (
+                f"This Source uses BigQuery {edition_phrase}capacity pricing, but reservation "
+                "details could not be read (permission denied). Grant "
+                "roles/bigquery.resourceViewer on the reservation admin project"
+                + (f" ({admin_project})" if admin_project else "")
+                + " and re-collect, or supply your total monthly BigQuery bill via "
+                "--bigquery-monthly-cost." + billing_export_hint
+            )
+
+        storage_line = self._bq_storage_line(total_bytes)
+        label_edition = edition or "capacity-based"
+        compute_line = CostLine(
+            label=f"BigQuery capacity ({label_edition}) — UNAVAILABLE", monthly=None,
+            monthly_low=None, monthly_high=None,
+            confidence=ConfidenceLevel.LOW, source_note=reason,
+        )
+        return 0.0, [storage_line, compute_line], reason
 
     # ================================================================== Justification helpers
 
@@ -1385,7 +1748,10 @@ class CostEstimator:
         """Customer-specific justification for a provisioned scenario."""
         spec = k.V7_RG_NODE_TYPES[node_type]
         qpd = profile.queries_per_day
-        peak_conc = profile.peak_concurrent_queries
+        # Same peak figure the fit notes use — quoting bare peak_concurrent_queries
+        # here rendered "~0 peak" beside a fit note warning about 191 peak
+        # (2026-08-04 audit).
+        peak_conc = max(profile.peak_concurrent_queries, profile.peak_slots or 0)
         total_vcpu = node_count * spec["vcpu"]
 
         return (
@@ -1471,15 +1837,6 @@ def _scan_basis(slots: SlotUtilization | None) -> tuple[int, str]:
     if getattr(slots, "has_billed_bytes", False):
         return slots.total_bytes_billed, "billed"
     return slots.total_bytes_processed, "processed (billed unavailable)"
-
-
-def _first_positive(*pairs):
-    for label, value in pairs:
-        if value is not None:
-            coerced = _safe_num(value)
-            if coerced > 0:
-                return coerced, label
-    return None, None
 
 
 def _safe_num(value) -> float:
@@ -1636,22 +1993,87 @@ def _line_high(line: CostLine) -> float:
     return line.monthly if line.monthly is not None else (line.monthly_high or 0)
 
 
+def _bq_breakdown_low(lines: list, total: float) -> float | None:
+    """Measured-minimum total of a BQ breakdown, or None for point-estimate bases.
+
+    Only meaningful when at least one line is a modelled range (monthly=None with
+    monthly_low/high set — the STANDARD capacity-from-slots path). Point lines
+    (storage, egress) contribute their point value on both bases; the range line
+    contributes its low here vs its headline in the total. Call AFTER all lines
+    are appended so both totals cover the same line set.
+    """
+    has_range = any(
+        ln.monthly is None and ln.monthly_low is not None for ln in lines
+    )
+    if not has_range:
+        return None
+    low = sum(
+        ln.monthly_low if ln.monthly is None and ln.monthly_low is not None
+        else _line_value(ln)
+        for ln in lines
+    )
+    return round(min(low, total), 4)
+
+
 def _breakeven(onetime: float, monthly_delta: float) -> float:
     if monthly_delta <= 0:
         return k.BREAKEVEN_NEVER
     return onetime / monthly_delta
 
 
+def collect_rms_bytes(
+    entities,
+    storage_placements: dict,
+    engine_placements: dict,
+) -> tuple[int, int]:
+    """Sum the two RMS byte pools for the storage split (Redshift path only).
+
+    Returns ``(table_rms_bytes, mv_rms_bytes)``:
+
+    - Table pool: TABLE entities whose Stage 13a StoragePlacement is RMS.
+    - MV pool: MATERIALIZED_VIEW entities whose Stage 13 engine placement homes
+      them in Redshift — a native Redshift MV stores its materialized result set
+      in RMS. Plain views and UDFs homed in Redshift contribute nothing (no
+      materialized storage).
+
+    Kept separate because their confidence differs (generated DDL vs BQ-bytes
+    size proxy) — apply_rms_storage_split names each pool in the line's note.
+    """
+    from bq_assess.models import EntityType, StorageTarget
+
+    table_rms = 0
+    mv_rms = 0
+    for e in entities:
+        sp = storage_placements.get(e.full_name)
+        if sp is not None and sp.target == StorageTarget.RMS:
+            table_rms += _entity_physical_bytes(e)
+            continue
+        if e.entity_type == EntityType.MATERIALIZED_VIEW:
+            ep = engine_placements.get(e.full_name)
+            if ep is not None and ep.home == "REDSHIFT":
+                mv_rms += _entity_physical_bytes(e)
+    return table_rms, mv_rms
+
+
 def apply_rms_storage_split(
-    cost: CostComparison, rms_physical_bytes: int, total_physical_bytes: int
+    cost: CostComparison,
+    rms_physical_bytes: int,
+    total_physical_bytes: int,
+    mv_physical_bytes: int = 0,
 ) -> None:
-    """Split the storage line after Stage 13a placed entities on RMS, in place.
+    """Split the storage line after Stage 13a/13 placed entities on RMS, in place.
 
     Serverless bills RMS storage separately by GB/month (serverless-billing.html,
-    verified 2026-07-22) — RMS-placed entities leave the S3 Tables tier and incur
-    an RMS line instead. RMS ($0.024/GB us-east-1) is cheaper than S3 Tables tier 1
-    ($0.0265/GB), so this slightly LOWERS the estimate; the point is the line item
-    exists and the totals reconcile with the placement decision.
+    verified 2026-07-22) — RMS-resident bytes leave the S3 Tables tier and incur
+    an RMS line instead. Two pools feed the RMS line:
+
+    - ``rms_physical_bytes``: TABLE entities Stage 13a placed on RMS (ADR-0005
+      fidelity exception). HIGH confidence — we generated the native DDL.
+    - ``mv_physical_bytes``: MATERIALIZED_VIEW entities Stage 13 homed in Redshift.
+      A native Redshift MV stores its materialized result set in RMS on both
+      Serverless and Provisioned; the BQ MV's measured bytes are the size proxy.
+      MEDIUM confidence — the Redshift materialization won't be byte-identical
+      and refresh churn is not modeled.
 
     ``total_physical_bytes`` is the full estate the S3 line was priced on: the
     reduced line is recomputed through the tier function at the remaining volume
@@ -1659,48 +2081,134 @@ def apply_rms_storage_split(
     over-reduced the line on >50 TB estates) and the object-monitoring component
     is re-estimated for the remaining objects.
 
-    Mutates the best-scenario lines and headline figures only; per-scenario lists
-    keep their all-Iceberg storage (they compare compute postures, not placement).
+    The substitution is applied to EVERY Redshift scenario's lines and
+    monthly_total, not just the headline (they all priced storage identically, so
+    a headline-only split left scenario totals disagreeing with the breakdown by
+    the RMS delta). Athena scenarios are skipped by category — Redshift Managed
+    Storage cannot exist on an Athena deployment; a pristine copy of the storage
+    line is stashed on ``cost.all_iceberg_storage_line`` for the Athena scenario
+    assembled later (engine/comparison.py), which must price ALL bytes as Iceberg.
+    RMS is priced via the region-applied V6 constant (apply_aws_region /
+    live-rate override), so region correctness follows the rest of the AWS side.
     """
-    if rms_physical_bytes <= 0:
+    total_rms_bytes = max(0, rms_physical_bytes) + max(0, mv_physical_bytes)
+    if total_rms_bytes <= 0:
         return
-    s3_line = next((ln for ln in cost.aws_lines if ln.label == "S3 Tables storage"), None)
-    if s3_line is None or s3_line.monthly is None:
+    # Suppress a line that would render $0.00 (empty RMS-placed tables) —
+    # a zero-value line item is noise; the placement itself still shows on
+    # the entities (2026-08-04 audit: sandbox estate carried '0.0 GB × rate = $0.00').
+    if total_rms_bytes * k.GB_PER_BYTE * k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH < 0.005:
         return
 
-    rms_gb = rms_physical_bytes * k.GB_PER_BYTE
-    old_s3_usd = s3_line.monthly
-    remaining_bytes = max(0, total_physical_bytes - rms_physical_bytes)
+    # Every non-Athena line list that carries a storage line gets the identical
+    # substitution. aws_lines usually IS the best scenario's list — dedupe by
+    # identity so shared references aren't split twice.
+    line_lists: list[list[CostLine]] = []
+    seen_ids: set[int] = set()
+    scenario_by_list: dict[int, AWSScenario] = {}
+    for scenario in cost.aws_scenarios:
+        if "ATHENA" in (scenario.category or "").upper():
+            continue  # hardening: RMS must never appear on an Athena option
+        line_lists.append(scenario.lines)
+        seen_ids.add(id(scenario.lines))
+        scenario_by_list[id(scenario.lines)] = scenario
+    if id(cost.aws_lines) not in seen_ids:
+        line_lists.append(cost.aws_lines)
+
+    first_s3 = next(
+        (ln for lines in line_lists for ln in lines if ln.label == "S3 Tables storage"),
+        None,
+    )
+    if first_s3 is None:
+        return
+    # Pristine all-Iceberg copy for the Athena scenario built at Stage 13b: if the
+    # customer chose Athena there would be no RMS, so it prices the full estate as
+    # S3 Tables. Without this, the Athena option inherited the reduced S3 line
+    # from scenarios[0] and silently dropped the RMS bytes from its total.
+    cost.all_iceberg_storage_line = dataclasses.replace(first_s3)
+
+    rms_gb = total_rms_bytes * k.GB_PER_BYTE
+    # Point OR range line (Intelligent-Tiering makes it a range with a headline —
+    # `monthly is None` used to silently skip the split, so RMS-placed tables got
+    # no RMS line and totals stopped reconciling with placement, 2026-08-03 audit).
+    old_s3_usd = _line_value(first_s3)
+    remaining_bytes = max(0, total_physical_bytes - total_rms_bytes)
     remaining_objects = remaining_bytes / (k.V2_ASSUMED_OBJECT_SIZE_MB * 1e6)
     reduced_s3_usd = (
         _tiered_s3_tables_usd(remaining_bytes * k.GB_PER_BYTE)
         + remaining_objects / 1000.0 * k.V2_OBJECT_MONITORING_USD_PER_1K_OBJECTS_MONTH
     )
     reduced_s3_usd = min(reduced_s3_usd, old_s3_usd)  # a split must never raise the line
+    reduction = old_s3_usd - reduced_s3_usd
     rms_usd = rms_gb * k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH
 
-    s3_line.monthly = round(reduced_s3_usd, 4)
-    s3_line.source_note += f"; {fmt_size_exact(rms_gb)} moved to RMS by storage placement"
-    cost.aws_lines.append(CostLine(
-        label="Redshift Managed Storage (RMS-placed tables)",
-        monthly=round(rms_usd, 4), monthly_low=None, monthly_high=None,
-        confidence=ConfidenceLevel.HIGH,
-        source_note=(
-            f"{fmt_size_exact(rms_gb)} × ${k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH}/GB-mo "
-            f"{k.AWS_REGION_SCOPE} — serverless bills RMS separately from RPU compute "
-            f"(verified {k.AWS_CONFIRMED_DATE})"
-        ),
-    ))
+    # Componentized provenance: name each pool so the line is auditable.
+    components = []
+    if rms_physical_bytes > 0:
+        components.append(
+            f"{fmt_size_exact(rms_physical_bytes * k.GB_PER_BYTE)} RMS-placed tables"
+        )
+    if mv_physical_bytes > 0:
+        components.append(
+            f"{fmt_size_exact(mv_physical_bytes * k.GB_PER_BYTE)} Redshift-native MVs "
+            f"(BQ MV bytes as size proxy; refresh churn not modeled)"
+        )
+    source_note = (
+        f"{' + '.join(components)} × ${k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH}/GB-mo "
+        f"{k.AWS_REGION_SCOPE} — RMS is billed separately from compute on both "
+        f"Serverless and Provisioned (verified {k.AWS_CONFIRMED_DATE})"
+    )
+    rms_confidence = (
+        ConfidenceLevel.MEDIUM if mv_physical_bytes > 0 else ConfidenceLevel.HIGH
+    )
 
-    delta_usd = rms_usd - (old_s3_usd - reduced_s3_usd)   # negative when RMS is cheaper
-    cost.aws_monthly_low = round(cost.aws_monthly_low + delta_usd, 4)
-    cost.aws_monthly_high = round(cost.aws_monthly_high + delta_usd, 4)
-    cost.monthly_delta_low = cost.bigquery_monthly - cost.aws_monthly_high
-    cost.monthly_delta_high = cost.bigquery_monthly - cost.aws_monthly_low
-    cost.annual_savings_low = cost.monthly_delta_low * 12
-    cost.annual_savings_high = cost.monthly_delta_high * 12
-    cost.breakeven_months_low = _breakeven(cost.migration_onetime, cost.monthly_delta_low)
-    cost.breakeven_months_high = _breakeven(cost.migration_onetime, cost.monthly_delta_high)
+    def _split_lines(lines: list[CostLine]) -> bool:
+        """Apply the substitution to one line list; True when a split happened."""
+        s3_line = next((ln for ln in lines if ln.label == "S3 Tables storage"), None)
+        if s3_line is None:
+            return False
+        if s3_line.monthly is not None:
+            s3_line.monthly = round(reduced_s3_usd, 4)
+        else:
+            # Range line: shift every figure by the reduction; the low/headline pair
+            # stays the totals basis, the high bound keeps its month-1 meaning.
+            s3_line.monthly_low = round(max(0.0, (s3_line.monthly_low or 0) - reduction), 4)
+            s3_line.monthly_high = round(max(0.0, (s3_line.monthly_high or 0) - reduction), 4)
+            if getattr(s3_line, "headline", None) is not None:
+                s3_line.headline = round(max(0.0, s3_line.headline - reduction), 4)
+        s3_line.source_note += f"; {fmt_size_exact(rms_gb)} moved to RMS by storage placement"
+        lines.append(CostLine(
+            label="Redshift Managed Storage (RMS)",
+            monthly=round(rms_usd, 4), monthly_low=None, monthly_high=None,
+            confidence=rms_confidence,
+            source_note=source_note,
+        ))
+        return True
+
+    for lines in line_lists:
+        if not _split_lines(lines):
+            continue
+        scenario = scenario_by_list.get(id(lines))
+        if scenario is not None:
+            # Recompute from the lines rather than adding a delta — keeps the
+            # total reconciling exactly with its own line items after rounding.
+            scenario.monthly_total = round(sum(_line_value(ln) for ln in lines), 4)
+
+    # Recompute headline figures from the (now-split) aws_lines.
+    cost.aws_monthly_low = round(sum(_line_low(ln) for ln in cost.aws_lines), 4)
+    cost.aws_monthly_high = round(sum(_line_high(ln) for ln in cost.aws_lines), 4)
+    if cost.bq_cost_available:
+        bq_low_basis = (
+            cost.bigquery_monthly_low
+            if cost.bigquery_monthly_low is not None
+            else cost.bigquery_monthly
+        )
+        cost.monthly_delta_low = bq_low_basis - cost.aws_monthly_high
+        cost.monthly_delta_high = cost.bigquery_monthly - cost.aws_monthly_low
+        cost.annual_savings_low = cost.monthly_delta_low * 12
+        cost.annual_savings_high = cost.monthly_delta_high * 12
+        cost.breakeven_months_low = _breakeven(cost.migration_onetime, cost.monthly_delta_low)
+        cost.breakeven_months_high = _breakeven(cost.migration_onetime, cost.monthly_delta_high)
 
 
 def reprice_migration_effort(cost: CostComparison, effort_total) -> None:

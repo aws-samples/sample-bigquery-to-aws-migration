@@ -233,10 +233,6 @@ def _interactive_prompts(params: dict) -> dict:
         if ds.strip():
             params["datasets"] = ds.strip()
 
-    params["include_query_logs"] = params.get("include_query_logs") or Confirm.ask(
-        "Include query log analysis?", default=False
-    )
-
     if params.get("include_query_logs") and not params.get("query_logs"):
         ql = Prompt.ask("Path to exported query logs JSON (or empty for API)", default="")
         if ql.strip():
@@ -406,7 +402,24 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         query_log_text = [q.query for q in bundle.queries if q.query]
         console.print(f"[green]✓ {len(query_log_text)} anonymized statements available for analysis.[/green]")
 
+    # ── Stage 3b: Query Attribution ───────────────────────────────
+    # Attribute query log entries to the specific tables they reference.
+    # This powers the workload display (side-by-side translations) but does NOT
+    # affect the entity's complexity score — scoring uses only the entity's own
+    # definition (views, routines) + the global ad-hoc bucket.
+    from bq_assess.core.query_attribution import EntityWorkload, attribute_queries
+    query_workload_map: dict[str, EntityWorkload] = {}
+    if bundle.queries:
+        known_entities = {e.full_name for e in entities}
+        query_workload_map = attribute_queries(bundle.queries, known_entities, gcp_project)
+        if query_workload_map:
+            console.print(
+                f"[green]✓ Attributed queries to {len(query_workload_map)} entities "
+                f"(of {len(known_entities)} total).[/green]"
+            )
+
     constructs_by_entity = sql_analyzer.detect_for_entities(entities, query_log_text)
+
     # Constructs found in the collected workload (application/BI queries) live in
     # the __ad_hoc__ bucket — not owned by any entity, surfaced on the report's
     # Query Complexity tab as a workload-level finding (R10.5).
@@ -513,7 +526,14 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         for entity in entities:
             try:
                 constructs = constructs_by_entity.get(entity.full_name, [])
-                result = complexity_scorer.score(entity, constructs, has_logs=has_query_logs, dep_counts=dep_counts)
+                result = complexity_scorer.score(
+                    entity, constructs, has_logs=has_query_logs,
+                    dep_counts=dep_counts,
+                    # Attributed production queries ARE this entity's observed
+                    # SQL surface — without this, every actively-queried table
+                    # showed LOW/schema-only beside its own analyzed queries.
+                    has_attributed_queries=entity.full_name in query_workload_map,
+                )
                 complexity_results[entity.full_name] = result
             except Exception as exc:
                 console.print(f"[yellow]⚠ Complexity scoring failed for {entity.full_name}: {exc}[/yellow]")
@@ -605,6 +625,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
                 location=detected_location,
                 storage_basis=storage_basis,
                 as_of=as_of,
+                egress_gib=bundle.egress_gib,
             )
             # Multi-region caveat (2026-07-28 review): the v2 collector merges
             # all regions' bytes and workload into the totals, but both clouds
@@ -857,29 +878,37 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         )
         # Stage 10 priced migration effort BEFORE the RMS amendments above — reprice
         # so the cost summary agrees with the amended per-entity effort cards, and
-        # split the storage line: RMS-placed bytes bill as RMS (serverless bills RMS
-        # separately by GB/month), not S3 Tables.
-        if rms_count and pricing:
+        # split the storage line: RMS-resident bytes bill as RMS (billed separately
+        # by GB/month on both Serverless and Provisioned), not S3 Tables. Two pools:
+        # RMS-placed tables (Stage 13a) and Redshift-homed MVs (Stage 13 — a native
+        # Redshift MV stores its materialized result set in RMS).
+        if pricing:
             from bq_assess.engine.redshift.cost import (
                 apply_rms_storage_split,
+                collect_rms_bytes,
                 reprice_migration_effort,
             )
-            reprice_migration_effort(
-                cost_comparison, sum(er.score for er in effort_results.values())
+            if rms_count:
+                reprice_migration_effort(
+                    cost_comparison, sum(er.score for er in effort_results.values())
+                )
+            table_rms_bytes, mv_rms_bytes = collect_rms_bytes(
+                entities, storage_placement_results, placement_results
             )
-            rms_physical_bytes = sum(
-                effective_physical_bytes(e.num_bytes, e.physical_bytes)
-                for e in table_entities
-                if storage_placement_results.get(e.full_name) is not None
-                and storage_placement_results[e.full_name].target == StorageTarget.RMS
-            )
-            total_physical_bytes = sum(
-                effective_physical_bytes(e.num_bytes, e.physical_bytes)
-                for e in entities
-            )
-            apply_rms_storage_split(
-                cost_comparison, rms_physical_bytes, total_physical_bytes
-            )
+            if table_rms_bytes or mv_rms_bytes:
+                total_physical_bytes = sum(
+                    effective_physical_bytes(e.num_bytes, e.physical_bytes)
+                    for e in entities
+                )
+                apply_rms_storage_split(
+                    cost_comparison, table_rms_bytes, total_physical_bytes,
+                    mv_physical_bytes=mv_rms_bytes,
+                )
+                console.print(
+                    f"[green]✓ RMS storage line: "
+                    f"{table_rms_bytes / 1024**3:.1f} GB RMS-placed tables + "
+                    f"{mv_rms_bytes / 1024**3:.1f} GB Redshift-native MVs.[/green]"
+                )
 
     # ── Stage 13b: Engine-Aware Cost Comparison ──────────────────────────────
     # Assemble engine-aware cost comparison with all scenarios in ONE pass (Fix 1/3/4/5)
@@ -993,6 +1022,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         complexity = complexity_results.get(entity.full_name)
         guidance = guidance_results.get(entity.full_name, [])
         placement = placement_results.get(entity.full_name)
+        wl = query_workload_map.get(entity.full_name)
 
         entity_reports.append(EntityReport(
             full_name=entity.full_name,
@@ -1010,6 +1040,13 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             placement=placement,
             physical_bytes=entity.physical_bytes,
             storage_placement=storage_placement_results.get(entity.full_name),
+            query_workload={
+                "query_count": wl.query_count,
+                "total_slot_ms": wl.total_slot_ms,
+                "slot_hours": wl.slot_hours,
+                "num_shapes": wl.num_shapes,
+                "statement_types": wl.statement_types,
+            } if wl else None,
         ))
 
     # Generate assessment ID
@@ -1033,6 +1070,38 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     console.print("[green]✓ Assessment assembled.[/green]")
 
+    # ── Stage 14b: Translate Query Workload Samples ───────────────────
+    # Translate the top-N query samples per entity for the report's side-by-side view.
+    # Uses the recommended engine (redshift or athena) for the translation target.
+    translated_workloads: dict[str, dict] | None = None
+    pe = engine_recommendation.primary_engine if engine_recommendation else "redshift"
+    workload_target_engine = pe.value if hasattr(pe, "value") else str(pe)
+    if query_workload_map:
+        from bq_assess.core.query_translator import translate_query
+        target_engine = workload_target_engine
+        console.print(f"\n[bold]Stage 14b:[/bold] Translating query workload samples (target: {target_engine})...")
+        translated_workloads = {}
+        # Entities beyond the sample cap have empty samples but keep their
+        # workload stats — they still show the workload column in the report.
+        for entity_name, wl in query_workload_map.items():
+            translated_workloads[entity_name] = {
+                "query_count": wl.query_count,
+                "total_slot_ms": wl.total_slot_ms,
+                "slot_hours": wl.slot_hours,
+                "num_shapes": wl.num_shapes,
+                "statement_types": wl.statement_types,
+                "samples": [
+                    {
+                        "query": s.query,
+                        "translated": translate_query(s.query, engine=target_engine),
+                        "statement_type": s.statement_type,
+                        "total_slot_ms": s.total_slot_ms,
+                    }
+                    for s in wl.samples
+                ],
+            }
+        console.print(f"[green]✓ Translated samples for {len(translated_workloads)} entities.[/green]")
+
     # ── Stage 15: Write Deliverables ─────────────────────────────────
     console.print("\n[bold]Stage 15:[/bold] Writing deliverables...")
 
@@ -1052,10 +1121,26 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     if "html" in formats:
         html_writer = HTMLWriter()
-        paths = html_writer.write(assessment, output_dir, storage_basis=storage_basis)
+        paths = html_writer.write(
+            assessment, output_dir,
+            storage_basis=storage_basis,
+            query_workloads=translated_workloads,
+        )
         output_files.extend(paths)
         for path in paths:
             console.print(f"  [green]✓ HTML report: {path}[/green]")
+
+    # Query-workload sidecar: EVERY attributed shape translated, one .sql per
+    # entity — the HTML embeds only the top 5, the rest live here (+ INDEX.csv).
+    workload_sidecar_dir: str | None = None
+    if query_workload_map:
+        from bq_assess.report.workload_writer import write_workload_sidecar
+        workload_sidecar_dir = write_workload_sidecar(
+            query_workload_map, workload_target_engine, project_dir,
+        )
+        if workload_sidecar_dir:
+            output_files.append(workload_sidecar_dir)
+            console.print(f"  [green]✓ Query workload: {workload_sidecar_dir}[/green]")
 
     # Terraform infrastructure files
     from bq_assess.engine.athena.terraform import generate_terraform
@@ -1099,10 +1184,31 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     if params.get("export_bundle", True):
         writer = BundleWriter()
         bundle_dir = writer.write(bundle, project_dir)
-        output_files.append(bundle_dir)
-        console.print(f"  [green]✓ Bundle exported: {bundle_dir}[/green]")
+        if params.get("zip_bundle"):
+            # Same hand-off artifact bq-collect --zip produces: the tree is
+            # replaced by a zip (here <project_dir>/bundle.zip — the project
+            # folder itself holds the report/terraform/migration siblings).
+            import shutil
 
-    # Customer-facing README at the project root
+            from bq_assess.bundle.writer import zip_bundle_dir
+            zip_path = zip_bundle_dir(
+                bundle_dir,
+                zip_path=str(Path(project_dir) / "bundle.zip"),
+                root_name="",
+            )
+            shutil.rmtree(bundle_dir)
+            output_files.append(zip_path)
+            console.print(f"  [green]✓ Bundle exported (zipped): {zip_path}[/green]")
+        else:
+            output_files.append(bundle_dir)
+            console.print(f"  [green]✓ Bundle exported: {bundle_dir}[/green]")
+
+    # Customer-facing README at the project root. Skipped in multi-project mode
+    # (2026-08-03): the fleet writes ONE top-level README next to SUMMARY.html
+    # instead of near-identical per-project copies.
+    if params.get("_multi_project"):
+        _print_summary(assessment, output_files)
+        return assessment
     from bq_assess.report.readme_writer import write_readme
     readme_path = write_readme(
         project_dir=project_dir,
@@ -1118,6 +1224,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
                 for p in storage_placement_results.values()
             )
         ),
+        has_query_workload=bool(workload_sidecar_dir),
     )
     output_files.append(readme_path)
     console.print(f"  [green]✓ README: {readme_path}[/green]")
@@ -1274,7 +1381,6 @@ def _assess_options(f):
         click.option("--credentials", default=None, help="Path to service account JSON."),
         click.option("--use-adc", is_flag=True, default=False, help="Use Application Default Credentials."),
         click.option("--datasets", default=None, help="Comma-separated dataset filter."),
-        click.option("--include-query-logs", is_flag=True, default=False, help="Analyze INFORMATION_SCHEMA.JOBS."),
         click.option("--query-logs", default=None, help="Path to exported query logs JSON."),
         click.option(
             "--query-log-days",
@@ -1290,6 +1396,11 @@ def _assess_options(f):
         click.option(
             "--export-bundle/--no-export-bundle", "export_bundle", default=True,
             help="Write the re-processable bundle/ next to the report (default: enabled).",
+        ),
+        click.option(
+            "--zip", "zip_bundle", is_flag=True, default=False,
+            help="Write the exported bundle as bundle.zip instead of a directory "
+                 "(same hand-off artifact bq-collect --zip produces).",
         ),
         click.option(
             "--exclude-query-text", is_flag=True, default=False,
@@ -1328,7 +1439,6 @@ def assess_cmd(
     credentials: str | None,
     use_adc: bool,
     datasets: str | None,
-    include_query_logs: bool,
     query_logs: str | None,
     query_log_days: int | None,
     bigquery_monthly_cost: float | None,
@@ -1337,6 +1447,7 @@ def assess_cmd(
     output_format: str | None,
     interactive: bool,
     export_bundle: bool,
+    zip_bundle: bool,
     exclude_query_text: bool,
     concurrency: int,
     skip_translation: bool,
@@ -1355,10 +1466,11 @@ def assess_cmd(
 
     params = _build_params(
         gcp_project=gcp_project, credentials=credentials, use_adc=use_adc,
-        datasets=datasets, include_query_logs=include_query_logs, query_logs=query_logs,
+        datasets=datasets, query_logs=query_logs,
         query_log_days=query_log_days, bigquery_monthly_cost=bigquery_monthly_cost,
         reservation_config=reservation_config, output=output, output_format=output_format,
         interactive=interactive, export_bundle=export_bundle,
+        zip_bundle=zip_bundle,
         exclude_query_text=exclude_query_text, concurrency=concurrency,
         skip_translation=skip_translation, skip_workload=skip_workload,
         offline_pricing=offline_pricing, no_cache=no_cache, config=config,
@@ -1385,31 +1497,9 @@ def assess_cmd(
 
 
 def _discover_projects(credentials_path: str | None) -> list[tuple[str, bool]]:
-    """List all GCP projects the caller can access that have BigQuery enabled.
-
-    Uses bigquery.Client.list_projects() — returns only projects visible to the
-    active credentials with the BigQuery API enabled. Each entry is
-    (project_id, has_datasets) so empty projects can be skipped up front.
-    """
-    from google.cloud import bigquery
-    from google.oauth2 import service_account
-
-    if credentials_path:
-        creds = service_account.Credentials.from_service_account_file(credentials_path)
-        client = bigquery.Client(credentials=creds, project=creds.project_id)
-    else:
-        # ADC: project is irrelevant for list_projects; use any placeholder the
-        # credential resolves. bigquery.Client() picks up the ADC default.
-        client = bigquery.Client()
-
-    projects: list[tuple[str, bool]] = []
-    for p in sorted(client.list_projects(), key=lambda p: p.project_id):
-        try:
-            has_datasets = any(client.list_datasets(project=p.project_id, max_results=1))
-        except Exception:
-            has_datasets = False  # can't list — treated as empty, surfaced as SKIPPED
-        projects.append((p.project_id, has_datasets))
-    return projects
+    """Delegates to core.project_discovery (shared with bq-collect since 0.6.1)."""
+    from bq_assess.core.project_discovery import discover_projects
+    return discover_projects(credentials_path)
 
 
 def _assess_all_projects(params: dict) -> None:
@@ -1436,6 +1526,12 @@ def _assess_all_projects(params: dict) -> None:
         console.print(f"  [dim]— skipping {pid} (no datasets)[/dim]")
     console.print()
 
+    # Share a reservation cache across all projects so each unique reservation
+    # is queried only once (avoids redundant API calls when multiple projects
+    # share the same reservation).
+    from bq_assess.core.reservation_reader import ReservationCache
+    fleet_reservation_cache = ReservationCache()
+
     results: list[tuple[str, str]] = [(pid, "SKIPPED (no datasets)") for pid in skipped]
     completed_assessments: list = []
     for i, project_id in enumerate(assessable, 1):
@@ -1445,6 +1541,8 @@ def _assess_all_projects(params: dict) -> None:
 
         project_params = dict(params)
         project_params["gcp_project"] = project_id
+        project_params["_multi_project"] = True  # fleet README replaces per-project ones
+        project_params["reservation_cache"] = fleet_reservation_cache
         try:
             bundle = collect(project_params)
             assessment = analyze_and_report(bundle, project_params)
@@ -1459,8 +1557,12 @@ def _assess_all_projects(params: dict) -> None:
             console.print(f"[red]✗ {project_id}: {exc}[/red]")
             results.append((project_id, "FAILED"))
 
-    # ── Cross-project SUMMARY.html ──────────────────────────────────
+    # Report any admin projects that were permission-denied across the fleet
+    fleet_reservation_cache.print_fleet_denied_summary(console)
+
+    # ── Cross-project SUMMARY.html + top-level README ────────────────
     if completed_assessments:
+        from bq_assess.report.readme_writer import write_fleet_readme
         from bq_assess.report.summary_writer import write_summary
         base_output_dir = params.get("output") or "bq-migration/"
         try:
@@ -1469,6 +1571,18 @@ def _assess_all_projects(params: dict) -> None:
         except Exception as exc:
             logger.exception("Failed to write cross-project summary")
             console.print(f"[yellow]⚠ Could not write cross-project summary: {exc}[/yellow]")
+        try:
+            # Folder names match the per-project output convention
+            # (<project>_<date>/) used by analyze_and_report + summary links.
+            folders = [
+                (a.project_id, f"{a.project_id}_{a.generated_at.strftime('%Y-%m-%d')}")
+                for a in completed_assessments
+            ]
+            readme_path = write_fleet_readme(base_output_dir, folders)
+            console.print(f"[green]✓ Top-level README: {readme_path}[/green]")
+        except Exception as exc:
+            logger.exception("Failed to write top-level README")
+            console.print(f"[yellow]⚠ Could not write top-level README: {exc}[/yellow]")
 
     # ── Roll-up summary ─────────────────────────────────────────────
     console.print(f"\n[bold]{'═' * 70}[/bold]")
@@ -1614,8 +1728,6 @@ def _build_params(**kwargs) -> dict:
         cli_params["use_adc"] = True
     if kwargs.get("datasets") is not None:
         cli_params["datasets"] = kwargs["datasets"]
-    if kwargs.get("include_query_logs"):
-        cli_params["include_query_logs"] = True
     if kwargs.get("query_logs") is not None:
         cli_params["query_logs"] = kwargs["query_logs"]
     if kwargs.get("query_log_days") is not None:
@@ -1633,6 +1745,8 @@ def _build_params(**kwargs) -> dict:
     cli_params["export_bundle"] = kwargs.get("export_bundle", True)
     if kwargs.get("exclude_query_text"):
         cli_params["exclude_query_text"] = True
+    if kwargs.get("zip_bundle"):
+        cli_params["zip_bundle"] = True
     cli_params["concurrency"] = kwargs.get("concurrency", 50)
     if kwargs.get("skip_translation"):
         cli_params["skip_translation"] = True
@@ -1675,7 +1789,10 @@ def _build_params(**kwargs) -> dict:
     params["_cli_engine_params"] = cli_engine_params
 
     params.setdefault("use_adc", False)
-    params.setdefault("include_query_logs", False)
+    # Query-log analysis is always on (2026-08-03 parity with bq-collect);
+    # opt-outs are --skip-workload / --exclude-query-text. YAML query_logs.enabled
+    # can still force it off for tests/special cases.
+    params.setdefault("include_query_logs", True)
     params.setdefault("output", "bq-migration/")
     params.setdefault("format", "html")
     params.setdefault("interactive", False)

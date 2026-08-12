@@ -409,14 +409,20 @@ def test_timestamp_column_gets_iso8601_parse(generator):
     result = generator.generate(entity, _conversion(), _config())
     full_sql = " ".join(result.statements)
     assert "from_iso8601_timestamp(created_at)" in full_sql
-    inserts = [s for s in result.statements if "INSERT INTO" in s]
+    # date-window chunks (the NULL-partition chunk uses IS NULL on both sides)
+    inserts = [s for s in result.statements
+               if "INSERT INTO" in s and "IS NULL" not in s]
     assert inserts and all(
         "WHERE from_iso8601_timestamp(created_at)" in s for s in inserts
     )
-    deletes = [s for s in result.statements if "DELETE FROM" in s]
+    deletes = [s for s in result.statements
+               if "DELETE FROM" in s and "IS NULL" not in s]
     assert deletes and all(
         "WHERE created_at >=" in s for s in deletes
     )
+    # the NULL chunk parses on the source side too
+    null_chunk = next(s for s in result.statements if "IS NULL" in s and "INSERT" in s)
+    assert "from_iso8601_timestamp(created_at) IS NULL" in null_chunk
 
 
 def test_interval_casts_and_range_flags_unreadable(generator):
@@ -693,3 +699,129 @@ def test_leading_digit_table_name_quoted_in_dml(generator):
         ).split(";")):
             if part:
                 sqlglot.parse_one(part, dialect="athena")
+
+
+class TestAthenaDdlReservedWords:
+    """2026-08-04 audit: 52 real tables had unquoted `date`/`time`/`precision`
+    columns — valid on Redshift but Hive-DDL-reserved on Athena, failing every
+    CREATE TABLE. Detection must be the UNION of both engines' reserved lists."""
+
+    def test_athena_ddl_reserved_words_backticked(self):
+        from bq_assess.targets.iceberg.identifiers import quote_identifier_ddl
+        for word in ("date", "time", "precision", "timestamp", "interval",
+                     "partition", "row", "rows", "if", "cache"):
+            assert quote_identifier_ddl(word) == f"`{word}`", (
+                f"Athena DDL reserved word {word!r} must be backticked"
+            )
+
+    def test_athena_reserved_also_quoted_in_dml(self):
+        # Same detection feeds DML — over-quoting is always valid Trino/Redshift
+        from bq_assess.targets.iceberg.identifiers import quote_identifier
+        assert quote_identifier("date") == '"date"'
+        assert quote_identifier("precision") == '"precision"'
+
+    def test_plain_identifiers_still_unquoted(self):
+        from bq_assess.targets.iceberg.identifiers import quote_identifier_ddl
+        for word in ("event_date", "created_at", "uid", "player_id", "dates"):
+            assert quote_identifier_ddl(word) == word
+
+    def test_converter_ddl_quotes_reserved_column(self):
+        """End-to-end: a table with a `date` column must produce backticked DDL."""
+        from bq_assess.models import (
+            ColumnSchema,
+            EntityMetadata,
+            EntityPopulation,
+            EntityType,
+        )
+        from bq_assess.targets.iceberg.converter import IcebergConverter
+
+        entity = EntityMetadata(
+            entity_id="t", dataset_id="ds", full_name="ds.t",
+            entity_type=EntityType.TABLE, population=EntityPopulation.TABLE,
+            num_rows=1, num_bytes=1,
+            columns=[
+                ColumnSchema(name="date", field_type="DATE", mode="NULLABLE"),
+                ColumnSchema(name="precision", field_type="FLOAT64", mode="NULLABLE"),
+            ],
+            time_partitioning=None, range_partitioning=None,
+            clustering_fields=None, view_query=None, mview_query=None,
+            routine=None, depends_on=[], last_modified=None,
+        )
+        result = IcebergConverter().convert(entity)
+        assert "`date` date" in result.ddl
+        assert "`precision` double" in result.ddl
+
+
+def test_validation_query_generated(generator):
+    """2026-08-04 audit: validation existed only as prose — every table plan
+    now carries a source-vs-target row-count query."""
+    result = generator.generate(_entity(), _conversion(), _config())
+    vq = result.validation_query
+    assert vq is not None
+    assert "COUNT(*)" in vq
+    assert "source_rows" in vq and "target_rows" in vq
+    assert "ds.my_table" in vq  # both sides reference the right table
+    assert "federates to BigQuery" in vq  # cost warning present
+
+
+def test_chunked_load_includes_null_partition_chunk(generator):
+    """2026-08-04 audit: date-window chunks exclude rows in BigQuery's __NULL__
+    partition — a final IS NULL chunk must exist or those rows silently drop."""
+    entity = _entity(
+        num_bytes=500 * 1024**3,
+        time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+    )
+    result = generator.generate(entity, _conversion(), _config())
+    full_sql = " ".join(result.statements)
+    if "DELETE FROM" in full_sql and "DATE '" in full_sql:
+        # concrete chunked path: a live IS NULL DELETE/INSERT pair
+        null_chunks = [s for s in result.statements
+                       if "IS NULL" in s and "INSERT INTO" in s]
+        assert null_chunks, "chunked load missing the NULL-partition chunk"
+        assert "__NULL__" in null_chunks[0]
+
+
+def test_rechunk_preserves_null_partition_chunk(tmp_path):
+    """run_migration.py's rechunk rebuilds date windows only — the NULL chunk
+    must survive the rewrite."""
+    import importlib.util
+
+    # the generated script imports boto3 at module level (a runtime dep of the
+    # DELIVERABLE, deliberately not of this package) — skip where absent (CI)
+    pytest.importorskip("boto3")
+
+    from bq_assess.engine.athena.migration_scripts import (
+        generate_migration_scripts as g,
+    )
+
+    g(project_dir=str(tmp_path), migration_plans={}, connector_name="c",
+      target_region="eu-west-1")
+    spec = importlib.util.spec_from_file_location(
+        "runmig", tmp_path / "migration" / "run_migration.py")
+    runmig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runmig)
+
+    statements = [
+        "-- STEP 0\nSELECT MIN(d) AS min_val, MAX(d) AS max_val FROM src;",
+        (
+            "DELETE FROM t WHERE d >= DATE '2026-01-01' AND d < DATE '2026-04-01';\n"
+            "INSERT INTO t SELECT * FROM src WHERE d >= DATE '2026-01-01' AND d < DATE '2026-04-01';"
+        ),
+        (
+            "-- FINAL CHUNK: rows with NULL d\n"
+            "DELETE FROM t WHERE d IS NULL;\nINSERT INTO t SELECT * FROM src WHERE d IS NULL;"
+        ),
+    ]
+
+    class _FakeClient:
+        def start_query_execution(self, **kw):
+            return {"QueryExecutionId": "x"}
+
+    # monkeypatch the scalar fetch to return a real range
+    runmig._fetch_scalar_row = lambda client, sql, wg=None: ("2025-06-01", "2026-08-01")
+    out = runmig.rechunk_statements(_FakeClient(), statements, dry_run=False)
+    assert any("IS NULL" in s and "INSERT INTO" in s for s in out), (
+        "rechunk dropped the NULL-partition chunk"
+    )
+    # and the date windows were rebuilt from the discovered range
+    assert any("2025-06-01" in s for s in out)

@@ -111,3 +111,31 @@ class TestComplexityScorer:
         c = [_construct("UNNEST")]
         result = scorer.score(_entity(), constructs=c)
         assert result.constructs == c
+
+
+class TestAttributedQueryConfidence:
+    """2026-08-04 review: a table with per-entity attributed production queries
+    is not 'schema only' — its real SQL surface was observed and analyzed."""
+
+    def test_attributed_table_is_medium_query_logs(self):
+        from bq_assess.models import ConfidenceLevel, ConfidenceSource
+        scorer = ComplexityScorer()
+        table = _entity(entity_type=EntityType.TABLE, view_query=None)
+        result = scorer.score(table, [], has_logs=True, has_attributed_queries=True)
+        assert result.confidence == ConfidenceLevel.MEDIUM
+        assert result.confidence_source == ConfidenceSource.QUERY_LOGS
+
+    def test_unattributed_table_stays_low_schema_only(self):
+        from bq_assess.models import ConfidenceLevel, ConfidenceSource
+        scorer = ComplexityScorer()
+        table = _entity(entity_type=EntityType.TABLE, view_query=None)
+        result = scorer.score(table, [], has_logs=True, has_attributed_queries=False)
+        assert result.confidence == ConfidenceLevel.LOW
+        assert result.confidence_source == ConfidenceSource.SCHEMA_ONLY
+
+    def test_view_with_surface_and_logs_still_high(self):
+        from bq_assess.models import ConfidenceLevel
+        scorer = ComplexityScorer()
+        view = _entity()  # VIEW with a definition
+        result = scorer.score(view, [], has_logs=True, has_attributed_queries=True)
+        assert result.confidence == ConfidenceLevel.HIGH

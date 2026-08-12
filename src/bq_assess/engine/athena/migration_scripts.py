@@ -56,7 +56,8 @@ def generate_migration_scripts(
     )
     _write_requirements(mig_dir)
     rebuilt_summary = _write_rebuilt_entities_sql(
-        mig_dir, rebuilt_entities or [], translation_results or {}
+        mig_dir, rebuilt_entities or [], translation_results or {},
+        migrated_tables=set(migration_plans),
     )
     _write_migration_guide(
         mig_dir,
@@ -73,7 +74,8 @@ def generate_migration_scripts(
 
 
 def _write_rebuilt_entities_sql(
-    mig_dir: Path, rebuilt_entities: list, translation_results: dict
+    mig_dir: Path, rebuilt_entities: list, translation_results: dict,
+    migrated_tables: set | None = None,
 ) -> dict:
     """Write rebuilt_entities.sql — the Rebuilt-population migration deliverable.
 
@@ -97,6 +99,16 @@ def _write_rebuilt_entities_sql(
     if not rebuilt_entities:
         return summary
 
+    # The translations carry their dialect (TranslationResult.target_engine) —
+    # the execution instructions MUST match it. A previous version hardcoded
+    # "run in the Athena workgroup" around Redshift-dialect SQL (2026-08-04
+    # audit: every shipped view was unrunnable on the instructed engine).
+    target_engine = next(
+        (getattr(tr, "target_engine", "redshift")
+         for tr in translation_results.values() if tr is not None),
+        "redshift",
+    )
+
     def _tr(full_name):
         tr = translation_results.get(full_name)
         if tr is None:
@@ -111,34 +123,70 @@ def _write_rebuilt_entities_sql(
         sql, warnings, blocked = _tr(entity.full_name)
         warn_lines = "".join(f"-- WARNING: {w}\n" for w in warnings)
 
+        # Views whose base tables are NOT in the migration plan can never
+        # validate on the target — flag them at the top of the section rather
+        # than let the operator discover it at CREATE time (2026-08-04 audit:
+        # 6 views depended on datasets absent from the plan).
+        missing_deps = []
+        if migrated_tables is not None and etype in ("VIEW", "MATERIALIZED_VIEW"):
+            rebuilt_names = {e.full_name for e in rebuilt_entities}
+            missing_deps = sorted(
+                dep for dep in (entity.depends_on or [])
+                if dep not in migrated_tables and dep not in rebuilt_names
+            )
+        dep_lines = "".join(
+            f"-- WARNING: depends on {d}, which is NOT in this migration plan — "
+            f"this view cannot validate until that table exists on the target.\n"
+            for d in missing_deps
+        )
+
         if etype == "VIEW" and sql and not blocked:
             summary["views"] += 1
             sections.append(
                 f"-- ── VIEW {entity.full_name} "
                 f"{'─' * max(1, 60 - len(entity.full_name))}\n"
-                f"{warn_lines}"
+                f"{dep_lines}{warn_lines}"
                 f"CREATE OR REPLACE VIEW {quote_full_name(entity.full_name)} AS\n{sql.rstrip(';')};\n"
             )
         elif etype == "MATERIALIZED_VIEW":
             summary["mviews"] += 1
             body = f"\n-- CREATE OR REPLACE VIEW {quote_full_name(entity.full_name)} AS\n-- " + \
                 "\n-- ".join(sql.rstrip(";").splitlines()) + "\n" if sql and not blocked else "\n"
+            if target_engine == "athena":
+                mv_note = (
+                    "-- Athena cannot CREATE MATERIALIZED VIEW. Two options:\n"
+                    "--   a) plain view (recomputes per query) — uncomment below\n"
+                    "--   b) scheduled CTAS refresh (EventBridge/Airflow: CREATE TABLE AS + swap)\n"
+                )
+            else:
+                mv_note = (
+                    "-- Redshift supports native materialized views: replace the commented\n"
+                    "-- CREATE OR REPLACE VIEW below with CREATE MATERIALIZED VIEW ... AUTO\n"
+                    "-- REFRESH YES once the base tables are loaded (a plain view also works).\n"
+                )
             sections.append(
                 f"-- ── MATERIALIZED VIEW {entity.full_name} "
                 f"{'─' * max(1, 47 - len(entity.full_name))}\n"
-                f"-- Athena cannot CREATE MATERIALIZED VIEW. Two options:\n"
-                f"--   a) plain view (recomputes per query) — uncomment below\n"
-                f"--   b) scheduled CTAS refresh (EventBridge/Airflow: CREATE TABLE AS + swap)\n"
+                f"{dep_lines}{mv_note}"
                 f"{warn_lines}{body}"
             )
         elif etype == "ROUTINE" and sql and not blocked:
             summary["routines"] += 1
             body = "\n-- ".join(sql.rstrip(";").splitlines())
+            if target_engine == "athena":
+                routine_note = (
+                    "-- Athena has no CREATE FUNCTION for SQL UDFs — inline this translated\n"
+                    "-- body at call sites, or wrap it as an Athena Lambda UDF.\n"
+                )
+            else:
+                routine_note = (
+                    "-- Wrap this translated body in CREATE FUNCTION ... LANGUAGE SQL on\n"
+                    "-- Redshift (scalar SQL UDF), or inline it at call sites.\n"
+                )
             sections.append(
                 f"-- ── ROUTINE {entity.full_name} "
                 f"{'─' * max(1, 57 - len(entity.full_name))}\n"
-                f"-- Athena has no CREATE FUNCTION for SQL UDFs — inline this translated\n"
-                f"-- body at call sites, or wrap it as an Athena Lambda UDF.\n"
+                f"{routine_note}"
                 f"{warn_lines}"
                 f"-- {body}\n"
             )
@@ -154,6 +202,18 @@ def _write_rebuilt_entities_sql(
                 f"-- source SQL and rewrite guidance.\n"
             )
 
+    if target_engine == "athena":
+        exec_lines = (
+            "-- Dialect: Athena (Trino). Execute statements individually (Athena\n"
+            "-- accepts one per call), in the workgroup created by terraform.\n"
+        )
+    else:
+        exec_lines = (
+            "-- Dialect: Amazon Redshift Serverless (the recommended Query Engine).\n"
+            "-- Execute in Redshift (Query Editor v2 or any SQL client) AFTER the\n"
+            "-- external schemas over the migrated Iceberg tables exist — do NOT\n"
+            "-- run this file in the Athena workgroup; the SQL is Redshift dialect.\n"
+        )
     header = (
         "-- ═══════════════════════════════════════════════════════════════════\n"
         "-- REBUILT ENTITIES — views, materialized views, UDFs, procedures\n"
@@ -164,8 +224,8 @@ def _write_rebuilt_entities_sql(
         f"-- Contents: {summary['views']} runnable view(s), {summary['mviews']} materialized\n"
         f"-- view alternative(s), {summary['routines']} routine translation(s),\n"
         f"-- {summary['manual']} manual-rewrite item(s).\n"
-        "-- Execute statements individually (Athena accepts one per call), in the\n"
-        "-- workgroup created by terraform. Review every statement before running.\n"
+        f"{exec_lines}"
+        "-- Review every statement before running.\n"
         "-- ═══════════════════════════════════════════════════════════════════\n\n"
     )
     (mig_dir / "rebuilt_entities.sql").write_text(header + "\n".join(sections), encoding="utf-8")
@@ -198,6 +258,7 @@ def _write_plan_json(
             "storage_target": placement.target.value if placement else "iceberg",
             "ddl": ddl,
             "statements": dml.statements,
+            "validation_query": dml.validation_query,
             "estimated_scan_bytes": dml.estimated_scan_bytes,
             "shortcomings": [
                 {
@@ -409,11 +470,11 @@ def _write_migration_guide(
   The load runs as <strong>Phase 3</strong> of the orchestrator via the redshift-data API:
   <code>python run_migration.py --phase 3 --redshift-workgroup &lt;name&gt; --redshift-database &lt;db&gt;</code>
   (or as part of a plain <code>run_migration.py</code> run when those flags are set).
-  Alternatively, run <code>redshift_phase.sql</code> manually in Redshift (Query Editor v2
+  Alternatively, run <code>redshift_phase.sql</code> manually in Redshift Serverless (Query Editor v2
   or any SQL client). Either path creates the native tables and loads them via
   <code>INSERT INTO … SELECT</code> from the Iceberg external schema. Validate
   row counts, then drop the staging tables via Athena (commented commands included).</p>
-  <p><em>Trade-off:</em> RMS tables are queryable by Redshift only — they leave the
+  <p><em>Trade-off:</em> RMS tables are queryable by Redshift Serverless only — they leave the
   multi-engine storage layer. This is intentional per the per-entity recommendation.</p>
 </div>"""
 
@@ -680,13 +741,29 @@ terraform apply    # Deploy (creates: S3 buckets, Athena workgroup, BQ connector
   <p>This provisions:</p>
   <table>
     <tr><th>Resource</th><th>Purpose</th></tr>
-    <tr><td>Athena BigQuery Connector (Lambda)</td><td>Federates queries to BigQuery</td></tr>
+    <tr><td>Athena BigQuery Connector (Lambda)</td><td>Federates queries to BigQuery — one connector serves <strong>every dataset</strong> in the GCP project (the name carries the primary dataset only as a label)</td></tr>
     <tr><td>Athena Data Catalog (<code>{connector_display}</code>)</td><td>Routes SQL to the connector Lambda</td></tr>
     <tr><td>Athena Workgroup (<code>{workgroup_name}</code>)</td><td>Engine v3 — required for Iceberg DML</td></tr>
     <tr><td>S3 Tables Table Bucket</td><td>Managed Iceberg storage — automatic compaction, snapshot expiry, and unreferenced-file cleanup (no OPTIMIZE/VACUUM needed). run_migration.py sets the bucket's default storage class to Intelligent-Tiering before creating tables: cost-neutral now (Frequent Access bills at Standard rates); data unaccessed for 30/90 days automatically tiers down ~43%/~81%. Note: any read returns a file to the Frequent tier, and periodic full-table scans will re-heat cold partitions.</td></tr>
     <tr><td>S3 Results Bucket</td><td>Athena query results (auto-expires after 7 days)</td></tr>
     <tr><td>Namespace (<code>{glue_db_display}</code>)</td><td>Athena database inside the s3tablescatalog federated catalog</td></tr>
+    <tr><td>Lake Formation grants</td><td>CREATE_TABLE/DESCRIBE per namespace + table permissions for the migration operator — the s3tablescatalog federated catalog is <strong>always</strong> governed by Lake Formation; IAM alone is not enough</td></tr>
   </table>
+
+  <p><strong>Lake Formation prerequisites</strong> (skipping these fails every Phase 1
+  CREATE TABLE with <code>Insufficient Lake Formation permission(s)</code>):</p>
+  <ul>
+    <li>The identity running <code>terraform apply</code> must be able to grant Lake
+    Formation permissions. If the account has never used Lake Formation, add that
+    identity as a <em>Data lake administrator</em> first (Lake Formation console →
+    Administrative roles and tasks, or
+    <code>aws lakeformation put-data-lake-settings</code>). Without it the grants fail
+    with <code>Insufficient Glue permissions to access database</code>.</li>
+    <li>The grants default to the identity that runs terraform. If a <em>different</em>
+    role runs <code>run_migration.py</code> (the Step 3 pattern), set
+    <code>migration_operator_principal_arn</code> in <code>terraform.tfvars</code> to that
+    role's ARN so the Lake Formation grants land on the right principal.</li>
+  </ul>
 </div>
 
 <div class="step">
@@ -774,8 +851,8 @@ WHERE required_column IS NULL;</code></pre>
 
 <table>
   <tr><th>File</th><th>Purpose</th></tr>
-  <tr><td><code>plan.json</code></td><td>Structured migration plan — DDL + INSERT statements per table, storage target, shortcomings, post-optimization steps</td></tr>
-  {"<tr><td><code>redshift_phase.sql</code></td><td>Native CREATE TABLE + INSERT…SELECT for RMS-placed tables — run in Redshift after run_migration.py</td></tr>" if rms_names else ""}
+  <tr><td><code>plan.json</code></td><td>Structured migration plan — DDL + INSERT statements per table, storage target, shortcomings, post-optimization steps, and a per-table <code>validation_query</code> (source-vs-target row counts; the source COUNT federates to BigQuery and bills a scan — run once after the load)</td></tr>
+  {"<tr><td><code>redshift_phase.sql</code></td><td>Native CREATE TABLE + INSERT…SELECT for RMS-placed tables — run in Redshift Serverless after run_migration.py</td></tr>" if rms_names else ""}
   {"<tr><td><code>rebuilt_entities.sql</code></td><td>Translated CREATE VIEW statements + MV/UDF/procedure rewrite stubs — run after Phase 2</td></tr>" if rebuilt.get("written") else ""}
   <tr><td><code>run_migration.py</code></td><td>Python orchestrator — executes plan.json via boto3 Athena API</td></tr>
   <tr><td><code>requirements.txt</code></td><td>Python dependencies (<code>pip install -r requirements.txt</code>)</td></tr>
@@ -799,7 +876,7 @@ WHERE required_column IS NULL;</code></pre>
 _RUN_MIGRATION_TEMPLATE = '''#!/usr/bin/env python3
 """BigQuery to Iceberg migration orchestrator.
 
-Reads plan.json and executes the full migration in two phases:
+Reads plan.json and executes the migration in up to three phases:
   Phase 1: Create Iceberg target tables (DDL)
   Phase 2: Load data from BigQuery via federated INSERT statements
 
@@ -1027,6 +1104,12 @@ def rechunk_statements(client, statements, dry_run=False, workgroup=None):
         it = iter([str(current), str(window_end), str(current), str(window_end)])
         rewritten.append(_DATE_LITERAL.sub(lambda m: f"DATE '{next(it)}'", chunk_template))
         current = window_end
+    # Preserve the NULL-partition chunk (rows in BigQuery's __NULL__ partition
+    # match no date window) — the rebuild above regenerates date windows only.
+    rewritten.extend(
+        s for s in statements
+        if "IS NULL" in s and "DELETE FROM" in s and "INSERT INTO" in s
+    )
     return rewritten
 
 

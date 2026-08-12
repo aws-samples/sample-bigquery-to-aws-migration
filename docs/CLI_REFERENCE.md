@@ -17,7 +17,7 @@ pip install -e .
 bq-assess --gcp-project my-project --use-adc
 
 # With query logs (higher confidence)
-bq-assess --gcp-project my-project --use-adc --include-query-logs
+bq-assess --gcp-project my-project --use-adc
 
 # With exported query logs (no bigquery.jobs.listAll needed)
 bq-assess --gcp-project my-project --use-adc --query-logs path/to/logs.json
@@ -27,7 +27,6 @@ bq-assess \
   --gcp-project my-project \
   --use-adc \
   --datasets "prod_data,analytics" \
-  --include-query-logs \
   --query-log-days 60 \
   --format json,html,csv \
   --output reports/
@@ -47,7 +46,7 @@ bq-assess --config assessment-config.yaml
 | `--credentials` | Path to service account JSON | — |
 | `--use-adc` | Use Application Default Credentials | false |
 | `--datasets` | Comma-separated dataset filter | all datasets |
-| `--include-query-logs` | Analyze INFORMATION_SCHEMA.JOBS | false |
+| `--zip` | Write the exported bundle as bundle.zip (hand-off artifact) | false |
 | `--query-logs` | Path to exported query logs JSON | — |
 | `--query-log-days` | Query log lookback window in days (1-90) | 30 |
 | `--redshift-type` | Target Redshift node type (overrides auto-recommendation) | auto |
@@ -57,7 +56,7 @@ bq-assess --config assessment-config.yaml
 | `--interactive` | Interactive prompt mode | false |
 | `--config` | Path to YAML config file | — |
 
-Note: `--query-log-days` implies `--include-query-logs` automatically.
+Note: query-log analysis is always on; opt out with `--skip-workload` (no JOBS reads) or `--exclude-query-text` (no statements in the bundle).
 
 ## Output
 
@@ -71,6 +70,6 @@ Note: `--query-log-days` implies `--include-query-logs` automatically.
 
 Without query logs, the tool uses heuristics for DISTKEY/SORTKEY recommendations (LOW confidence).
 
-With `--include-query-logs`, it analyzes `INFORMATION_SCHEMA.JOBS` for JOIN patterns and hub tables (HIGH confidence). Requires `roles/bigquery.resourceViewer`.
+Query-log analysis (always on) analyzes `INFORMATION_SCHEMA.JOBS` for JOIN patterns and hub tables (HIGH confidence). Requires `roles/bigquery.resourceViewer`.
 
 Alternatively, `--query-logs <path>` accepts an exported JSON file — a JSON array of objects with at least a `"query"` field. This bypasses the API entirely.

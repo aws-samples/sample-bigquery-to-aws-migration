@@ -21,9 +21,11 @@ from bq_assess.core.disclaimer import (
     COST_NOT_QUOTE,
     DATA_HANDLING,
 )
+from bq_assess.core.query_attribution import TOP_QUERIES_PER_ENTITY
 from bq_assess.engine.redshift import cost_constants as k
 from bq_assess.models import Assessment
 from bq_assess.report._serialize import (
+    build_query_sample_chunks,
     build_report_rows,
     serialize_entities,
     serialize_landing,
@@ -95,7 +97,17 @@ def _format_savings(value, suffix="/mo"):
 
 
 def _format_savings_annual(value):
-    """Annual savings — same logic, /yr suffix."""
+    """Annual savings — same logic, /yr suffix.
+
+    Rounds to the nearest dollar BEFORE the 12× so the annual figure is
+    exactly 12× the displayed monthly (unrounded-delta artifact showed
+    $24,987/yr beside $2,082/mo — 12×2,082=24,984; 2026-08-04 audit). The
+    underlying annual is monthly×12, so value/12 recovers the monthly.
+    """
+    if value is None or isinstance(value, Undefined):
+        return "N/A"
+    if abs(value) >= 12.0:  # below this, whole-dollar rounding distorts more than it fixes
+        value = round(value / 12.0) * 12
     return _format_savings(value, suffix="/yr")
 
 
@@ -129,13 +141,57 @@ class HTMLWriter:
         self._env.filters["fmt_size"] = _format_size
         self._env.filters["fmt_size_split"] = _format_size_split
 
-    def write(self, assessment: Assessment, out_dir: str, storage_basis: str = "assumed") -> list[str]:
-        """Write a single combined HTML file; return list with its absolute path."""
+    def write(
+        self,
+        assessment: Assessment,
+        out_dir: str,
+        storage_basis: str = "assumed",
+        query_workloads: dict | None = None,
+    ) -> list[str]:
+        """Write a single combined HTML file; return list with its absolute path.
+
+        Args:
+            query_workloads: Optional dict of entity_name → {samples: [{query,
+                translated, ...}]} for the embedded query-sample chunks. Only the
+                TRANSLATED SAMPLES come from here — workload stats (count,
+                slot-hours, shapes) live on EntityReport.query_workload and flow
+                through the shared serializer to every writer.
+        """
         landing_data = serialize_landing(assessment)
         effort_entities, query_entities = serialize_entities(assessment)
+
+        query_sample_chunks: list[dict] = []
+        entity_to_chunk: dict[str, int] = {}
+        if query_workloads:
+            query_sample_chunks, entity_to_chunk = build_query_sample_chunks(
+                query_workloads
+            )
+
+        # query_workload is an EntityReport field, so the serialized dicts (and
+        # the JSON sidecars) already carry the stats. Here the has_workload JS
+        # flag and the entity's chunk index are added — on a shallow COPY:
+        # serialize_entities memoizes its output on the assessment and shares it
+        # with the JSON writer, so in-place edits would leak HTML-only keys into
+        # the JSON sidecars. Gate on query_count, not samples: robust to a
+        # workload carrying stats without embedded SQL (the row must still show
+        # the workload column). query_chunk lets the JS parse only the one chunk
+        # holding the expanded entity — walking/parsing all chunks on first
+        # expand blocked the UI at petabyte scale.
+        def _annotate(d: dict) -> dict:
+            if not (d.get("query_workload") or {}).get("query_count"):
+                return d
+            out = {**d, "has_workload": True}
+            chunk = entity_to_chunk.get(d["full_name"])
+            if chunk is not None:
+                out["query_chunk"] = chunk
+            return out
+
+        query_entities = [_annotate(d) for d in query_entities]
+
         report_rows, detail_chunks = build_report_rows(effort_entities, query_entities)
 
         rg_4xl = k.V7_RG_NODE_TYPES["rg.4xlarge"]
+        rg_xl = k.V7_RG_NODE_TYPES["rg.xlarge"]
         ri_1yr_discount = round(
             (1 - rg_4xl["ri_1yr_usd_per_node_hour"] / rg_4xl["ondemand_usd_per_node_hour"]) * 100
         )
@@ -168,13 +224,11 @@ class HTMLWriter:
                 "primary_engine", "redshift"
             )
 
-        # Server-side counts over SQL-owning entities (population REBUILT) so the
-        # Query Complexity stat cards are correct even without JavaScript — the
-        # cards default to the SQL-entity scope the table opens with (the JS
-        # syncQueryCards previously papered over wrong initial values).
+        # Server-side counts over entities in the default scope (REBUILT or has_workload)
+        # so the Query Complexity stat cards are correct even without JavaScript.
         sql_counts = {"PORTABLE": 0, "ADAPT": 0, "REWRITE": 0, "total": 0}
         for row in report_rows["query"]:
-            if row.get("population") != "REBUILT":
+            if row.get("population") != "REBUILT" and not row.get("has_workload"):
                 continue
             sql_counts["total"] += 1
             cat = (row.get("complexity") or {}).get("category")
@@ -185,8 +239,10 @@ class HTMLWriter:
             **landing_data,
             "report_rows": report_rows,
             "detail_chunks": detail_chunks,
+            "query_sample_chunks": query_sample_chunks,
             "sql_counts": sql_counts,
             "recommended_engine": recommended_engine,
+            "top_queries_per_entity": TOP_QUERIES_PER_ENTITY,
             "storage_basis": storage_basis,
             "csp_nonce": script_nonce,
             "disclaimer_paragraphs": [
@@ -208,6 +264,7 @@ class HTMLWriter:
                 "serverless_3yr_breakeven_pct": round(k.V1_SERVERLESS_3YR_BREAKEVEN_UTIL * 100),
                 "slot_to_rpu_ratio": k.V3_SLOT_TO_RPU_RATIO,
                 "rg_4xl_ondemand_hr": rg_4xl["ondemand_usd_per_node_hour"],
+                "rg_xl_ondemand_hr": rg_xl["ondemand_usd_per_node_hour"],
                 "ri_1yr_discount_pct": ri_1yr_discount,
                 "ri_3yr_discount_pct": ri_3yr_discount,
                 "hours_per_month": int(k.HOURS_PER_MONTH),

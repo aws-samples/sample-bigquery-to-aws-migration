@@ -91,7 +91,7 @@ def _known_assessment(
     return Assessment(
         assessment_id="assess-20260617-abc123",
         generated_at=datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc),
-        project_id="my-project",
+        project_id="example-project",
         summary=AssessmentSummary(
             total_entities=2,
             total_tables=1,
@@ -146,7 +146,7 @@ def test_html_renders_single_file():
     assert len(paths) == 1
     assert paths[0].endswith(".html")
     assert os.path.exists(paths[0])
-    assert os.path.basename(paths[0]) == "my-project-assessment.html"
+    assert os.path.basename(paths[0]) == "example-project-assessment.html"
 
 
 def test_html_contains_all_tabs():
@@ -867,6 +867,37 @@ def test_range_storage_line_renders_range_not_na():
     assert "$1,905" in cell and "$2,103" in cell
 
 
+def test_bq_breakdown_range_line_renders_range_not_na():
+    """BigQuery breakdown table handles range lines (Task 5: STANDARD capacity
+    compute is monthly=None, monthly_low/monthly_high set). Must render
+    '$730.13 – $1,554.19', not 'N/A'."""
+    import dataclasses
+    a = _known_assessment()
+    range_line = CostLine(
+        label="BigQuery STANDARD capacity (slot-month range)",
+        monthly=None,
+        monthly_low=730.13,
+        monthly_high=1554.19,
+        confidence=ConfidenceLevel.MEDIUM,
+        source_note="V4-STANDARD",
+    )
+    a.cost = dataclasses.replace(
+        a.cost,
+        bigquery_breakdown=[range_line],
+    )
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    # Find the BQ breakdown table section (not the cost-hero)
+    breakdown_start = html.index("BigQuery Cost Breakdown")
+    i = html.index("BigQuery STANDARD capacity", breakdown_start)
+    cell = html[i:i + 400]
+    assert "N/A" not in cell
+    # Check for both precise and rounded formats
+    assert ("$730.13" in cell and "$1,554.19" in cell) or ("$730" in cell and "$1,554" in cell)
+
+
 def test_negative_delta_never_labeled_savings():
     """A cost increase must not render as a green 'Savings' (sandbox validation:
     -$356/mo rendered '+$355.59/mo' under 'Monthly Savings')."""
@@ -900,3 +931,172 @@ def test_straddling_delta_range_shows_both_bounds():
     assert "Monthly Cost vs BigQuery" in html
     assert "worst case" in html
     assert "Save $2,082/mo" in html
+
+
+# --- Query workload flow (2026-08-03 review fixes) ---------------------------
+
+
+def _workload_assessment():
+    a = _known_assessment()
+    a.entities[0].query_workload = {
+        "query_count": 42, "total_slot_ms": 7_200_000, "slot_hours": 2.0,
+        "num_shapes": 30, "statement_types": {"SELECT": 42},
+    }
+    return a
+
+
+def test_html_workload_column_without_samples():
+    """Entities past the sample cap (stats, no embedded SQL) must still get
+    has_workload and their stats in the row payload."""
+    a = _workload_assessment()
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)  # note: NO query_workloads kwarg at all
+    with open(paths[0]) as f:
+        html = f.read()
+    assert '"has_workload": true' in html or '"has_workload":true' in html
+    assert '"num_shapes": 30' in html or '"num_shapes":30' in html
+
+
+def test_html_workload_samples_embedded():
+    """The query_workloads kwarg path: translated samples land in query-chunks."""
+    a = _workload_assessment()
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out, query_workloads={
+        "ds.orders": {
+            "samples": [{
+                "query": "SELECT * FROM `p.ds.orders`",
+                "translated": "SELECT * FROM ds.orders",
+                "statement_type": "SELECT",
+                "total_slot_ms": 3_600_000,
+            }],
+        },
+    })
+    with open(paths[0]) as f:
+        html = f.read()
+    assert "query-chunk" in html
+    assert "SELECT * FROM ds.orders" in html
+
+
+def test_html_write_does_not_pollute_shared_serialization():
+    """serialize_entities memoizes on the assessment and is shared with the
+    JSON writer — HTMLWriter must not leak has_workload into those dicts."""
+    from bq_assess.report._serialize import serialize_entities
+
+    a = _workload_assessment()
+    out = tempfile.mkdtemp()
+    HTMLWriter().write(a, out)
+    _, query_entities = serialize_entities(a)  # memoized instance
+    for d in query_entities:
+        assert "has_workload" not in d, (
+            "HTML-only key leaked into the shared serialized dicts (would "
+            "pollute JSON sidecars on html-before-json write order)"
+        )
+    # but the model field itself IS there for every writer
+    orders = next(d for d in query_entities if d["full_name"] == "ds.orders")
+    assert orders["query_workload"]["query_count"] == 42
+
+
+def test_html_query_chunk_index_on_rows():
+    """Each workload row carries query_chunk so JS parses only that chunk —
+    walking all chunks on first expand blocked the UI at petabyte scale."""
+    a = _workload_assessment()
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out, query_workloads={
+        "ds.orders": {
+            "samples": [{
+                "query": "SELECT 1", "translated": "SELECT 1",
+                "statement_type": "SELECT", "total_slot_ms": 1000,
+            }],
+        },
+    })
+    with open(paths[0]) as f:
+        html = f.read()
+    assert '"query_chunk": 0' in html or '"query_chunk":0' in html
+    # JS uses the index, not a scan
+    assert "e.query_chunk" in html
+
+
+# --- Unavailable BQ cost handling ---
+
+
+def test_unavailable_bq_cost_suppresses_comparison_and_savings():
+    """When BQ cost is unavailable, the Cost Comparison section is replaced with
+    a cause-specific notice; savings tiles and BQ-hero do not render, but AWS
+    Deployment Options and AWS Cost Breakdown remain visible (workload-based)."""
+    import dataclasses
+
+    from bq_assess.models import AWSScenario
+    a = _known_assessment()
+    # Add a storage line to bigquery_breakdown
+    storage_line = CostLine(
+        label="BigQuery Active Storage",
+        monthly=1250.0,
+        monthly_low=None,
+        monthly_high=None,
+        confidence=ConfidenceLevel.HIGH,
+        source_note="V2",
+    )
+    # Add AWS scenarios to ensure AWS Deployment Options renders
+    aws_scenario = AWSScenario(
+        label="Redshift Serverless",
+        category="SERVERLESS",
+        lines=[
+            CostLine(
+                label="Redshift Serverless compute",
+                monthly=15000.0,
+                monthly_low=None,
+                monthly_high=None,
+                confidence=ConfidenceLevel.HIGH,
+                source_note="V3",
+            )
+        ],
+        monthly_total=15050.0,
+        confidence=ConfidenceLevel.HIGH,
+        is_recommended=True,
+        justification="Your workload scans 15.5 TB/month.",
+    )
+    a.cost = dataclasses.replace(
+        a.cost,
+        bq_cost_available=False,
+        bq_cost_basis="unavailable",
+        bq_cost_unavailable_reason=(
+            "This Source uses BigQuery ENTERPRISE capacity pricing, but this bundle "
+            "was produced by an older collector that cannot extract slot assignments."
+        ),
+        bigquery_monthly=0.0,
+        monthly_delta_low=0.0,
+        monthly_delta_high=0.0,
+        annual_savings_low=0.0,
+        annual_savings_high=0.0,
+        bigquery_breakdown=[storage_line],
+        aws_scenarios=[aws_scenario],
+    )
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    # Savings content must NOT render
+    assert "Save $" not in html
+    assert "cheaper than BQ" not in html
+    assert "BigQuery (Current)" not in html
+    # The notice renders with the unavailable reason
+    assert "ENTERPRISE capacity pricing" in html
+    assert "older collector" in html
+    # The notice includes storage reference if available
+    assert "storage alone" in html
+    # AWS Deployment Options and AWS Cost Breakdown remain visible (workload-based)
+    assert "AWS Deployment Options" in html
+    assert "Redshift Serverless" in html
+    assert "AWS Cost Breakdown" in html
+
+
+def test_customer_provided_basis_labels_the_bq_side():
+    """When bq_cost_basis='customer_provided', the BQ hero label says so."""
+    import dataclasses
+    a = _known_assessment()
+    a.cost = dataclasses.replace(a.cost, bq_cost_basis="customer_provided")
+    out = tempfile.mkdtemp()
+    paths = HTMLWriter().write(a, out)
+    with open(paths[0]) as f:
+        html = f.read()
+    assert "customer-provided" in html.lower()

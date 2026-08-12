@@ -1,7 +1,7 @@
 """Unit tests for the BQ→Redshift translation pipeline (rewrite.py, 2026-07-16 rework).
 
 Covers the regression cases named in the design review
-(the 2026-07-16 translation deep-audit notes):
+(2026-07-16 translation deep-audit):
 temporal AST rewrites to a fixpoint, the string-literal offset guard,
 AST-based residual detection (no string-literal false positives),
 idempotency, multi-statement isolation, and the confidence taxonomy.
@@ -248,3 +248,41 @@ class TestStringLiteralNoCorruption:
         r = guide.translate("SELECT 'call TIMESTAMPDIFF(a, b, DAY)' AS help FROM t")
         assert "TIMESTAMPDIFF(a, b, DAY)" in r.redshift_sql
         assert r.confidence == "HIGH"
+
+
+class TestProjectQualifierStripping:
+    """2026-08-04 audit: every shipped rebuilt view kept its 3-part BigQuery
+    project qualifier ('pdp22--playa--data--prd'.standardized.t) — a catalog
+    that does not exist on the target. The translator must strip it."""
+
+    def test_backticked_three_part_ref_stripped(self):
+        guide = RewriteGuide()
+        r = guide.translate(
+            "SELECT * FROM `my-proj.standardized.inf_game_rounds` WHERE x > 1"
+        )
+        assert "my-proj" not in r.redshift_sql
+        assert '"standardized"."inf_game_rounds"' in r.redshift_sql
+        # mechanical normalization — no warning, confidence unaffected
+        assert r.confidence == "HIGH"
+
+    def test_two_part_ref_untouched(self):
+        guide = RewriteGuide()
+        r = guide.translate("SELECT * FROM ds.t")
+        assert "ds.t" in r.redshift_sql
+        assert r.confidence == "HIGH"
+
+
+class TestTimestampAddSub:
+    """2026-08-04 audit: sqlglot passes TIMESTAMP_SUB through verbatim
+    ('TIMESTAMP_SUB(GETDATE(), '1', HOUR)' — invalid Redshift, unflagged)."""
+
+    def test_timestamp_sub_becomes_negative_dateadd(self):
+        r = RewriteGuide().translate(
+            "SELECT TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"
+        )
+        assert "DATEADD(HOUR, -1, GETDATE())" in r.redshift_sql
+        assert "TIMESTAMP_SUB" not in r.redshift_sql
+
+    def test_timestamp_add_becomes_dateadd(self):
+        r = RewriteGuide().translate("SELECT TIMESTAMP_ADD(ts, INTERVAL 2 DAY)")
+        assert "DATEADD(DAY, 2, ts)" in r.redshift_sql

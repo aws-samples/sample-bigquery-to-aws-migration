@@ -153,6 +153,8 @@ class BundleWriter:
             "regions": bundle.regions,
             "entity_count": len(bundle.entities),
             "storage_basis": bundle.storage_basis,
+            "egress_sessions": bundle.egress_sessions,
+            "egress_gib": bundle.egress_gib,
             # Ratio the fallback physical_bytes were baked at — lets the loader
             # detect (and re-derive past) a stale ratio in "assumed" bundles.
             "assumed_physical_ratio": ASSUMED_PHYSICAL_RATIO,
@@ -187,3 +189,30 @@ class BundleWriter:
             json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
         return sha256_file(path)
 
+
+
+def zip_bundle_dir(bundle_dir: str, zip_path: str | None = None,
+                   root_name: str | None = None) -> str:
+    """Zip a bundle directory; return the zip path (shared by both CLIs).
+
+    Entries are rooted at <root_name>/bundle/* so unzipping never spills into
+    cwd and BundleLoader's recursive manifest search resolves the layout.
+    Defaults produce bq-collect's hand-off shape: <parent>.zip rooted at the
+    parent folder name (bundle-<project>.zip → bundle-<project>/bundle/*).
+    bq-assess overrides zip_path/root_name to keep the zip inside its project
+    folder (<project>/bundle.zip → bundle/*; pass root_name="").
+    """
+    import zipfile
+
+    parent = os.path.dirname(os.path.abspath(bundle_dir))
+    if root_name is None:
+        root_name = os.path.basename(parent)
+    zip_path = zip_path or parent + ".zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, _dirs, files in os.walk(bundle_dir):
+            for fname in sorted(files):
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, bundle_dir)
+                arc = os.path.join(root_name, "bundle", rel) if root_name else os.path.join("bundle", rel)
+                zf.write(full, arc)
+    return zip_path

@@ -106,10 +106,10 @@ def test_axis_banners_present_on_both_tabs():
 
 
 def test_query_tab_defaults_to_sql_entities():
-    """Query Complexity table defaults to SQL-owning entities (REBUILT population)
-    with a show-all toggle; stat cards resync with the active scope."""
+    """Query Complexity table defaults to SQL-owning entities (REBUILT population
+    or has_workload) with a show-all toggle; stat cards resync with the active scope."""
     raw = (TEMPLATES / "combined.html.j2").read_text()
-    assert "function ownsSql(e) { return e.population === 'REBUILT'; }" in raw
+    assert "function ownsSql(e) { return e.population === 'REBUILT' || e.has_workload; }" in raw
     assert "baseFilter: ownsSql" in raw
     assert 'id="query-show-all"' in raw
     assert "syncQueryCards" in raw
@@ -136,3 +136,94 @@ def test_intelligent_tiering_storage_table():
     assert "millisecond" in raw                       # the latency claim
     assert "access proxy" in raw or "access history" in raw  # honesty caveat
     assert "re-heat" in raw or "back to Frequent" in raw
+
+
+def test_landing_donut_scoped_to_sql_entities():
+    """The landing Query Complexity donut must use the same scope as the tab
+    it summarizes (SQL-owning entities), not all-entity complexity_counts —
+    pdp22 showed 68 Adapt of 208 on the donut vs 7 of 7 on the tab
+    (2026-08-03 sandbox review)."""
+    raw = (TEMPLATES / "combined.html.j2").read_text()
+    donut_block = raw[raw.index('charts.donut("Query Complexity'):]
+    donut_block = donut_block[:donut_block.index("]) }}")]
+    assert "sql_counts" in donut_block
+    assert "summary.complexity_counts" not in donut_block
+
+
+def _render_donut(segments):
+    from jinja2 import Environment, FileSystemLoader
+    env = Environment(loader=FileSystemLoader(str(TEMPLATES)), autoescape=True)
+    tmpl = env.from_string(
+        '{% import "_donut.j2" as charts %}{{ charts.donut("T", segments) }}'
+    )
+    return tmpl.render(segments=segments)
+
+
+def _donut_center(html: str) -> str:
+    """Extract the center value+label ('100% Adapt') from rendered donut HTML."""
+    import re
+    m = re.search(
+        r'donut__center-value">([^<]+)</span>\s*'
+        r'<span class="donut__center-label">([^<]+)</span>',
+        html,
+    )
+    assert m, "donut center markup not found"
+    return f"{m.group(1)} {m.group(2)}"
+
+
+def test_donut_center_shows_dominant_segment():
+    """Center headline must be the biggest slice, not blindly segments[0] —
+    an all-Adapt estate rendered '0% Portable' inside an all-amber ring
+    (2026-08-03 sandbox review)."""
+    html = _render_donut([
+        {"label": "Portable", "count": 0, "color": "green"},
+        {"label": "Adapt", "count": 7, "color": "amber"},
+        {"label": "Rewrite", "count": 0, "color": "red"},
+    ])
+    assert _donut_center(html) == "100% Adapt"
+
+
+def test_donut_center_tie_prefers_earlier_segment():
+    """50/50 split: the earlier (better-news) segment wins the headline."""
+    html = _render_donut([
+        {"label": "Portable", "count": 1, "color": "green"},
+        {"label": "Adapt", "count": 1, "color": "amber"},
+        {"label": "Rewrite", "count": 0, "color": "red"},
+    ])
+    assert _donut_center(html) == "50% Portable"
+
+
+def test_donut_center_majority_portable_unchanged():
+    html = _render_donut([
+        {"label": "Portable", "count": 140, "color": "green"},
+        {"label": "Adapt", "count": 68, "color": "amber"},
+        {"label": "Rewrite", "count": 0, "color": "red"},
+    ])
+    assert _donut_center(html) == "67% Portable"
+
+
+def test_workload_summary_single_formatter():
+    """2026-08-04 review: five hand-built workload phrasings had drifted into
+    three terms for num_shapes. ONE formatter (wlSummary) must be the only
+    producer, and the terminology is 'distinct statements' everywhere."""
+    from pathlib import Path
+    src = Path("src/bq_assess/report/templates/combined.html.j2").read_text()
+    assert "function wlSummary(wl)" in src
+    # every consumer goes through the formatter
+    assert src.count("wlSummary(e.query_workload)") >= 2
+    # no stray hand-built phrasings left
+    assert "' unique)" not in src
+    assert "query shapes" not in src
+    # nested access pin: a rename of these keys must fail the suite
+    assert "wl.query_count" in src and "wl.num_shapes" in src and "wl.slot_hours" in src
+    # counts are locale-formatted like sibling columns
+    assert "function fmtCount(n) { return Number(n).toLocaleString('en-US'); }" in src
+
+
+def test_workload_summary_conditional_parenthetical():
+    """'1 queries (1 unique)' regression: the parenthetical renders only when
+    dedup collapsed something, and 'query' pluralizes."""
+    from pathlib import Path
+    src = Path("src/bq_assess/report/templates/combined.html.j2").read_text()
+    assert "ns !== q" in src          # parenthetical gated on shapes != executions
+    assert "q === 1 ? ' query' : ' queries'" in src

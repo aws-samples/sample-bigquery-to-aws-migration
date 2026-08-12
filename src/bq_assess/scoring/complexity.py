@@ -46,6 +46,7 @@ class ComplexityScorer:
         relationships=None,
         has_logs: bool = False,
         dep_counts: dict[str, int] | None = None,
+        has_attributed_queries: bool = False,
     ) -> ComplexityResult:
         """Score query complexity based on detected constructs."""
         points = 0
@@ -83,17 +84,23 @@ class ComplexityScorer:
         else:
             category = ComplexityCategory.REWRITE
 
-        # Confidence ladder. Query logs corroborate an entity's own SQL surface —
-        # they are NOT attributed per-entity (workload-level analysis is a separate
-        # feature), so logs alone cannot raise a no-surface entity above LOW.
-        # (R11.4 as amended 2026-07-30; previously has_logs marked every entity
-        # HIGH, overstating confidence for plain tables.)
+        # Confidence ladder. Query logs corroborate an entity's own SQL surface;
+        # project-wide logs alone cannot raise a no-surface entity above LOW —
+        # but PER-ENTITY attributed queries are that entity's real observed SQL
+        # surface: a table whose production queries were analyzed is not
+        # "schema only" (2026-08-04: every actively-queried table showed
+        # LOW CONFIDENCE / schema-only beside its own analyzed queries).
         has_surface = bool(
             entity.view_query or entity.mview_query or
             (entity.routine and entity.routine.body)
         )
         if has_logs and has_surface:
             confidence = ConfidenceLevel.HIGH
+            confidence_source = ConfidenceSource.QUERY_LOGS
+        elif has_attributed_queries:
+            # Observed production queries hitting this specific entity —
+            # MEDIUM: real SQL evidence, but only what the log window captured.
+            confidence = ConfidenceLevel.MEDIUM
             confidence_source = ConfidenceSource.QUERY_LOGS
         elif has_surface:
             confidence = ConfidenceLevel.MEDIUM

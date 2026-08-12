@@ -30,20 +30,51 @@ _PLAIN_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_$]*\Z")
 # 2026-07-17). Anything appearing here should also be reported upstream.
 _KEYWORD_SUPPLEMENT = frozenset({"encrypt"})
 
+# Athena DDL reserved words (Hive grammar) — the full list from the Athena
+# "Reserved keywords" doc page (DDL table). Delegating to sqlglot's REDSHIFT
+# dialect missed these: Redshift does not reserve DATE/TIME/PRECISION etc., so
+# `date date` passed unquoted and failed CREATE TABLE on a live workgroup
+# (2026-08-04 audit: 52 tables across three real estates). Over-quoting is safe
+# in both contexts — these render backticked in DDL and double-quoted in DML,
+# and a quoted lowercase identifier is always valid.
+_ATHENA_DDL_RESERVED = frozenset({
+    "all", "alter", "and", "array", "as", "authorization", "between", "bigint",
+    "binary", "boolean", "both", "by", "cache", "case", "cast", "char",
+    "column", "commit", "conf", "constraint", "create", "cross", "cube",
+    "current", "current_date", "current_timestamp", "cursor", "database",
+    "date", "dayofweek", "decimal", "delete", "describe", "distinct", "double",
+    "drop", "else", "end", "exchange", "exists", "extended", "external",
+    "extract", "false", "fetch", "float", "floor", "following", "for",
+    "foreign", "from", "full", "function", "grant", "group", "grouping",
+    "having", "if", "import", "in", "inner", "insert", "int", "integer",
+    "intersect", "interval", "into", "is", "join", "lateral", "left", "less",
+    "like", "local", "macro", "map", "more", "none", "not", "null", "numeric",
+    "of", "on", "only", "or", "order", "out", "outer", "over", "partialscan",
+    "partition", "percent", "preceding", "precision", "preserve", "primary",
+    "procedure", "range", "reads", "reduce", "references", "regexp", "revoke",
+    "right", "rlike", "rollback", "rollup", "row", "rows", "select", "set",
+    "smallint", "start", "table", "tablesample", "then", "time", "timestamp",
+    "to", "transform", "trigger", "true", "truncate", "unbounded", "union",
+    "uniquejoin", "update", "user", "using", "utc_timestamp", "values",
+    "varchar", "views", "when", "where", "window", "with",
+})
+
 
 def _needs_quoting(name: str) -> bool:
     """Return True if the identifier requires quoting in either dialect.
 
     Checks: (1) non-standard characters, (2) local keyword supplement,
-    (3) sqlglot's Redshift reserved word list (shared with Athena for safety —
-    both engines overlap heavily on ANSI SQL reserved words).
+    (3) the Athena DDL (Hive) reserved list, (4) sqlglot's Redshift reserved
+    word list. The UNION of (3)+(4) is required: each engine reserves words the
+    other doesn't (Athena: date/time/precision; Redshift: encrypt/…), and the
+    same detection feeds both quoting contexts.
     """
     if _PLAIN_IDENTIFIER.match(name) is None:
         return True
-    if name.lower() in _KEYWORD_SUPPLEMENT:
+    if name.lower() in _KEYWORD_SUPPLEMENT or name.lower() in _ATHENA_DDL_RESERVED:
         return True
-    # Check sqlglot's Redshift dialect reserved words — if sqlglot would quote
-    # it for Redshift, it needs quoting for Athena too (superset is safe).
+    # sqlglot's Redshift dialect reserved words — if sqlglot would quote it
+    # for Redshift, quote it everywhere (over-quoting is always valid).
     ident = exp.to_identifier(name, quoted=None)
     rendered = ident.sql(dialect="redshift")
     return rendered.startswith('"')
