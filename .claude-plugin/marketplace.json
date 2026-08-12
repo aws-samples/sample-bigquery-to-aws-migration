@@ -8,7 +8,7 @@
     {
       "name": "bq-assess",
       "source": "./",
-      "version": "0.6.0",
+      "version": "0.8.0",
       "description": "Read-only BigQuery migration assessment: per-table Migration Effort and Query Complexity scoring, Iceberg DDL, engine recommendation (Athena vs Redshift), and a BigQuery-vs-AWS cost comparison — as a Python CLI plus a guided Claude Code skill."
     }
   ]
