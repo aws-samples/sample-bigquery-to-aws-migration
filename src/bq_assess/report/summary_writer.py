@@ -48,6 +48,13 @@ def _project_row(a: Assessment) -> dict:
         if comp is None:
             continue
         cat = getattr(comp.category, "value", comp.category)
+        # A translation BLOCKER (e.g. JS UDF — manual rewrite required) IS a
+        # rewrite regardless of the complexity score: the fleet headline said
+        # "0 need rewrite" while the project's own rebuilt_entities.sql shipped
+        # a MANUAL REWRITE stub (2026-08-04 audit).
+        tr = getattr(e, "translated_sql", None)
+        if tr is not None and any("BLOCKER" in w for w in (tr.warnings or [])):
+            cat = "REWRITE"
         if cat in sql_complexity:
             sql_complexity[cat] += 1
 
@@ -56,10 +63,18 @@ def _project_row(a: Assessment) -> dict:
     # annual_saving_high is kept so a range that straddles zero (worst case
     # costs more, steady state saves — the Intelligent-Tiering spread) renders
     # as a range instead of a bare "(higher)" verdict (2026-07-31 sandbox validation).
-    bq_monthly = a.cost.bigquery_monthly
-    aws_monthly = a.cost.aws_monthly_high
-    annual_saving = a.cost.annual_savings_low
-    annual_saving_high = a.cost.annual_savings_high
+    # When BQ cost is unavailable (2026-08-10), render None so the fleet table
+    # shows "—" and _key_takeaways excludes it from savings aggregates.
+    if a.cost.bq_cost_available:
+        bq_monthly = a.cost.bigquery_monthly
+        aws_monthly = a.cost.aws_monthly_high
+        annual_saving = a.cost.annual_savings_low
+        annual_saving_high = a.cost.annual_savings_high
+    else:
+        bq_monthly = None
+        aws_monthly = None
+        annual_saving = None
+        annual_saving_high = None
 
     if a.cost.recommendation and a.cost.recommendation.recommended_scenario:
         recommendation = a.cost.recommendation.recommended_scenario
@@ -76,6 +91,7 @@ def _project_row(a: Assessment) -> dict:
         "auto_pct": auto_pct,
         "auto_count": auto,
         "scored_count": scored,
+        "bq_cost_available": a.cost.bq_cost_available,
         "bq_monthly": bq_monthly,
         "aws_monthly": aws_monthly,
         "annual_saving": annual_saving,
@@ -90,15 +106,17 @@ def _project_row(a: Assessment) -> dict:
 def _key_takeaways(rows: list[dict]) -> list[str]:
     """Auto-generate the takeaway bullets from the aggregate numbers."""
     takeaways: list[str] = []
-    saving_rows = [r for r in rows if r["annual_saving"] > 0]
+    # Exclude projects with unavailable BQ cost (annual_saving is None) from
+    # all savings-related aggregates (2026-08-10 capacity-pricing-honesty).
+    saving_rows = [r for r in rows if r["annual_saving"] is not None and r["annual_saving"] > 0]
     if len(rows) > 1:
         takeaways.append(
             f"{len(saving_rows)} of {len(rows)} projects save money on AWS."
         )
-    neutral = [r for r in rows if r["annual_saving"] <= 0]
+    neutral = [r for r in rows if r["annual_saving"] is not None and r["annual_saving"] <= 0]
     for r in neutral:
         high = r.get("annual_saving_high", r["annual_saving"])
-        if high > 0:
+        if high is not None and high > 0:
             takeaways.append(
                 f"{r['project_id']} ranges from {_fmt_money(abs(r['annual_saving']))}/yr "
                 f"higher (worst case, all storage hot) to {_fmt_money(high)}/yr saved at "
@@ -115,11 +133,15 @@ def _key_takeaways(rows: list[dict]) -> list[str]:
             f"{best['project_id']} delivers the largest annual saving "
             f"({_fmt_money(best['annual_saving'])}/yr) — {best['recommendation']}."
         )
+    # ONE "most manual" bullet — the actual minimum. Emitting it for every
+    # project under 80% produced two projects both claimed as "the most manual"
+    # in one summary (2026-08-04 audit).
     low_auto = [r for r in rows if r["scored_count"] and r["auto_pct"] < 80]
-    for r in low_auto:
+    if low_auto:
+        worst = min(low_auto, key=lambda r: r["auto_pct"])
         takeaways.append(
-            f"{r['project_id']} has the most manual migration surface "
-            f"({r['auto_pct']:.0f}% auto) — budget engineering time accordingly."
+            f"{worst['project_id']} has the most manual migration surface "
+            f"({worst['auto_pct']:.0f}% auto) — budget engineering time accordingly."
         )
     return takeaways
 
@@ -131,9 +153,11 @@ def write_summary(assessments: Sequence[Assessment], output_dir: str) -> str:
     total_tables = sum(r["tables"] for r in rows)
     total_entities = sum(r["entities"] for r in rows)
     total_size_gb = sum(r["size_gb"] for r in rows)
-    total_annual_saving = sum(r["annual_saving"] for r in rows)
-    total_bq_monthly = sum(r["bq_monthly"] for r in rows)
-    total_aws_monthly = sum(r["aws_monthly"] for r in rows)
+    # Exclude projects with unavailable BQ cost (None values) from cost aggregates
+    # (2026-08-10 capacity-pricing-honesty).
+    total_annual_saving = sum(r["annual_saving"] for r in rows if r["annual_saving"] is not None)
+    total_bq_monthly = sum(r["bq_monthly"] for r in rows if r["bq_monthly"] is not None)
+    total_aws_monthly = sum(r["aws_monthly"] for r in rows if r["aws_monthly"] is not None)
 
     total_auto = sum(r["auto_count"] for r in rows)
     total_scored = sum(r["scored_count"] for r in rows)
@@ -150,29 +174,40 @@ def write_summary(assessments: Sequence[Assessment], output_dir: str) -> str:
     generated = datetime.now(timezone.utc)
 
     table_rows_html = ""
-    for r in sorted(rows, key=lambda r: r["annual_saving"], reverse=True):
+    # Sort by annual_saving, but put None values at the end
+    for r in sorted(rows, key=lambda r: (r["annual_saving"] is None, -(r["annual_saving"] or 0))):
         high = r.get("annual_saving_high", r["annual_saving"])
-        if r["annual_saving"] > 0:
-            saving_html = f'<span class="pos">{_fmt_money(r["annual_saving"])}</span>'
-        elif r["annual_saving"] < 0 and high > 0:
-            # Range straddles zero: worst case costs more, steady state saves.
-            saving_html = (
-                f'<span class="neg">{_fmt_money(abs(r["annual_saving"]))} higher</span>'
-                f' <span class="neutral">to</span> '
-                f'<span class="pos">{_fmt_money(high)} saved</span>'
-            )
-        elif r["annual_saving"] < 0:
-            saving_html = f'<span class="neg">+{_fmt_money(abs(r["annual_saving"]))} (higher)</span>'
-        else:
+
+        # When BQ cost is unavailable, render dashes in cost columns (2026-08-10).
+        if r["annual_saving"] is None:
+            bq_cost_html = '<span class="neutral">—</span>'
+            aws_cost_html = '<span class="neutral">—</span>'
             saving_html = '<span class="neutral">—</span>'
+        else:
+            bq_cost_html = f'${r["bq_monthly"]:,.0f}/mo'
+            aws_cost_html = f'${r["aws_monthly"]:,.0f}/mo'
+            if r["annual_saving"] > 0:
+                saving_html = f'<span class="pos">{_fmt_money(r["annual_saving"])}</span>'
+            elif r["annual_saving"] < 0 and high is not None and high > 0:
+                # Range straddles zero: worst case costs more, steady state saves.
+                saving_html = (
+                    f'<span class="neg">{_fmt_money(abs(r["annual_saving"]))} higher</span>'
+                    f' <span class="neutral">to</span> '
+                    f'<span class="pos">{_fmt_money(high)} saved</span>'
+                )
+            elif r["annual_saving"] < 0:
+                saving_html = f'<span class="neg">+{_fmt_money(abs(r["annual_saving"]))} (higher)</span>'
+            else:
+                saving_html = '<span class="neutral">—</span>'
+
         table_rows_html += f"""
       <tr>
         <td><a href="{r['report_href']}">{r['project_id']}</a></td>
         <td>{r['tables']:,}</td>
         <td>{_fmt_size(r['size_gb'])}</td>
         <td>{r['auto_pct']:.1f}%</td>
-        <td>${r['bq_monthly']:,.0f}/mo</td>
-        <td>${r['aws_monthly']:,.0f}/mo</td>
+        <td>{bq_cost_html}</td>
+        <td>{aws_cost_html}</td>
         <td>{saving_html}</td>
         <td>{r['recommendation']}</td>
       </tr>"""
@@ -326,7 +361,7 @@ def write_summary(assessments: Sequence[Assessment], output_dir: str) -> str:
   </div>
   <div class="stat-card">
     <div class="value">{auto_pct:.1f}%</div>
-    <div class="label">entities auto-migrate</div>
+    <div class="label">tables auto-migrate</div>
     <div class="detail">{total_auto:,} of {total_scored:,} auto-migrate</div>
   </div>
   <div class="stat-card">

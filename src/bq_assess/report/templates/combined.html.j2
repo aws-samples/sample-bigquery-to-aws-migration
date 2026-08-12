@@ -126,10 +126,15 @@
       {"label": "Assisted", "count": summary.effort_counts.ASSISTED or 0, "color": "amber"},
       {"label": "Manual", "count": summary.effort_counts.MANUAL or 0, "color": "red"},
     ]) }}
-    {{ charts.donut("Query Complexity", [
-      {"label": "Portable", "count": summary.complexity_counts.PORTABLE or 0, "color": "green"},
-      {"label": "Adapt", "count": summary.complexity_counts.ADAPT or 0, "color": "amber"},
-      {"label": "Rewrite", "count": summary.complexity_counts.REWRITE or 0, "color": "red"},
+    {# Scoped to SQL-owning entities (population REBUILT) — the same counts the
+       Query Complexity tab shows. summary.complexity_counts spans ALL entities
+       (plain tables can score ADAPT via the hub-entity bonus), which made the
+       landing donut disagree with the tab it summarizes (2026-08-03 sandbox validation
+       review: donut said 68 Adapt / 208, tab said 7 of 7). #}
+    {{ charts.donut("Query Complexity (SQL entities)", [
+      {"label": "Portable", "count": sql_counts.PORTABLE, "color": "green"},
+      {"label": "Adapt", "count": sql_counts.ADAPT, "color": "amber"},
+      {"label": "Rewrite", "count": sql_counts.REWRITE, "color": "red"},
     ]) }}
   </div>
 </div>
@@ -159,10 +164,42 @@
     </div>
   </div>
   {% else %}
+  {# Available or unavailable: both render AWS content (workload-based, valid either way) #}
+
+  {% if not cost.bq_cost_available %}
+  {# BigQuery cost unavailable — suppress comparison, render cause-specific notice #}
+  <div class="card" style="border-left: 4px solid var(--color-severity-warning); margin-bottom: var(--space-md);">
+    <div class="card-body">
+      <p style="margin:0 0 .5rem 0;font-weight:600">BigQuery cost could not be estimated for this Source.</p>
+      <p style="margin:0 0 .5rem 0;font-size:.8125rem;color:var(--color-text-secondary)">
+        {{ cost.bq_cost_unavailable_reason }}
+      </p>
+      {% set storage_line = namespace(found=None) %}
+      {% for ln in cost.bigquery_breakdown %}
+        {% if "storage" in ln.label|lower %}
+          {% set storage_line.found = ln %}
+        {% endif %}
+      {% endfor %}
+      {% if storage_line.found and storage_line.found.monthly %}
+      <p style="margin:0 0 .5rem 0;font-size:.8125rem;color:var(--color-text-muted)">
+        For reference, storage alone is approximately {{ storage_line.found.monthly|currency_precise }}/mo — compute could not be determined, so this is <em>not</em> the bill and no AWS savings comparison is shown.
+      </p>
+      {% endif %}
+      <p style="margin:0;font-size:.8125rem;color:var(--color-text-muted)">
+        Migration Effort and Query Complexity below are unaffected — they are derived from schema and query analysis, not billing.
+      </p>
+    </div>
+  </div>
+  {% else %}
+  {# BQ cost available: render cost-hero + savings tiles #}
   <div class="cost-hero">
     <div class="cost-hero__block">
-      <div class="cost-hero__label">BigQuery (Current)</div>
-      <div class="cost-hero__value">{{ cost.bigquery_monthly|currency_precise }}</div>
+      {# Range basis (STANDARD capacity modelled from slots): show the modelled
+         range, not a false point (2026-08-11 MRI-1). Serializer omits None keys
+         — .get() avoids Jinja Undefined passing an `is not none` test. #}
+      {% set _bq_low = cost.get("bigquery_monthly_low") %}
+      <div class="cost-hero__label">{% if cost.bq_cost_basis == "customer_provided" %}BigQuery (customer-provided){% else %}BigQuery (Current){% if _bq_low is not none %}, modelled range{% endif %}{% endif %}</div>
+      <div class="cost-hero__value">{% if _bq_low is not none %}{{ _bq_low|currency_precise }} &ndash; {{ cost.bigquery_monthly|currency_precise }}{% else %}{{ cost.bigquery_monthly|currency_precise }}{% endif %}</div>
       <div class="cost-hero__sub">{% for _ln in cost.bigquery_breakdown %}{% if 'capacity' in _ln.label|lower %}{{ _ln.label }}{% endif %}{% endfor %}{% if cost.bq_pricing_model == 'ON_DEMAND' %}On-Demand{% endif %}{% if cost.bq_pricing_region %} &middot; {{ cost.bq_pricing_region }}{% endif %}</div>
     </div>
     <div class="cost-hero__arrow"{% if cost.monthly_delta_low < 0 %} style="color: var(--color-severity-warning);"{% endif %}>
@@ -191,13 +228,18 @@
      month-1 vs steady-state spread), show both bounds. #}
   {% set _delta_color = "var(--color-severity-success)" if cost.monthly_delta_low >= 0 else "var(--color-severity-warning)" %}
   {% set _straddles = cost.monthly_delta_low < 0 and cost.monthly_delta_high > 0 %}
+  {# Range-basis BQ cost (2026-08-11 MRI-1): the low delta is computed against the
+     BQ measured minimum — the committable figure — with the upside shown as a
+     subtitle instead of a bare point anchored to the modelled upper estimate. #}
+  {% set _bq_range_basis = cost.get("bigquery_monthly_low") is not none %}
   <div class="row" style="margin-bottom: var(--space-lg);">
     <div class="col-6">
       <div class="card text-center">
         <div class="card-body">
           <div class="card-title">{% if cost.monthly_delta_low >= 0 %}Monthly Savings{% elif _straddles %}Monthly Cost vs BigQuery{% else %}Monthly Cost Increase{% endif %}</div>
           <div class="fs-3 fw-bold" style="color: {{ _delta_color }};">{{ cost.monthly_delta_low|savings }}</div>
-          {% if _straddles %}<div class="text-muted" style="font-size:.75rem">worst case (all storage hot) &mdash; up to {{ cost.monthly_delta_high|savings }} at storage-tiering steady state</div>{% endif %}
+          {% if _straddles %}<div class="text-muted" style="font-size:.75rem">worst case (all storage hot) &mdash; up to {{ cost.monthly_delta_high|savings }} at storage-tiering steady state</div>
+          {% elif _bq_range_basis and cost.monthly_delta_high > cost.monthly_delta_low %}<div class="text-muted" style="font-size:.75rem">vs BigQuery measured minimum &mdash; up to {{ cost.monthly_delta_high|savings }} vs the modelled upper estimate</div>{% endif %}
         </div>
       </div>
     </div>
@@ -206,11 +248,13 @@
         <div class="card-body">
           <div class="card-title">{% if cost.annual_savings_low >= 0 %}Annual Savings{% elif _straddles %}Annual Cost vs BigQuery{% else %}Annual Cost Increase{% endif %}</div>
           <div class="fs-3 fw-bold" style="color: {{ _delta_color }};">{{ cost.annual_savings_low|savings_annual }}</div>
-          {% if _straddles %}<div class="text-muted" style="font-size:.75rem">worst case &mdash; up to {{ cost.annual_savings_high|savings_annual }} at steady state</div>{% endif %}
+          {% if _straddles %}<div class="text-muted" style="font-size:.75rem">worst case &mdash; up to {{ cost.annual_savings_high|savings_annual }} at steady state</div>
+          {% elif _bq_range_basis and cost.annual_savings_high > cost.annual_savings_low %}<div class="text-muted" style="font-size:.75rem">vs BigQuery measured minimum &mdash; up to {{ cost.annual_savings_high|savings_annual }}</div>{% endif %}
         </div>
       </div>
     </div>
   </div>
+  {% endif %}{# end bq_cost_available check — savings tiles above, AWS sections below render for both #}
 
 
   {% if cost.aws_scenarios %}
@@ -226,13 +270,17 @@
         </span>
         <span class="scenario-cost">{{ scenario.monthly_total|currency_precise }}</span>
         <span class="scenario-delta">
+          {# customer_provided is a total-only figure (compute+storage inseparable):
+             scenarios shift storage across the BQ/AWS boundary, so deltas against it
+             rank scenarios but aren't absolute savings (2026-08-11 MRI-2). #}
+          {% set _vs_label = "vs provided BQ total" if cost.bq_cost_basis == "customer_provided" else "cheaper than BQ" %}
           {% set delta = cost.bigquery_monthly - scenario.monthly_total %}
-          {% if cost.bigquery_monthly > 100 %}
+          {% if cost.bq_cost_available and cost.bigquery_monthly > 100 %}
             {% set pct = ((delta / cost.bigquery_monthly) * 100)|round(0)|int %}
             {% if pct >= 1 %}
-              <span style="color:var(--color-severity-success)">{{ pct }}% cheaper than BQ</span>
+              <span style="color:var(--color-severity-success)">{{ pct }}% {{ _vs_label }}</span>
             {% endif %}
-          {% else %}
+          {% elif cost.bq_cost_available %}
             {% if delta > 1 %}
               <span style="color:var(--color-severity-success)">{{ delta|savings }} vs BQ</span>
             {% endif %}
@@ -257,6 +305,8 @@
   {% endfor %}
   {% endif %}
 
+  {% if cost.bq_cost_available %}
+  {# BQ breakdown only when cost is available — AWS breakdown renders for both available and unavailable #}
   <h3 style="margin-top: var(--space-xl); margin-bottom: var(--space-md);">BigQuery Cost Breakdown</h3>
   <table>
     <thead>
@@ -270,12 +320,26 @@
     {% for line in cost.bigquery_breakdown %}
       <tr>
         <td><strong>{{ line.label }}</strong>{% if line.confidence == "LOW" %} <span class="badge badge-low tip" tabindex="0" data-tip="{{ help.CONFIDENCE_HELP['cost'][line.confidence] }}">LOW CONFIDENCE</span>{% endif %}</td>
-        <td style="text-align:right">{{ line.monthly|currency_precise }}</td>
+        {# .get(): the serializer omits None-valued keys, so a range line has NO
+           "monthly" key — bare `line.monthly is not none` is Undefined-is-not-none
+           = TRUE and rendered "N/A" (Task 5: STANDARD capacity compute is a range). #}
+        <td style="text-align:right">
+          {% if line.get("monthly") is not none %}
+            {{ line.monthly|currency_precise }}
+          {% elif line.get("monthly_low") is not none and line.get("monthly_high") is not none %}
+            {{ line.monthly_low|currency_precise }} &ndash; {{ line.monthly_high|currency_precise }}
+          {% elif line.get("monthly_low") is not none %}
+            {{ line.monthly_low|currency_precise }}
+          {% else %}
+            &ndash;
+          {% endif %}
+        </td>
         <td class="text-muted">{{ line.source_note }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
+  {% endif %}
 
   <h3 style="margin-top: var(--space-xl); margin-bottom: var(--space-md);">AWS Cost Breakdown (Recommended Option)</h3>
   <table>
@@ -414,7 +478,8 @@
     <div class="card-body">
       <h3 style="margin-top:0;font-size:.9375rem">Storage Assumptions</h3>
       <ul style="margin:0;padding-left:1.25rem;font-size:.8125rem;color:var(--color-text-secondary)">
-        <li><strong>Both engine paths:</strong> S3 Tables (Iceberg) — storage tiered from ${{ pricing.s3_tables_tier1_per_gb }}/GB ({{ pricing.aws_region }}); automatic compaction/maintenance billed separately (per-object + per-GB-processed). Serverless and Provisioned share the same decoupled Iceberg storage layer — Redshift Managed Storage is not billed in this architecture</li>
+        {% set has_rms_line = cost.aws_lines | selectattr("label", "equalto", "Redshift Managed Storage (RMS)") | list | length > 0 %}
+        <li><strong>Both engine paths:</strong> S3 Tables (Iceberg) — storage tiered from ${{ pricing.s3_tables_tier1_per_gb }}/GB ({{ pricing.aws_region }}); automatic compaction/maintenance billed separately (per-object + per-GB-processed). Serverless and Provisioned share the same decoupled Iceberg storage layer{% if has_rms_line %} &mdash; except RMS-placed tables and Redshift-native materialized views, whose bytes bill as Redshift Managed Storage (separate line in the breakdown above). If Athena were chosen instead, all bytes would stay on S3 Tables &mdash; the Athena option is priced accordingly{% else %} &mdash; Redshift Managed Storage is not billed in this architecture{% endif %}</li>
         {% if cost.storage_tier_breakdown %}
         <li><strong>Intelligent-Tiering:</strong> files move to Infrequent Access after 30 days without access (${{ pricing.int_ia_per_gb }}/GB) and Archive Instant Access after 90 (${{ pricing.int_aia_per_gb }}/GB), rates {{ pricing.aws_region }} &mdash; per-tier derivation in the cost breakdown above. All tiers serve reads at millisecond latency with no retrieval fees; an accessed file moves back to Frequent automatically. The split uses last-modified time as an access proxy: regularly-read tables stay Frequent, and full-table scans re-heat cold files</li>
         {% endif %}
@@ -453,7 +518,7 @@
         <li><strong>Serverless On-Demand:</strong> ${{ pricing.serverless_rpu_hr }}/RPU-hr ({{ pricing.aws_region }}). BQ slot&rarr;RPU ratio: {{ pricing.slot_to_rpu_ratio }} (evidence range 0.06&ndash;0.25)</li>
         <li><strong>Serverless Reserved (1yr, All Upfront):</strong> ~{{ pricing.serverless_1yr_all_upfront_discount_pct }}% discount (${{ pricing.serverless_1yr_all_upfront_rpu_hr }}/RPU-hr). Break-even at ~{{ pricing.serverless_1yr_all_upfront_breakeven_pct }}% utilization</li>
         <li><strong>Serverless Reserved (1yr, No Upfront):</strong> ~{{ pricing.serverless_1yr_no_upfront_discount_pct }}% discount (${{ pricing.serverless_1yr_no_upfront_rpu_hr }}/RPU-hr). Break-even at ~{{ pricing.serverless_1yr_no_upfront_breakeven_pct }}% utilization</li>
-        <li><strong>Provisioned On-Demand:</strong> RG Graviton4 rg.4xlarge @ ${{ pricing.rg_4xl_ondemand_hr }}/node-hr. {{ pricing.hours_per_month }} hours/month</li>
+        <li><strong>Provisioned On-Demand:</strong> RG Graviton4 &mdash; rg.xlarge @ ${{ pricing.rg_xl_ondemand_hr }}/node-hr, rg.4xlarge @ ${{ pricing.rg_4xl_ondemand_hr }}/node-hr ({{ pricing.aws_region }}); the priced option's node type appears in its scenario row. {{ pricing.hours_per_month }} hours/month</li>
         <li><strong>Provisioned 1yr RI:</strong> ~{{ pricing.ri_1yr_discount_pct }}% discount vs on-demand</li>
         <li><strong>Provisioned 3yr RI:</strong> ~{{ pricing.ri_3yr_discount_pct }}% discount vs on-demand</li>
         <li><strong>Cluster sizing:</strong> based on peak concurrent query load with 1.5 vCPU/query heuristic and 3&times; burst factor</li>
@@ -628,10 +693,11 @@
     Axis 2 &middot; SQL
   </div>
   <div class="axis-question">How hard is it to rewrite the SQL that runs on it?</div>
-  <div class="axis-scope">Entities that own <strong>SQL</strong> &mdash; views, materialized views, and
-  routines &mdash; scored per BigQuery-specific construct in their definitions and query logs
-  (JS UDFs, UNNEST, ARRAY, STRUCT, function drift). Expand a row to see the detected constructs
-  and the <strong>translated SQL</strong> side by side.</div>
+  <div class="axis-scope">Entities scored per BigQuery-specific construct found in their definitions
+  and production query logs (JS UDFs, UNNEST, ARRAY, STRUCT, function drift). Tables with attributed
+  production workload show their <strong>top queries</strong> translated side-by-side to
+  {{ "Athena" if recommended_engine == "athena" else "Amazon Redshift" }} SQL (the recommended Query Engine's dialect).
+  Expand a row to see the detected constructs, rewrite guidance, and translated queries.</div>
   <div class="axis-scale">
     <span class="badge badge-portable">PORTABLE</span><span class="badge badge-adapt">ADAPT</span><span class="badge badge-rewrite">REWRITE</span>
   </div>
@@ -705,6 +771,7 @@
         <th title="How the entity arrives on AWS: TABLE = its data is moved; REBUILT = recreated from its SQL definition (views, materialized views, routines)">Population</th>
         <th>Complexity</th>
         <th>Source</th>
+        <th title="Production query workload from INFORMATION_SCHEMA.JOBS (last 30 days)">Workload</th>
       </tr>
     </thead>
     <tbody data-page-size="100"></tbody>
@@ -732,6 +799,9 @@
 {% for chunk in detail_chunks %}
 <script type="application/json" class="detail-chunk" data-chunk="{{ loop.index0 }}">{{ chunk|tojson }}</script>
 {% endfor %}
+{% for chunk in query_sample_chunks %}
+<script type="application/json" class="query-chunk" data-chunk="{{ loop.index0 }}">{{ chunk|tojson }}</script>
+{% endfor %}
 <script type="application/json" id="help-data">{{ {
   "confidence": {
     "effort": help.CONFIDENCE_HELP["effort"],
@@ -743,6 +813,7 @@
   "sources": help.SOURCE_LABELS,
   "text": help.UI_TEXT,
   "recommendedEngine": recommended_engine,
+  "topQueriesPerEntity": top_queries_per_entity,
 }|tojson }}</script>
 
 <script nonce="{{ csp_nonce }}">
@@ -772,6 +843,38 @@ document.querySelectorAll('script.detail-chunk').forEach(function(tag) {
   DETAIL_CHUNK_TAGS[tag.dataset.chunk] = tag;
 });
 var DETAIL_CHUNKS = {};
+
+// ONE formatter for workload figures — the row, the expanded panel, and the
+// sidecar pointer all speak the same language ("queries" = executions from
+// JOBS logs; "distinct statements" = unique query texts after dedup). Five
+// hand-built phrasings had drifted into three different terms for num_shapes
+// (2026-08-04 review).
+function fmtCount(n) { return Number(n).toLocaleString('en-US'); }
+function wlSummary(wl) {
+  var q = wl.query_count, ns = wl.num_shapes;
+  var base = fmtCount(q) + (q === 1 ? ' query' : ' queries');
+  // parenthetical only when dedup actually collapsed something
+  if (ns > 0 && ns !== q) base += ' (' + fmtCount(ns) + ' distinct statements)';
+  return base + ' · ' + wl.slot_hours + ' slot-hrs';
+}
+var QUERY_CHUNK_TAGS = {};
+document.querySelectorAll('script.query-chunk').forEach(function(tag) {
+  QUERY_CHUNK_TAGS[tag.dataset.chunk] = tag;
+});
+var QUERY_CHUNKS = {};
+// Parse ONLY the chunk carrying the expanded entity (e.query_chunk). The old
+// walk-all-chunks fallback parsed the entire sample payload on first expand —
+// tens of MB at petabyte-scale estates, blocking the main thread.
+function getQuerySamples(e) {
+  var idx = e.query_chunk;
+  if (idx == null) return null;   // entity has no embedded samples
+  if (!(idx in QUERY_CHUNKS)) {
+    var tag = QUERY_CHUNK_TAGS[idx];
+    QUERY_CHUNKS[idx] = tag ? JSON.parse(tag.textContent) : {};
+    if (tag) tag.textContent = '';  // free the raw JSON text
+  }
+  return QUERY_CHUNKS[idx][e.full_name] || null;
+}
 function detailFor(e) {
   if (e.detail_chunk == null) return e;  // no heavy payload for this entity
   var idx = e.detail_chunk;
@@ -808,6 +911,7 @@ var ENGINE_META = {
   }
 };
 var RECOMMENDED_ENGINE = HELP.recommendedEngine || 'redshift';
+var TOP_QUERIES_PER_ENTITY = HELP.topQueriesPerEntity || 5;
 
 function el(tag, className, text) {
   var node = document.createElement(tag);
@@ -1045,7 +1149,7 @@ function buildEffortDetail(e) {
 
 function buildQueryDetail(e) {
   var td = document.createElement('td');
-  td.setAttribute('colspan', '6');
+  td.setAttribute('colspan', '7');
   var c = e.complexity;
 
   if (c.reasoning === 'no BigQuery-specific constructs detected') {
@@ -1093,6 +1197,62 @@ function buildQueryDetail(e) {
     td.appendChild(preCode(e.translated_sql.redshift_sql));
   }
 
+  if (e.has_workload && e.query_workload && e.query_workload.num_shapes > 0) {
+    var samples = getQuerySamples(e);
+    var ns = e.query_workload.num_shapes;
+    if (!samples || !samples.length) {
+      // Stats without embedded SQL: everything lives in the sidecar.
+      td.appendChild(sectionHeading('Production Queries'));
+      td.appendChild(el('p', 'text-muted', wlSummary(e.query_workload) + ' — original + translated SQL in query-workload/' + e.full_name + '.sql next to this report.'));
+    } else {
+      var showing = Math.min(TOP_QUERIES_PER_ENTITY, samples.length);
+      td.appendChild(sectionHeading('Production Queries (top ' + showing + ' of ' + fmtCount(ns) + ' distinct statements, by slot cost)'));
+      samples.slice(0, TOP_QUERIES_PER_ENTITY).forEach(function(sq, idx) {
+        var qDiv = document.createElement('div');
+        qDiv.style.marginBottom = '1.5rem';
+        qDiv.style.borderBottom = '1px solid var(--color-border)';
+        qDiv.style.paddingBottom = '1rem';
+        var header = document.createElement('p');
+        header.style.margin = '0 0 .5rem';
+        header.appendChild(el('strong', null, 'Query ' + (idx + 1)));
+        header.appendChild(document.createTextNode(' '));
+        var meta = el('span', 'text-muted', '(' + sq.s + ', ' + (sq.m / 3600000).toFixed(1) + ' slot-hrs)');
+        meta.style.fontSize = '.8125rem';
+        header.appendChild(meta);
+        qDiv.appendChild(header);
+        var grid = document.createElement('div');
+        grid.style.display = 'grid';
+        grid.style.gridTemplateColumns = '1fr 1fr';
+        grid.style.gap = '12px';
+        var origCol = document.createElement('div');
+        var origLabel = el('p', 'text-muted', 'BigQuery (original)');
+        origLabel.style.margin = '0 0 4px';
+        origLabel.style.fontSize = '11px';
+        origLabel.style.fontWeight = '600';
+        origCol.appendChild(origLabel);
+        origCol.appendChild(preCode(sq.o));
+        grid.appendChild(origCol);
+        var transCol = document.createElement('div');
+        var transLabel = el('p', 'text-muted', ENGINE_META[RECOMMENDED_ENGINE].label + ' (translated)');
+        transLabel.style.margin = '0 0 4px';
+        transLabel.style.fontSize = '11px';
+        transLabel.style.fontWeight = '600';
+        transCol.appendChild(transLabel);
+        transCol.appendChild(preCode(sq.t));
+        grid.appendChild(transCol);
+        qDiv.appendChild(grid);
+        td.appendChild(qDiv);
+      });
+      // Always point at the sidecar file — when nothing was omitted the
+      // pointer previously vanished and readers couldn't find the full set.
+      if (ns > TOP_QUERIES_PER_ENTITY) {
+        td.appendChild(el('p', 'text-muted', fmtCount(ns - TOP_QUERIES_PER_ENTITY) + ' more distinct statements omitted here — all ' + fmtCount(ns) + ' (original + translated) are in query-workload/' + e.full_name + '.sql next to this report.'));
+      } else {
+        td.appendChild(el('p', 'text-muted', 'All ' + fmtCount(ns) + ' distinct statement' + (ns === 1 ? '' : 's') + ' shown — also in query-workload/' + e.full_name + '.sql next to this report.'));
+      }
+    }
+  }
+
   if (e.placement) {
     var placementEngineKey = (e.translated_sql && e.translated_sql.target_engine) || RECOMMENDED_ENGINE;
     td.appendChild(sectionHeading('Where should this live?', ENGINE_META[placementEngineKey].placementTip));
@@ -1116,6 +1276,14 @@ function buildQueryDetail(e) {
       td.appendChild(whyP);
       td.appendChild(bulletList(signals, true));
     }
+    if (e.placement.home === 'REDSHIFT' && e.entity_type === 'MATERIALIZED_VIEW') {
+      var rmsNote = el('p', 'text-muted',
+        'Storage note: a Redshift-native materialized view stores its result set in ' +
+        'Redshift Managed Storage — its bytes are included in the RMS line of the AWS ' +
+        'cost breakdown (sized from the BigQuery MV\'s bytes; refresh churn not modeled).');
+      rmsNote.style.fontSize = '.8125rem';
+      td.appendChild(rmsNote);
+    }
   }
   return td;
 }
@@ -1132,7 +1300,7 @@ function effortHasDetail(e) {
 }
 
 function queryHasDetail(e) {
-  return !!(e.complexity.score > 0 || nonEmpty(e.complexity.flags) || nonEmpty(e.rewrite_guidance) || e.placement || e.has_translated_sql);
+  return !!(e.complexity.score > 0 || nonEmpty(e.complexity.flags) || nonEmpty(e.rewrite_guidance) || e.placement || e.has_translated_sql || e.has_workload);
 }
 
 function renderEffortRow(e, tr) {
@@ -1179,6 +1347,15 @@ function renderQueryRow(e, tr) {
   srcTd.appendChild(tipSpan(HELP.sources[src] || String(src || '').replace(/_/g, ' '),
     HELP.text.source_tip));
   tr.appendChild(srcTd);
+  var wlTd = document.createElement('td');
+  wlTd.style.fontSize = '.8125rem';
+  if (e.query_workload) {
+    wlTd.textContent = wlSummary(e.query_workload);
+  } else {
+    wlTd.textContent = '—';
+    wlTd.classList.add('text-muted');
+  }
+  tr.appendChild(wlTd);
 }
 
 function EntityTable(opts) {
@@ -1273,9 +1450,10 @@ function EntityTable(opts) {
 }
 
 // Query Complexity default scope: entities that own SQL (views/MVs/routines —
-// population REBUILT). Plain tables carry no SQL of their own and only add noise;
-// the "Show all entities" toggle brings them back.
-function ownsSql(e) { return e.population === 'REBUILT'; }
+// population REBUILT) or have attributed production workload from query logs.
+// Plain tables with no workload only add noise; the "Show all entities" toggle
+// brings them back.
+function ownsSql(e) { return e.population === 'REBUILT' || e.has_workload; }
 
 var tables = {
   effort: new EntityTable({

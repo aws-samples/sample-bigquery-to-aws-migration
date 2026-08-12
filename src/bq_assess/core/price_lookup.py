@@ -180,7 +180,7 @@ class PriceLookup:
             url = _AWS_OFFER_URL_TEMPLATE.format(service="AmazonRedshift", region=self._aws_region)
             req = urllib.request.Request(url)
             req.add_header("Accept-Encoding", "gzip")
-            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - hardcoded https AWS Price List API URL, no user input
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as exc:
             logger.warning("AWS Price List API unreachable: %s — using hardcoded rates", exc)
@@ -276,7 +276,7 @@ class PriceLookup:
         try:
             url = _AWS_OFFER_URL_TEMPLATE.format(service="AmazonS3", region=self._aws_region)
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - hardcoded https AWS Price List API URL, no user input
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
             return None

@@ -3,7 +3,7 @@ SAR connector deploy + bucket_prefix length fix (2026-07-30)."""
 from __future__ import annotations
 
 import shutil
-import subprocess  # nosec B404 - test runs terraform validate with fixed args, no shell
+import subprocess
 
 import pytest
 
@@ -111,12 +111,12 @@ def test_generated_terraform_validates(tmp_path):
         tables=[], target_region="us-east-1",
     )
     tf_dir = tmp_path / "terraform"
-    init = subprocess.run(  # nosec B603 B607 - fixed arg list, no shell, test-only
+    init = subprocess.run(
         ["terraform", "init", "-backend=false", "-input=false"],
         cwd=tf_dir, capture_output=True, text=True, timeout=300, check=False,
     )
     assert init.returncode == 0, init.stderr
-    validate = subprocess.run(  # nosec B603 B607 - fixed arg list, no shell, test-only
+    validate = subprocess.run(
         ["terraform", "validate"],
         cwd=tf_dir, capture_output=True, text=True, timeout=60, check=False,
     )

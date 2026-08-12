@@ -596,3 +596,68 @@ class TestAssumedRatioRederivation:
         bundle_dir = BundleWriter().write(bundle, str(tmp_path))
         manifest = json.loads((Path(bundle_dir) / "manifest.json").read_text())
         assert manifest["assumed_physical_ratio"] == ASSUMED_PHYSICAL_RATIO
+
+
+# ---------------------------------------------------------------------------
+# Detecting pre-auto-reader bundles (Task 4, 2026-08-10)
+# ---------------------------------------------------------------------------
+
+
+class TestReservationDataCollected:
+    """A 0.3.x pricing.json (no auto-reader keys) marks reservation_data_collected=False
+    to distinguish from permission-denied."""
+
+    def test_old_bundle_pricing_marks_reservation_data_not_collected(self, tmp_path) -> None:
+        """A 0.3.x pricing.json (no auto-reader keys) must not be blamed on permissions."""
+        pricing_dict = {
+            "model": "CAPACITY", "confidence": "MEDIUM", "source_note": "test",
+            "edition": "ENTERPRISE", "baseline_slots": None, "max_slots": None,
+            "commitment_slots": None, "commitment_plan": None,
+        }
+        bundle = _make_bundle([], pricing=PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="test", edition="ENTERPRISE",
+        ))
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        # Simulate old bundle: remove auto-reader keys and re-checksum
+        pricing_path = Path(bundle_dir) / "pricing.json"
+        pricing_path.write_text(json.dumps(pricing_dict))
+        manifest_path = Path(bundle_dir) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        from bq_assess.bundle.models import sha256_file
+        manifest["files"]["pricing.json"] = sha256_file(pricing_path)
+        manifest_path.write_text(json.dumps(manifest))
+
+        bundle = BundleLoader().load(bundle_dir)
+        assert bundle.pricing.reservation_data_collected is False
+        assert bundle.pricing.reservation_readable is True   # nothing was denied
+
+    def test_new_bundle_pricing_marks_reservation_data_collected(self, tmp_path) -> None:
+        pricing_dict = {
+            "model": "CAPACITY", "confidence": "HIGH", "source_note": "test",
+            "edition": "ENTERPRISE", "baseline_slots": 100, "max_slots": 200,
+            "commitment_slots": 100, "commitment_plan": "ANNUAL",
+            "reservation_readable": True, "autoscale_slot_seconds": 0,
+            "timeline_window_seconds": 604800, "assigned_projects": [],
+            "assigned_count": 1, "commitments": [],
+        }
+        bundle = _make_bundle([], pricing=PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.HIGH,
+            source_note="test", edition="ENTERPRISE",
+            baseline_slots=100, max_slots=200, commitment_slots=100,
+            commitment_plan="ANNUAL", reservation_readable=True,
+            autoscale_slot_seconds=0, timeline_window_seconds=604800,
+            assigned_projects=[], assigned_count=1, commitments=[],
+        ))
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        # Simulate new bundle by manually writing the full pricing.json
+        pricing_path = Path(bundle_dir) / "pricing.json"
+        pricing_path.write_text(json.dumps(pricing_dict))
+        manifest_path = Path(bundle_dir) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        from bq_assess.bundle.models import sha256_file
+        manifest["files"]["pricing.json"] = sha256_file(pricing_path)
+        manifest_path.write_text(json.dumps(manifest))
+
+        bundle = BundleLoader().load(bundle_dir)
+        assert bundle.pricing.reservation_data_collected is True

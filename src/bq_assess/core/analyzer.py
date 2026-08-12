@@ -68,11 +68,9 @@ _NUMERIC_LITERAL_RE = re.compile(
     r"(?<=[\s=><!(,+\-*/])\d+\.?\d*(?=[\s,);]|$)"
 )
 
-# FROM / JOIN table references  (handles optional project.dataset.table)
-_TABLE_REF_RE = re.compile(
-    r"(?:FROM|JOIN)\s+`?([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+){0,2})`?",
-    re.IGNORECASE,
-)
+# Table-reference COUNTING is delegated to core/table_refs (shared grammar,
+# 2026-08-04). The JOIN-pattern regex below stays local: it parses the ON
+# condition's column pairs, which is join-analysis grammar, not table refs.
 
 # JOIN … ON pattern:
 #   JOIN <table> ON <alias>.<col> = <alias>.<col>
@@ -341,14 +339,17 @@ class QueryAnalyzer:
     def _extract_table_refs(
         query: str, counts: dict[str, int]
     ) -> None:
-        """Extract table references from FROM and JOIN clauses."""
-        for match in _TABLE_REF_RE.finditer(query):
-            table_name = match.group(1)
-            # Normalise: take the last two parts (dataset.table) if fully qualified
-            parts = table_name.split(".")
-            if len(parts) >= 2:
-                table_name = f"{parts[-2]}.{parts[-1]}"
-            counts[table_name] += 1
+        """Count table references (shared grammar, core/table_refs).
+
+        Policy: every occurrence counts (frequency, not distinct); bare
+        single-part names are kept — anonymized logs often carry unqualified
+        local names and the hub/count stats are name-relative anyway. No
+        project filter: counts are keyed by normalized name regardless of
+        which project qualified them.
+        """
+        from bq_assess.core.table_refs import extract_table_refs
+        for ref in extract_table_refs(query, project_id=None):
+            counts[ref.dataset_table or ref.table] += 1
 
     @staticmethod
     def _extract_join_patterns(

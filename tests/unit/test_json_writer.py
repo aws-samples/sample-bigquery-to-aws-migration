@@ -52,7 +52,7 @@ def _known_assessment():
     return Assessment(
         assessment_id="assess-20260617-abc123",
         generated_at=datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc),
-        project_id="my-project",
+        project_id="example-project",
         summary=AssessmentSummary(
             total_entities=2, total_tables=1, total_size_gb=42.5,
             effort_counts={"AUTO": 0, "ASSISTED": 1, "MANUAL": 0},
@@ -172,3 +172,23 @@ def test_json_enum_serialized_as_value():
         data = json.load(f)
     assert data["cost"]["bq_pricing_model"] == "CAPACITY"
     assert data["cost"]["compute_confidence"] == "MEDIUM"
+
+
+def test_json_cost_includes_availability_fields():
+    """The three BQ-cost-availability fields are serialized into the cost object."""
+    import dataclasses
+    a = _known_assessment()
+    a.cost = dataclasses.replace(
+        a.cost,
+        bq_cost_available=False,
+        bq_cost_basis="unavailable",
+        bq_cost_unavailable_reason="ENTERPRISE capacity pricing without reservation data",
+    )
+    out = tempfile.mkdtemp()
+    paths = JSONWriter().write(a, out)
+    landing_path = next(p for p in paths if "landing" in p)
+    with open(landing_path) as f:
+        data = json.load(f)
+    assert data["cost"]["bq_cost_available"] is False
+    assert data["cost"]["bq_cost_basis"] == "unavailable"
+    assert data["cost"]["bq_cost_unavailable_reason"] == "ENTERPRISE capacity pricing without reservation data"

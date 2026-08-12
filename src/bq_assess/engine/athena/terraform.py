@@ -326,7 +326,7 @@ resource "aws_serverlessapplicationrepository_cloudformation_stack" "bq_connecto
 
 resource "aws_athena_data_catalog" "bigquery" {{
   name        = var.connector_name
-  description = "Federated BigQuery connector for dataset ${{var.dataset_id}}"
+  description = "Federated BigQuery connector for GCP project ${{var.gcp_project}} (all datasets; named after the primary dataset ${{var.dataset_id}})"
   type        = "LAMBDA"
 
   parameters = {{
@@ -679,6 +679,11 @@ dataset_id     = "{dataset_id}"
 # ─── Optional ────────────────────────────────────────────────────────────────
 
 # spill_bucket = "my-existing-spill-bucket"  # Leave empty to create a new one
+
+# Lake Formation grants default to the identity running terraform. If a
+# DIFFERENT role runs run_migration.py, put that role's ARN here so the
+# grants land on the right principal (see MIGRATION_GUIDE, Step 4):
+# migration_operator_principal_arn = "arn:aws:iam::123456789012:role/YOUR_MIGRATION_ROLE"
 
 # tags = {{
 #   Project     = "bq-migration"

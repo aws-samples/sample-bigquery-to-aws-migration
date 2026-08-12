@@ -173,6 +173,7 @@ def apply_bq_region(location: str | None) -> bool:
     global V4_STORAGE_LONGTERM_PHYSICAL_USD_PER_GIB_MONTH
     global V4_EDITION_SLOT_HOUR_USD, V4_EDITION_RESOURCE_CUD_SLOT_HOUR_USD
     global V4_PRICING_REGION, V4_REGION_SCOPE
+    global V4_EGRESS_USD_PER_GIB
 
     loc = normalize_bq_location(location)
     rates = V4_REGIONAL_RATES.get(loc)
@@ -206,6 +207,8 @@ def apply_bq_region(location: str | None) -> bool:
             if edition in payg
         }
 
+    V4_EGRESS_USD_PER_GIB = V4_EGRESS_REGIONAL_RATES.get(loc, 0.12)
+
     V4_PRICING_REGION = loc
     V4_REGION_SCOPE = f"BigQuery region {loc}"
     return True
@@ -217,6 +220,37 @@ def apply_bq_region(location: str | None) -> bool:
 # Syntax:  [PROJECT_ID.]`region-REGION`.INFORMATION_SCHEMA.<VIEW>
 # Example: FROM `region-us`.INFORMATION_SCHEMA.CAPACITY_COMMITMENTS WHERE state = 'ACTIVE'
 # =============================================================================
+
+# =============================================================================
+# V4 — BigQuery Storage Read API egress pricing, $/GiB (internet egress)
+# Source: https://cloud.google.com/bigquery/pricing#storage-api (2026-08-04)
+# Billed per GiB of data read via the Storage Read API (Arrow/Avro wire format ≈
+# logical uncompressed bytes). Rates vary by source region.
+# =============================================================================
+
+V4_EGRESS_USD_PER_GIB: float = 0.12  # US multi-region default
+
+V4_EGRESS_REGIONAL_RATES: dict[str, float] = {
+    "us": 0.12,
+    "eu": 0.12,
+    "us-central1": 0.12,
+    "us-east1": 0.12,
+    "us-west1": 0.12,
+    "us-east4": 0.12,
+    "us-west2": 0.12,
+    "northamerica-northeast1": 0.12,
+    "europe-west1": 0.12,
+    "europe-west2": 0.12,
+    "europe-west3": 0.12,
+    "europe-west4": 0.12,
+    "australia-southeast1": 0.19,
+    "australia-southeast2": 0.19,
+    "asia-southeast1": 0.12,
+    "asia-northeast1": 0.14,
+    "asia-south1": 0.12,
+    "southamerica-east1": 0.23,
+}
+
 
 V5_REGION_QUALIFIER_EXAMPLE: str = "`region-us`"
 V5_RESERVATION_VIEWS: tuple[str, ...] = (

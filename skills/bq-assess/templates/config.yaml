@@ -14,10 +14,11 @@ gcp:
 
 # --- Query log analysis ---
 query_logs:
-  enabled: true                      # Analyze INFORMATION_SCHEMA.JOBS (--include-query-logs).
-                                     # NOTE: workload analysis also runs automatically when a
-                                     # BigQuery capacity/reservation pricing model is detected,
-                                     # even without this flag. Opt out with --skip-workload.
+  enabled: true                      # Analyze INFORMATION_SCHEMA.JOBS. On by default — there is no
+                                     # --include-query-logs flag (removed in v0.6.2 for parity
+                                     # with bq-collect). NOTE: workload analysis also runs when a
+                                     # BigQuery capacity/reservation pricing model is detected.
+                                     # Opt out entirely with --skip-workload.
   days: 30                           # Lookback window in days, 1-90 (--query-log-days)
   # file: exported-logs.json         # Path to exported query logs JSON (--query-logs)
 

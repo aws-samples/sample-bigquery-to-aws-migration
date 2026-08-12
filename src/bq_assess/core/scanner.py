@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 import threading
 import time
 from collections.abc import Iterator
@@ -520,9 +519,9 @@ def _retry(fn, config: dict | None = None, rate_limiter: RateLimiter | None = No
             if hinted is not None:
                 # Hint is a floor: clamp to max_delay, then add upward spread so
                 # simultaneously-throttled workers don't wake in one wave.
-                wait = min(hinted, max_delay) * (1.0 + 0.5 * random.random())  # nosec B311 - retry jitter, not cryptographic
+                wait = min(hinted, max_delay) * (1.0 + 0.5 * random.random())
             else:
-                wait = min(delay, max_delay) * (0.5 + random.random())  # nosec B311 - retry jitter, not cryptographic
+                wait = min(delay, max_delay) * (0.5 + random.random())
             logger.warning(
                 "Transient error (%s), retrying in %.1fs (%s attempt %d/%d)",
                 exc.code if is_api else type(exc).__name__,
@@ -664,31 +663,23 @@ def _to_column_schema(field: bigquery.SchemaField) -> ColumnSchema:
     )
 
 
-# Matches `project.dataset.table` or `dataset.table` references inside FROM/JOIN clauses,
-# optionally backtick-quoted. Best-effort dependency extraction (R4.5); refined in 4.x.
-_DEP_RE = re.compile(
-    r"(?:FROM|JOIN)\s+`?([A-Za-z0-9_.\-]+)`?",
-    re.IGNORECASE,
-)
-
-
 def _extract_dependencies(sql: str | None) -> list[str]:
     """Best-effort parse of referenced tables from view/mview/routine SQL (R4.5).
 
-    Returns ``dataset.table`` FQNs (project prefix stripped), de-duplicated, order-stable.
-    Deliberately conservative — relationship inference (issue 4.1) refines this later.
+    Returns ``dataset.table`` FQNs (project prefix stripped), de-duplicated,
+    order-stable. Parsing lives in core/table_refs (shared grammar, 2026-08-04);
+    the policy here differs from attribution's: NO project filter — a view
+    reading another project's table still depends on it, and the dependency
+    should surface in depends_on for the relationship pass to consider.
     """
     if not sql:
         return []
+    from bq_assess.core.table_refs import extract_table_refs
     seen: dict[str, None] = {}
-    for raw in _DEP_RE.findall(sql):
-        ref = raw.strip("`").strip()
-        if not ref or "." not in ref:
-            continue
-        parts = ref.split(".")
-        # Normalize project.dataset.table -> dataset.table
-        fqn = ".".join(parts[-2:]) if len(parts) >= 2 else ref
-        seen.setdefault(fqn, None)
+    for ref in extract_table_refs(sql, project_id=None):
+        if ref.dataset is None:
+            continue  # bare names (aliases/CTEs) are not dependencies
+        seen.setdefault(ref.dataset_table, None)
     return list(seen.keys())
 
 

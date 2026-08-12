@@ -176,12 +176,27 @@ class AthenaMigrationGenerator:
             if config.post_optimization else []
         )
 
+        # Post-load validation: one query comparing federated-source vs Iceberg
+        # counts. NOTE: the source COUNT(*) federates to BigQuery and bills a
+        # BQ scan — run after the load, not per-chunk.
+        target = quote_full_name(iceberg_table_name(entity.full_name))
+        source = self._source_ref(entity)
+        validation_query = (
+            f"-- Post-load row-count validation for {entity.full_name} "
+            f"(source COUNT federates to BigQuery — run once, after the load)\n"
+            f"SELECT src.n AS source_rows, tgt.n AS target_rows, "
+            f"src.n - tgt.n AS missing\n"
+            f"FROM (SELECT COUNT(*) AS n FROM {source}) src\n"
+            f"CROSS JOIN (SELECT COUNT(*) AS n FROM {target}) tgt;"
+        )
+
         return MigrationDML(
             table=entity.full_name,
             statements=statements,
             shortcomings=shortcomings,
             post_optimization=post_opt,
             estimated_scan_bytes=entity.num_bytes,
+            validation_query=validation_query,
         )
 
     def _source_ref(self, entity: EntityMetadata) -> str:
@@ -372,7 +387,10 @@ class AthenaMigrationGenerator:
                 f"INSERT INTO {target}\n"
                 f"SELECT {select_clause} FROM {source}\n"
                 f"WHERE {src_field} >= DATE '{{{{start}}}}' AND {src_field} < DATE '{{{{end}}}}';\n"
-                f"-- Repeat for each {chunk_days}-day window across the partition range")
+                f"-- Repeat for each {chunk_days}-day window across the partition range\n"
+                f"-- FINAL CHUNK — rows with NULL {raw_field} (BigQuery __NULL__ partition):\n"
+                f"-- DELETE FROM {target} WHERE {field} IS NULL;\n"
+                f"-- INSERT INTO {target} SELECT {select_clause} FROM {source} WHERE {src_field} IS NULL;")
             ]
 
         statements = [
@@ -402,6 +420,18 @@ class AthenaMigrationGenerator:
             )
             for start, end in chunks[5:]:
                 statements.append(f"-- {start} to {end}\n")
+
+        # NULL-partition chunk: BigQuery time-partitioned tables can hold rows
+        # with a NULL partition column (the __NULL__ partition). Every date
+        # window above excludes them — without this final chunk those rows
+        # silently drop from the migration (2026-08-04 audit).
+        statements.append(
+            f"-- FINAL CHUNK: rows with NULL {raw_field} (BigQuery __NULL__ partition)\n"
+            f"DELETE FROM {target} WHERE {field} IS NULL;\n"
+            f"INSERT INTO {target}\n"
+            f"SELECT {select_clause} FROM {source}\n"
+            f"WHERE {src_field} IS NULL;\n"
+        )
 
         return statements
 

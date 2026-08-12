@@ -27,7 +27,7 @@ from bq_assess.models import EntityPopulation, EntityType
 # Fixture: a mock BigQuery client describing one dataset with all four kinds
 # ---------------------------------------------------------------------------
 
-_DATASET = "sample_dataset"
+_DATASET = "bq_redshift_test"
 
 
 def _schema_field(name, field_type="STRING", mode="NULLABLE", fields=()):
@@ -138,7 +138,7 @@ def _js_routine():
 @pytest.fixture
 def mock_scanner() -> BigQueryScanner:
     """A scanner whose mock client returns the four-kind fixture for one dataset."""
-    scanner = BigQueryScanner(project_id="my-project", use_adc=True)
+    scanner = BigQueryScanner(project_id="example-project", use_adc=True)
     client = MagicMock(spec=bigquery.Client)
 
     ds = MagicMock(spec=bigquery.dataset.DatasetListItem)
@@ -214,10 +214,10 @@ def test_scan_all_four_kinds_then_cache_round_trip(mock_scanner, tmp_path):
     # --- Round-trip through the real cache ---
     db_path = os.path.join(str(tmp_path), "phase1.db")
     cache = MetadataCache(db_path=db_path)
-    cache.store("my-project", scanned)
+    cache.store("example-project", scanned)
 
-    assert cache.has_cache("my-project")
-    loaded = cache.load("my-project")
+    assert cache.has_cache("example-project")
+    loaded = cache.load("example-project")
     assert loaded is not None
 
     loaded_by_name = {e.full_name: e for e in loaded}

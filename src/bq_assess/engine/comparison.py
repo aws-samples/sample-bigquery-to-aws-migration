@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 
 from bq_assess.engine.redshift import cost_constants as k
-from bq_assess.engine.redshift.cost import _line_high, _line_low
+from bq_assess.engine.redshift.cost import _line_high, _line_low, _line_value
 from bq_assess.models import (
     AWSRecommendation,
     AWSScenario,
@@ -48,8 +48,16 @@ def assemble_cost_comparison(
         workload_profile: WorkloadProfile built from slot data
         engine_recommendation: EngineRecommendation from RecommendationScorer
     """
-    # Build Athena scenario (non-recommended initially)
-    storage_line = _find_storage_line(base_comparison.aws_scenarios)
+    # Build Athena scenario (non-recommended initially). If the RMS storage split
+    # ran (Redshift-homed MVs / RMS-placed tables), the Redshift scenarios' S3
+    # lines no longer cover the full estate — the Athena option must price ALL
+    # bytes as Iceberg (nothing can live in RMS on an Athena deployment), so it
+    # uses the pristine pre-split copy the split stashed.
+    storage_line = (
+        base_comparison.all_iceberg_storage_line
+        if base_comparison.all_iceberg_storage_line is not None
+        else _find_storage_line(base_comparison.aws_scenarios)
+    )
     athena_scenario = _build_athena_scenario(
         athena_estimate=athena_estimate,
         storage_line=storage_line,
@@ -65,6 +73,7 @@ def assemble_cost_comparison(
         workload_profile=workload_profile,
         bigquery_monthly=base_comparison.bigquery_monthly,
         engine_recommendation=engine_recommendation,
+        bq_cost_available=base_comparison.bq_cost_available,
     )
 
     # Mark the recommended scenario
@@ -105,8 +114,20 @@ def assemble_cost_comparison(
     aws_monthly_low = sum(_line_low(ln) for ln in best.lines)
     aws_monthly_high = sum(_line_high(ln) for ln in best.lines)
     bigquery_monthly = base_comparison.bigquery_monthly
-    monthly_delta_low = bigquery_monthly - aws_monthly_high
-    monthly_delta_high = bigquery_monthly - aws_monthly_low
+    # When BQ cost is unavailable, deltas must be zero (no valid comparison).
+    # When the BQ side is a modelled range (STANDARD capacity), the savings floor
+    # is computed against the BQ measured minimum (2026-08-11 — MRI-1).
+    if base_comparison.bq_cost_available:
+        bq_low_basis = (
+            base_comparison.bigquery_monthly_low
+            if base_comparison.bigquery_monthly_low is not None
+            else bigquery_monthly
+        )
+        monthly_delta_low = bq_low_basis - aws_monthly_high
+        monthly_delta_high = bigquery_monthly - aws_monthly_low
+    else:
+        monthly_delta_low = 0.0
+        monthly_delta_high = 0.0
     annual_savings_low = monthly_delta_low * 12
     annual_savings_high = monthly_delta_high * 12
 
@@ -139,6 +160,9 @@ def assemble_cost_comparison(
         compute_confidence=best.confidence,
         estimate_basis_level=basis_level,
         estimate_basis=basis_text,
+        bq_cost_available=base_comparison.bq_cost_available,
+        bq_cost_basis=base_comparison.bq_cost_basis,
+        bq_cost_unavailable_reason=base_comparison.bq_cost_unavailable_reason,
     )
 
 
@@ -214,7 +238,11 @@ def _build_athena_scenario(
         justification = "No workload data — Athena compute is $0 until queries run."
 
     lines = [compute_line, storage_line]
-    monthly_total = float(athena_estimate.monthly_compute) + (storage_line.monthly or 0)
+    # _line_value honors headline/range lines — `.monthly or 0` dropped the
+    # whole storage cost when Intelligent-Tiering made the line a range
+    # (2026-08-03: pdp22's Athena option showed $2,223 "92% cheaper" with
+    # $18,900 of storage silently missing).
+    monthly_total = float(athena_estimate.monthly_compute) + _line_value(storage_line)
 
     return AWSScenario(
         label="Athena (on-demand $5/TB)",
@@ -421,6 +449,7 @@ def _generate_unified_recommendation(
     workload_profile: WorkloadProfile,
     bigquery_monthly: float,
     engine_recommendation: EngineRecommendation,
+    bq_cost_available: bool = True,
 ) -> AWSRecommendation:
     """Generate unified recommendation considering both cost and engine signals.
 
@@ -439,7 +468,7 @@ def _generate_unified_recommendation(
         cheapest = min(redshift_scenarios, key=lambda s: s.monthly_total)
         return AWSRecommendation(
             recommended_scenario=cheapest.label,
-            reasoning=_build_redshift_reasoning(cheapest, workload_profile, bigquery_monthly, redshift_scenarios),
+            reasoning=_build_redshift_reasoning(cheapest, workload_profile, bigquery_monthly, redshift_scenarios, bq_cost_available),
             workload_profile=workload_profile,
             alternatives_considered=[s.label for s in scenarios if s.label != cheapest.label],
         )
@@ -481,7 +510,7 @@ def _generate_unified_recommendation(
             alternatives_considered=[s.label for s in scenarios if s.label != athena.label],
         )
     elif primary_engine == TargetEngine.REDSHIFT:
-        reasoning = _build_redshift_reasoning(cheapest_redshift, workload_profile, bigquery_monthly, redshift_scenarios)
+        reasoning = _build_redshift_reasoning(cheapest_redshift, workload_profile, bigquery_monthly, redshift_scenarios, bq_cost_available)
         if athena.monthly_total < cheapest_redshift.monthly_total * 0.5:
             reasoning = (
                 f"Engine analysis favors Redshift (high concurrency/volume signals); "
@@ -603,6 +632,7 @@ def _build_redshift_reasoning(
     workload_profile: WorkloadProfile,
     bq_monthly: float,
     all_redshift: list[AWSScenario],
+    bq_cost_available: bool = True,
 ) -> str:
     """Build reasoning for Redshift recommendation."""
     qpd = workload_profile.queries_per_day
@@ -616,12 +646,21 @@ def _build_redshift_reasoning(
             f"Serverless auto-scales to zero during idle periods and handles burst without pre-provisioning."
         )
     else:
-        return (
+        base_reasoning = (
             f"Recommended Query Engine: Redshift {scenario.label}. "
             f"Your workload runs {qpd:,.0f} queries/day scanning {monthly_tb:,.0f} TB/month. "
             f"This is a sustained, high-volume pattern (active {active_frac:.0%} of hours). "
-            f"Provisioned RG with a committed term saves significantly vs on-demand."
         )
+        # Only mention savings vs on-demand if BQ cost is available
+        if bq_cost_available:
+            base_reasoning += (
+                "Provisioned RG with a committed term saves significantly vs on-demand."
+            )
+        else:
+            base_reasoning += (
+                "Provisioned RG with a committed term is suitable for sustained workloads."
+            )
+        return base_reasoning
 
 
 def _extract_signal_reasons(engine_recommendation: EngineRecommendation) -> str:

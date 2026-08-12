@@ -389,6 +389,7 @@ def apply_aws_region(region: str) -> bool:
     global V2_S3_TABLES_USD_PER_GB_MONTH_TIER3, V6_MANAGED_STORAGE_USD_PER_GB_MONTH
     global V2_INT_IA_USD_PER_GB_MONTH, V2_INT_AIA_USD_PER_GB_MONTH
     global AWS_PRICING_REGION, AWS_REGION_SCOPE
+    global V8_DATA_TRANSFER_OUT_USD_PER_GB
 
     rates = AWS_REGIONAL_RATES.get(region)
     if rates is None:
@@ -421,9 +422,36 @@ def apply_aws_region(region: str) -> bool:
         table[node_type]["ri_1yr_usd_per_node_hour"] = ri1
         table[node_type]["ri_3yr_usd_per_node_hour"] = ri3
 
+    V8_DATA_TRANSFER_OUT_USD_PER_GB = V8_DT_OUT_REGIONAL_RATES.get(region, 0.09)
+
     AWS_PRICING_REGION = region
     AWS_REGION_SCOPE = f"{rates['label']} / {region}"
     return True
+
+
+# =============================================================================
+# V8 — AWS Data Transfer Out (internet), $/GB (first 10 TB/month tier)
+# Source: https://aws.amazon.com/ec2/pricing/on-demand/#Data_Transfer (2026-08-04)
+# This is the equivalent of BQ Storage Read API egress on the AWS side — data leaving
+# the VPC to internet consumers (BI tools, pandas clients, etc). Within-VPC = $0.
+# =============================================================================
+
+V8_DATA_TRANSFER_OUT_USD_PER_GB: float = 0.09  # us-east-1 default
+
+V8_DT_OUT_REGIONAL_RATES: dict[str, float] = {
+    "us-east-1": 0.09,
+    "us-west-2": 0.09,
+    "us-east-2": 0.09,
+    "ca-central-1": 0.09,
+    "eu-west-1": 0.09,
+    "eu-west-2": 0.09,
+    "eu-central-1": 0.09,
+    "ap-southeast-2": 0.114,
+    "ap-southeast-1": 0.12,
+    "ap-northeast-1": 0.114,
+    "ap-south-1": 0.1093,
+    "sa-east-1": 0.15,
+}
 
 
 # =============================================================================

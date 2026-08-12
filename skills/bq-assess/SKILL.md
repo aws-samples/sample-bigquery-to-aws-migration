@@ -57,7 +57,7 @@ When the CLI exits non-zero during the `scan` phase, match stderr against these 
 
 | Condition | Detection | Skill action |
 |---|---|---|
-| Missing `bigquery.jobs.listAll` | `AnalyzerError` substring `"bigquery.jobs.listAll"` | Present three options: (1) grant IAM permission — show pre-formatted `gcloud` command from `references/iam-roles.md`, (2) re-run without query logs (omit `--include-query-logs`), (3) export logs manually and pass `--query-logs <path>` |
+| Missing `bigquery.jobs.listAll` | **Not an error path.** The CLI exits 0 and degrades silently. Detect after a successful run: `cost.estimate_basis` in the landing JSON contains `"No workload data"` | Do not report the run as clean. Follow "Workload Data Unavailable" in `references/phases/scan.md`: warn that cost confidence is reduced, then offer (1) grant `roles/bigquery.resourceViewer` and re-run, or (2) continue as-is. `--query-logs <path>` stays available if logs are already exported |
 | Missing `bigquery.metadataViewer` | `ScannerError` from `validate_credentials()` | Route back to `preflight` auth step. Load `references/phases/preflight.md` and resume at authentication verification. |
 | ADC expired | `google.auth.exceptions.RefreshError` in stderr | Route back to `preflight`. Show: `gcloud auth application-default login` |
 | No tables found | CLI exits with `"No tables found. Nothing to assess."` | Prompt user to check the `--datasets` filter or verify the project ID is correct. |
