@@ -7,8 +7,9 @@ Also generates the Glue federated database setup DDL that the INSERT statements 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
+from bq_assess.core.partition_stats import partition_id_to_date
 from bq_assess.engine.optimization import (
     generate_post_optimization,
     iceberg_table_name,
@@ -123,15 +124,105 @@ _TYPES_NEEDING_CAST = frozenset({
     "TIMESTAMP", "DATETIME",
 })
 
-# Column types the federated BigQuery connector cannot read at all
-# (live-verified 2026-07-30: arrays fail with "Lists have one child Field.
-# Found: none"; structs containing timestamps throw IllegalArgumentException;
-# RANGE fails with "Unsupported 'Complex' vector VarCharVector").
-_CONNECTOR_UNREADABLE = ("RECORD", "STRUCT", "RANGE")
+# Scalar types the federated BigQuery connector cannot read
+# ("Unsupported 'Complex' vector VarCharVector"). RANGE is carried from the
+# 2026-07-30 notes and is NOT re-verified — no RANGE column exists in any
+# testbed, so treat it as unconfirmed rather than measured.
+_CONNECTOR_UNREADABLE = ("RANGE",)
+
+# BigQuery types that arrive NULL when nested inside a RECORD. The connector
+# serves a TOP-LEVEL timestamp fine (as an ISO-8601 varchar, which the generated
+# SQL casts); one nested inside a struct silently loses its value.
+_NULLED_WHEN_NESTED = ("TIMESTAMP", "DATETIME")
+
+
+def _has_repeated_record_descendant(col) -> bool:
+    """True when ``col`` contains a REPEATED RECORD anywhere beneath it."""
+    for child in col.fields or ():
+        if child.mode == "REPEATED" and child.fields:
+            return True
+        if _has_repeated_record_descendant(child):
+            return True
+    return False
+
+
+def _connector_unreadable_columns(columns) -> list[str]:
+    """Top-level columns that make the connector fail outright.
+
+    Measured against the BigQuery connector (2025.41.1) on 2026-09-28, which
+    corrected the previous blanket rule. ARRAY and STRUCT are NOT unreadable:
+
+        COUNT(preferences)  ARRAY<STRUCT>                   -> OK
+        COUNT(event_data)   ARRAY<STRUCT> nested 3 deep     -> OK
+        COUNT(dimensions)   STRUCT of scalars               -> OK
+        SELECT * products / user_profiles                   -> OK
+
+    What does fail is a *non-repeated* RECORD holding a REPEATED RECORD:
+
+        COUNT(ecommerce)    STRUCT{ items ARRAY<STRUCT> }   -> IllegalArgumentException
+        COUNT(attribution)  STRUCT{ touchpoints ARRAY<..> } -> IllegalArgumentException
+        SELECT * clickstream / order_facts                  -> IllegalArgumentException
+
+    The last two matter: the bad column takes the whole-table SELECT * with it,
+    so this genuinely blocks the load rather than just that column.
+
+    Verified at depth 1 (REPEATED RECORD as a direct child). Deeper nestings are
+    flagged by the same recursion but are NOT measured — erring toward flagging,
+    since a false warning costs a review while a miss costs a failed load.
+
+    Returns ``(column_name, reason)`` pairs so the shortcoming can name the
+    actual cause instead of one blanket sentence covering both.
+    """
+    blocked: list[tuple[str, str]] = []
+    for col in columns:
+        field_type = col.field_type.upper()
+        if field_type in _CONNECTOR_UNREADABLE:
+            blocked.append((col.name, f"{field_type} is an unsupported vector type"))
+        elif (
+            field_type in ("RECORD", "STRUCT")
+            and col.mode != "REPEATED"
+            and _has_repeated_record_descendant(col)
+        ):
+            blocked.append((
+                col.name,
+                "a struct containing a repeated struct raises IllegalArgumentException",
+            ))
+    return blocked
+
+
+def _nested_nulled_paths(columns, prefix: str = "") -> list[str]:
+    """Dotted paths of TIMESTAMP/DATETIME leaves nested inside a RECORD."""
+    out: list[str] = []
+    for col in columns:
+        path = f"{prefix}.{col.name}" if prefix else col.name
+        if col.fields:
+            out.extend(_nested_nulled_paths(col.fields, path))
+        elif prefix and col.field_type.upper() in _NULLED_WHEN_NESTED:
+            out.append(path)
+    return out
 
 _LARGE_TABLE_BYTES = 100 * 1024**3  # 100 GB
-# Safety margin under Athena's 100-open-partition write limit
+# Athena's hard ceiling on open partitions in one Iceberg write
+_MAX_OPEN_PARTITIONS = 100
+# Safety margin under that limit
 _SAFE_PARTITIONS_PER_INSERT = 90
+
+
+def _partition_end_bound(iso_date: str, partition_id: str) -> date:
+    """Exclusive upper bound one granularity step past the last partition.
+
+    ``partition_id_to_date`` widens a partition id to the first instant of its
+    period, so the last partition's own rows sit at or after that date. The
+    window bound has to clear the whole period or those rows are dropped: a
+    MONTH id of ``202608`` must extend to 2026-09-01, not 2026-08-02.
+    """
+    d = date.fromisoformat(iso_date)
+    width = len(partition_id)
+    if width == 4:                                  # YEAR
+        return date(d.year + 1, 1, 1)
+    if width == 6:                                  # MONTH
+        return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+    return d + timedelta(days=1)                    # DAY and HOUR
 
 
 def _partitions_per_day(granularity: str) -> float:
@@ -204,7 +295,7 @@ class AthenaMigrationGenerator:
 
         Each part is quoted when required (quote_identifier) — BigQuery allows
         hyphens and leading digits in table names, which are invalid unquoted
-        Trino identifiers (the 2026-07-31 sandbox validation found 310 DELETE/
+        Trino identifiers (the 2026-07-31 SpinLab validation found 310 DELETE/
         INSERT statements failing to parse on hyphenated names).
         """
         table_name = quote_identifier(entity.full_name.split(".")[-1])
@@ -228,9 +319,11 @@ class AthenaMigrationGenerator:
         # regardless of byte size; large tables also chunk for retry safety
         is_partitioned = entity.time_partitioning is not None
         is_large = entity.num_bytes > _LARGE_TABLE_BYTES
-        estimated_partitions = self._estimate_partition_count(entity)
+        partitions = self._partition_count(entity)
 
-        needs_chunking = is_partitioned and (estimated_partitions > 100 or is_large)
+        needs_chunking = is_partitioned and (
+            partitions > _MAX_OPEN_PARTITIONS or is_large
+        )
 
         if needs_chunking:
             return self._chunked_insert(target, source, entity, config)
@@ -435,8 +528,22 @@ class AthenaMigrationGenerator:
 
         return statements
 
+    def _partition_count(self, entity: EntityMetadata) -> int:
+        """Partitions in the source table — measured when available, else estimated."""
+        if entity.partition_count is not None:
+            return entity.partition_count
+        return self._estimate_partition_count(entity)
+
     def _estimate_partition_count(self, entity: EntityMetadata) -> int:
-        """Estimate partition count for the chunking decision."""
+        """Fallback partition estimate for when PARTITIONS could not be read.
+
+        Reached on the offline-bundle path and when the caller lacks permission on
+        INFORMATION_SCHEMA.PARTITIONS. Known to under-count badly (#53): it derives
+        a span from ``last_modified``, which is the last *write*, so an
+        actively-ingested table looks brand new and scores near zero. Kept only
+        because guessing low is better than emitting no plan at all, and the
+        chunk headers tell the operator to verify via STEP 0.
+        """
         if not entity.time_partitioning:
             # Range partitioning
             if entity.range_partitioning:
@@ -465,11 +572,33 @@ class AthenaMigrationGenerator:
     ) -> list[tuple[str, str]]:
         """Generate concrete (start, end) date pairs for chunked INSERT.
 
+        Bounds come from the source's real partition range when PARTITIONS was
+        read, and otherwise from ``last_modified → now``. That fallback is the
+        second half of #53: ``last_modified`` is the last *write*, so windows
+        covered only the tail of the data, and for a table written today the loop
+        produced no windows at all — which sent ``_chunked_insert`` down its
+        template branch and made Phase 2 skip the table entirely.
+
         Scales window size based on partition granularity to avoid exceeding
         Athena's 100-open-partition write limit (using 90 as safety margin).
         """
-        if not entity.last_modified:
-            return []
+        start_date = end_date = None
+        if entity.partition_min_id and entity.partition_max_id:
+            lo = partition_id_to_date(entity.partition_min_id)
+            hi = partition_id_to_date(entity.partition_max_id)
+            if lo and hi:
+                start_date = date.fromisoformat(lo)
+                # partition_max_id names the last partition, so the exclusive
+                # upper bound is one granularity step past it. A day is the
+                # smallest step these windows express; for MONTH/YEAR ids the
+                # month/year rolls over, so step to the following month/year.
+                end_date = _partition_end_bound(hi, entity.partition_max_id)
+
+        if start_date is None:
+            if not entity.last_modified:
+                return []
+            start_date = entity.last_modified.date()
+            end_date = datetime.now(timezone.utc).date()
 
         # Scale chunk_days based on partition granularity
         effective_chunk_days = chunk_days
@@ -484,10 +613,6 @@ class AthenaMigrationGenerator:
 
         # Floor at 1 to guard against chunk_days=0 hanging the loop
         effective_chunk_days = max(1, effective_chunk_days)
-
-        now = datetime.now(timezone.utc)
-        start_date = entity.last_modified.date()
-        end_date = now.date()
 
         chunks: list[tuple[str, str]] = []
         current = start_date
@@ -517,28 +642,66 @@ class AthenaMigrationGenerator:
                 remediation_engine="spark",
             ))
 
-        # Federated-connector readability gap: the BigQuery connector cannot
-        # serve REPEATED (array) columns ("Lists have one child Field. Found:
-        # none") and fails on STRUCTs containing timestamps — live-verified
-        # 2026-07-30. The INSERT...SELECT path won't work for these tables;
-        # they need a GCS-export (Parquet) load instead.
-        connector_blocked = [
-            col.name for col in entity.columns
-            if col.mode == "REPEATED" or col.field_type.upper() in _CONNECTOR_UNREADABLE
-        ]
-        if connector_blocked:
+        # Federated-connector readability gap. Narrowed 2026-09-28 after live
+        # probes: the old rule flagged every REPEATED or RECORD column, which
+        # was wrong for 4 of 6 testbed tables — ARRAY and STRUCT read fine. See
+        # _connector_unreadable_columns for the measurements.
+        blocked_pairs = _connector_unreadable_columns(entity.columns)
+        if blocked_pairs:
+            connector_blocked = [name for name, _reason in blocked_pairs]
+            reasons = "; ".join(
+                f"{name}: {reason}" for name, reason in blocked_pairs
+            )
             shortcomings.append(MigrationShortcoming(
                 category="type_cast",
                 severity="action_required",
                 bq_source=f"columns: {connector_blocked}",
                 description=(
-                    "Athena BigQuery connector cannot read ARRAY/STRUCT/RANGE columns — "
-                    "the federated INSERT...SELECT will fail for this table"
+                    f"Athena BigQuery connector cannot read {reasons} — the "
+                    f"federated INSERT...SELECT will fail for this table, "
+                    f"including SELECT *"
                 ),
                 remediation=(
                     "Load via GCS export instead: BigQuery EXPORT DATA (Parquet) → "
                     "S3 transfer → Athena INSERT...SELECT from an external Parquet "
                     "table (nested types survive Parquet round-trip)"
+                ),
+                remediation_engine="manual",
+                # The ONLY shortcoming that sets this: the generated DML cannot
+                # run at all. Drives the effort amend to MANUAL (#74).
+                blocks_load=True,
+            ))
+
+        # Silent nested-timestamp loss. The load SUCCEEDS and the row counts
+        # match, so neither the INSERT nor validation_query reveals anything —
+        # the values simply arrive NULL. Measured 2026-09-28 against the live
+        # connector vs BigQuery ground truth:
+        #   user_profiles.metadata.updated_at        0 of 20,000 non-null
+        #   clickstream.session.session_start        0 of 150,000
+        #   order_facts.shipping.shipped_at          0 of 42,105
+        #   order_facts.payment.processed_at         0 of 60,000
+        # Deliberately NOT phrased as a load failure: the wording here must stay
+        # clear of check_report.py's load-blocking markers, because a table with
+        # only this problem does load, and scoring it as blocked would be a
+        # different lie than the one being fixed.
+        nulled_paths = _nested_nulled_paths(entity.columns)
+        if nulled_paths:
+            shortcomings.append(MigrationShortcoming(
+                category="type_cast",
+                severity="action_required",
+                bq_source=f"nested columns: {nulled_paths}",
+                description=(
+                    f"TIMESTAMP/DATETIME nested inside a struct arrives NULL through "
+                    f"the federated connector — {nulled_paths} would load as empty "
+                    f"while row counts still match, so the post-load row-count "
+                    f"validation CANNOT detect this"
+                ),
+                remediation=(
+                    "Verify per column after loading, e.g. SELECT COUNT(col.ts) "
+                    "against the BigQuery source count. To preserve the values, "
+                    "load this table via GCS export (BigQuery EXPORT DATA Parquet → "
+                    "S3 → INSERT...SELECT from an external Parquet table) rather "
+                    "than the federated connector"
                 ),
                 remediation_engine="manual",
             ))

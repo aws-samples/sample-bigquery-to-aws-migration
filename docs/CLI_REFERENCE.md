@@ -5,9 +5,7 @@ For the guided experience, see the [main README](../README.md).
 ## Install
 
 ```bash
-git clone <repo-url>
-cd bigqueryToRedshift
-pip install -e .
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git"
 ```
 
 ## Usage
@@ -31,9 +29,6 @@ bq-assess \
   --format json,html,csv \
   --output reports/
 
-# Interactive mode
-bq-assess --interactive
-
 # From config file
 bq-assess --config assessment-config.yaml
 ```
@@ -53,10 +48,16 @@ bq-assess --config assessment-config.yaml
 | `--bigquery-monthly-cost` | Monthly BigQuery spend override | estimated |
 | `--output` | Output directory | reports/ |
 | `--format` | Output formats (json, html, csv) | json,html |
-| `--interactive` | Interactive prompt mode | false |
 | `--config` | Path to YAML config file | — |
 
 Note: query-log analysis is always on; opt out with `--skip-workload` (no JOBS reads) or `--exclude-query-text` (no statements in the bundle).
+
+Note: bq-assess never prompts for configuration — run
+`bq-assess assess --gcp-project <X|all> --use-adc` and it completes on its own
+(the `--interactive` flag was removed 2026-08-12). The one exception: when a
+capacity reservation read is permission-denied in a terminal, it offers
+"Grant access and retry?" so the collection needn't be re-run. `bq-assess
+report`, fleet runs, and scripted/redirected runs never prompt at all.
 
 ## Output
 

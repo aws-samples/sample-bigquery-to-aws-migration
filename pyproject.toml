@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bq-assess"
-version = "0.8.0"
+# Keep in step with src/bq_assess/__init__.py and packaging/collector/pyproject.toml.
+# tests/unit/test_version_consistency.py enforces it — nothing did before 0.9.0.
+version = "0.9.0"
 description = "Read-only BigQuery migration assessment CLI: profiles a Source and assesses migrating it to an AWS lakehouse (S3 Tables / Apache Iceberg storage, Amazon Redshift Serverless query engine)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -38,6 +40,10 @@ dev = [
     "pytest>=7.4",
     "hypothesis>=6.82",
     "pytest-cov>=4.1",
+    # Exact pin, not a floor: ruff's DEFAULT rule set changed between 0.15 and
+    # 0.16 (59 enabled rules -> 405), so a floor would let local and CI disagree
+    # about what passes. Must match the pin in .gitlab-ci.yml's lint job.
+    "ruff==0.16.9",
 ]
 
 [tool.setuptools.packages.find]
@@ -52,3 +58,7 @@ bq_assess = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "scale: petabyte-scale E2E harness (slow, ~1 min) — run with `pytest -m scale`",
+]
+addopts = "-m 'not scale'"

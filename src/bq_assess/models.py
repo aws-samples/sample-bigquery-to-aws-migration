@@ -135,6 +135,15 @@ class EntityMetadata:
     depends_on: list[str]           # FQNs of Tables this entity references (R4.5)
     last_modified: datetime
     physical_bytes: int | None = None  # populated by storage_stats; None = not yet resolved
+    # Populated by partition_stats from INFORMATION_SCHEMA.PARTITIONS; None = not
+    # resolved (offline bundle, missing permission), in which case consumers fall
+    # back to estimating. Before these existed the partition count was guessed
+    # from last_modified, which reported 30 for tables holding 730 (#53).
+    # *_id values are raw BigQuery partition ids — YYYY / YYYYMM / YYYYMMDD /
+    # YYYYMMDDHH for YEAR / MONTH / DAY / HOUR granularity (probe-verified).
+    partition_count: int | None = None
+    partition_min_id: str | None = None
+    partition_max_id: str | None = None
 
 
 # ---- Conversion / scoring results -----------------------------------------
@@ -246,6 +255,14 @@ class PricingDetection:             # R16 — what PricingDetector.detect() retu
     assigned_projects: list[str] = field(default_factory=list)
     assigned_count: int = 0
     commitments: list[dict] = field(default_factory=list)  # [{slot_count, plan, edition}]
+    # Customer-supplied monthly BigQuery bill captured at COLLECTION time
+    # (--bigquery-monthly-cost on bq-collect or bq-assess assess, 2026-08-12).
+    # Rides in the bundle so the report can use it as the BQ cost for any
+    # pricing model; a report-time --bigquery-monthly-cost still wins.
+    # supplied_on (UTC date) is rendered with the customer-provided label so a
+    # months-old figure is never mistaken for a current bill (review F4).
+    customer_monthly_cost: float | None = None
+    customer_cost_supplied_on: str | None = None
 
 
 @dataclass
@@ -357,6 +374,12 @@ class CostComparison:               # R18
     # Region provenance: which geography each side was priced in (2026-07-02 region cascade).
     bq_pricing_region: str = "us"           # BigQuery dataset location the BQ rates reflect
     aws_pricing_region: str = "us-east-1"   # AWS region the AWS rates reflect
+    # Non-empty when the AWS region was not a clean nearest match (pinned judgment call,
+    # distant nearest-with-stack, or unknown-location fallback) — the report must flag it.
+    # note = methodology text; label = hero badge ("pinned region" | "fallback region" |
+    # "distant region"; empty for clean matches and quiet us/eu multi-region pins).
+    aws_region_match_note: str = ""
+    aws_region_match_label: str = ""
     # BQ-cost availability (2026-08-10): Enterprise/EP capacity without reservation
     # data has BOTH rate (~2× commitment spread) and quantity (24/7 baseline) unknown —
     # no defensible estimate exists. When available=False the report suppresses the
@@ -530,6 +553,13 @@ class MigrationShortcoming:
     description: str
     remediation: str
     remediation_engine: str  # "spark" | "redshift" | "manual"
+    # True only when the generated load CANNOT run at all, as opposed to running
+    # while needing review. category+severity cannot express this: the connector
+    # blocker, the nested-timestamp NULLing and the lossy-cast notice are all
+    # ("type_cast", "action_required"), so the only discriminator used to be prose
+    # in `description` — which product code must not depend on. Drives the effort
+    # amend (#74) and separates the action_required counts (#68).
+    blocks_load: bool = False
 
 
 @dataclass

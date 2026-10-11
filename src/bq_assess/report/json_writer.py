@@ -12,6 +12,7 @@ import os
 
 from bq_assess.models import Assessment
 from bq_assess.report._serialize import serialize_entities, serialize_landing
+from bq_assess.report.provenance import provenance
 
 
 class JSONWriter:
@@ -27,14 +28,20 @@ class JSONWriter:
 
         effort_entities, query_entities = serialize_entities(assessment)
 
+        # Every file carries the full provenance block, not just the landing one
+        # (#61). These get handed around individually, and a consumer holding
+        # only the effort file previously could not tell which project, run, or
+        # tool version produced it — nor that the scores are advisory.
+        prov = provenance(assessment)
+
         effort = {
-            "assessment_id": aid,
+            **prov,
             "entities": effort_entities,
         }
         paths.append(self._dump(effort, out_dir, f"assessment-effort-{aid}.json"))
 
         query = {
-            "assessment_id": aid,
+            **prov,
             "entities": query_entities,
         }
         paths.append(self._dump(query, out_dir, f"assessment-query-{aid}.json"))

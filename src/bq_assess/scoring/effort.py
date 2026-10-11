@@ -114,6 +114,46 @@ class EffortScorer:
         return False
 
 
+_LOAD_BLOCKED_POINTS = 3  # clears the MANUAL threshold from any starting score
+
+
+def amend_for_load_blocking(result: EffortResult) -> EffortResult:
+    """Re-score an entity whose generated load cannot run at all (#74).
+
+    Before this, a table could be scored AUTO — "fully automatable" — while the
+    same report said its federated INSERT...SELECT would fail. EffortScorer
+    cannot see that: it receives only EntityMetadata and ConversionResult, and
+    the migration plan does not exist yet when effort is first scored.
+
+    Per CONTEXT.md the axis reads AUTO = tool moves it unattended, ASSISTED =
+    moves it but a flagged decision needs sign-off, MANUAL = human designs the
+    load. A connector-blocked table is MANUAL by that definition: there is no
+    working generated load to sign off on, and the remediation is a separate
+    GCS-export pipeline.
+
+    Adds points rather than forcing the category, so `_category_for()` stays the
+    single ladder, `score` stays an interpretable sum, and this composes with
+    amend_for_rms_placement instead of discarding it. +3 clears MANUAL (>2) from
+    any starting score — it is a threshold lever, not a measurement, the same
+    way the RMS amend's +1 is.
+
+    Called after the migration-plan stage, which is before both the per-entity
+    read and the summary counts — so rows and headline cannot disagree.
+    """
+    points = result.score + _LOAD_BLOCKED_POINTS
+    return EffortResult(
+        category=_category_for(points),
+        score=points,
+        flags=[*result.flags, "connector_load_blocked"],
+        reasoning=(
+            f"{result.reasoning}; generated load cannot run — the federated "
+            f"connector cannot read this table, so the load must be redesigned "
+            f"(GCS export) (+{_LOAD_BLOCKED_POINTS})"
+        ),
+        confidence=result.confidence,
+    )
+
+
 def amend_for_rms_placement(result: EffortResult) -> EffortResult:
     """Re-score an entity whose Storage Target is RMS (ADR-0005).
 

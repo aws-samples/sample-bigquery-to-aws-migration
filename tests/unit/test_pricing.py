@@ -280,7 +280,7 @@ def test_constants_are_sourced_not_inlined(monkeypatch) -> None:
     assert result.confidence is ConfidenceLevel.LOW
 
 
-# --- Grouped reservation rows (2026-07-08 deep audit: bounded-rows JOBS read) ----------
+# --- Grouped reservation rows (2026-07-08 storm audit: bounded-rows JOBS read) ----------
 
 def test_detector_sql_is_grouped() -> None:
     """The JOBS read GROUPs BY reservation/edition server-side — a handful of rows

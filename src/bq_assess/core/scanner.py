@@ -519,9 +519,9 @@ def _retry(fn, config: dict | None = None, rate_limiter: RateLimiter | None = No
             if hinted is not None:
                 # Hint is a floor: clamp to max_delay, then add upward spread so
                 # simultaneously-throttled workers don't wake in one wave.
-                wait = min(hinted, max_delay) * (1.0 + 0.5 * random.random())
+                wait = min(hinted, max_delay) * (1.0 + 0.5 * random.random())  # nosec B311 - retry jitter, not cryptographic
             else:
-                wait = min(delay, max_delay) * (0.5 + random.random())
+                wait = min(delay, max_delay) * (0.5 + random.random())  # nosec B311 - retry jitter, not cryptographic
             logger.warning(
                 "Transient error (%s), retrying in %.1fs (%s attempt %d/%d)",
                 exc.code if is_api else type(exc).__name__,

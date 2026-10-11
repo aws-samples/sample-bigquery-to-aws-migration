@@ -50,6 +50,34 @@ _CONFIDENCE_ORDER = {
 }
 
 
+def min_line_confidence(*line_groups) -> ConfidenceLevel:
+    """Minimum confidence across all PRICED lines — the estimate-basis level.
+
+    Unpriced placeholder lines (monthly, monthly_low, and monthly_high all None
+    — e.g. the Enterprise/EP "UNAVAILABLE" compute line) carry no estimate for
+    their confidence to describe, so they never gate the level (2026-08-12:
+    the LOW placeholder dragged a measured-workload MEDIUM report to a 'Low
+    Confidence Cost Estimate' banner). Priced lines — points and ranges alike —
+    all count: the chain is as strong as its weakest real input.
+
+    Shared by CostEstimator._estimate_basis and comparison._derive_estimate_basis
+    so the two report paths cannot drift.
+    """
+    priced = [
+        ln
+        for group in line_groups
+        for ln in group
+        if ln.monthly is not None
+        or ln.monthly_low is not None
+        or ln.monthly_high is not None
+    ]
+    return min(
+        (ln.confidence for ln in priced),
+        key=lambda c: _CONFIDENCE_ORDER.get(c, 0),
+        default=ConfidenceLevel.LOW,
+    )
+
+
 class CostEstimator:
     """Compute the BigQuery-vs-AWS cost comparison (R18)."""
 
@@ -82,10 +110,23 @@ class CostEstimator:
         effort_total,
         *,
         location: str | None = None,
+        aws_region_override: str | None = None,
         storage_basis: str = "assumed",
         as_of: datetime | None = None,
         egress_gib: float | None = None,
     ) -> CostComparison:
+        # ---- Override precedence, resolved ONCE (2026-08-12 review F4) ----
+        # Report-time --bigquery-monthly-cost wins; otherwise a bundle-carried
+        # customer cost (recorded at collection) applies. Downstream consumers
+        # (_bigquery_runrate, _estimate_basis, _pricing_notes) all see the same
+        # resolved value — no per-consumer backfills.
+        if (
+            bq_monthly_override is None
+            and pricing is not None
+            and pricing.customer_monthly_cost is not None
+        ):
+            bq_monthly_override = pricing.customer_monthly_cost
+
         # ---- Region cascade: price BOTH clouds in the Source's geography (2026-07-02) ----
         # BigQuery rates re-resolve to the detected dataset location; AWS rates re-resolve
         # to the nearest AWS region so the comparison is like-for-like. A live pricing
@@ -115,9 +156,32 @@ class CostEstimator:
                         "multi-region rates unless a live catalog lookup resolves it",
                         bq_location,
                     )
-            aws_region, _is_fallback = k.bq_location_to_aws_region(bq_location)
-            if k.AWS_PRICING_REGION != aws_region:
-                k.apply_aws_region(aws_region)
+            # An explicit AWS region (CLI --target-region, or Stage 8's final
+            # decision) beats the policy re-derivation — without this the
+            # nearest-region policy silently clobbers the user's choice while
+            # the console announces it (2026-08-14 review must-fix).
+            if aws_region_override:
+                if k.AWS_PRICING_REGION != aws_region_override:
+                    k.apply_aws_region(
+                        aws_region_override,
+                        match_note="externally selected region",
+                        match_label="pinned region",
+                    )
+            else:
+                region_match = k.match_bq_location(bq_location)
+                if k.AWS_PRICING_REGION != region_match.aws_region:
+                    k.apply_aws_region(
+                        region_match.aws_region,
+                        match_note=region_match.note,
+                        match_label=region_match.ui_label,
+                    )
+                else:
+                    # Region already installed (CLI Stage 8 / prior estimate) —
+                    # rates must not re-apply (live-rate clobber guard), but the
+                    # provenance note must reflect THIS location's match, not
+                    # whatever a previous run left behind.
+                    k.AWS_REGION_MATCH_NOTE = region_match.note
+                    k.AWS_REGION_MATCH_LABEL = region_match.ui_label
         else:
             bq_location = v4.V4_PRICING_REGION
 
@@ -212,7 +276,7 @@ class CostEstimator:
         breakeven_high = _breakeven(migration_onetime, monthly_delta_high)
 
         basis_level, basis_text = self._estimate_basis(
-            bq_breakdown, best, slots, bq_monthly_override
+            bq_breakdown, best, slots, bq_cost_basis=bq_avail["basis"],
         )
 
         return CostComparison(
@@ -235,6 +299,8 @@ class CostEstimator:
             recommendation=recommendation,
             bq_pricing_region=v4.V4_PRICING_REGION,
             aws_pricing_region=k.AWS_PRICING_REGION,
+            aws_region_match_note=k.AWS_REGION_MATCH_NOTE,
+            aws_region_match_label=k.AWS_REGION_MATCH_LABEL,
             bq_cost_available=bq_avail["available"],
             bq_cost_basis=bq_avail["basis"],
             bq_cost_unavailable_reason=bq_avail["reason"],
@@ -247,35 +313,51 @@ class CostEstimator:
         )
 
     def _estimate_basis(
-        self, bq_breakdown, best, slots: SlotUtilization | None, override,
+        self, bq_breakdown, best, slots: SlotUtilization | None,
+        *, bq_cost_basis: str,
     ) -> tuple[ConfidenceLevel, str]:
         """The one always-visible confidence statement for the cost section (2026-07-15).
 
         Replaces the per-scenario and per-line badge scatter (11 badges on a typical
         summary page) with a single plain-language sentence naming what the estimate was
-        priced from. Level = minimum across the BigQuery breakdown and the recommended
-        option's lines — the chain is as strong as its weakest input, so it caps at
-        MEDIUM while the slot→RPU ratio is an assumption. The uncertainties themselves
-        live in ``key_uncertainties`` (2026-07-16 restructure: one home per statement).
+        priced from. Level = estimate_basis_level (min over PRICED lines, capped at
+        MEDIUM when the BQ side is unavailable — Ryan 2026-08-13). The BQ-side wording
+        for the customer-provided/unavailable states comes from bq_basis_qualifier —
+        the single owner shared with comparison._derive_estimate_basis, which REBUILDS
+        this text whenever workload data exists (so any wording here that the
+        qualifier doesn't own never ships in that case; keep BQ-state wording in the
+        qualifier). ``bq_cost_basis`` is the first-class state from _bigquery_runrate:
+        "modelled" | "customer_provided" | "unavailable" (required — a forgotten
+        default mislabeled a report once, 2026-08-12).
         """
-        lines = list(bq_breakdown) + list(best.lines)
-        level = min((ln.confidence for ln in lines), key=lambda c: _CONFIDENCE_ORDER.get(c, 0), default=ConfidenceLevel.LOW)
+        bq_cost_available = bq_cost_basis != "unavailable"
+        level = estimate_basis_level(
+            bq_breakdown, best.lines, bq_cost_available=bq_cost_available,
+        )
 
-        if override is not None:
-            text = "BigQuery cost is operator-supplied (--bigquery-monthly-cost)."
-        elif slots is not None and slots.days_sampled > 0:
+        if slots is not None and slots.days_sampled > 0:
             window = f"{_window_days(slots)} days of measured workload"
             volume = f"{slots.total_queries:,} queries"
-            scan_basis = (
-                "billed bytes" if getattr(slots, "has_billed_bytes", False)
-                else "processed bytes — an overestimate of what BigQuery actually charges"
-            )
-            text = f"Priced from {window} ({volume}, {scan_basis}) and current published rates."
-        else:
+            if bq_cost_basis == "modelled":
+                scan_basis = (
+                    "billed bytes" if getattr(slots, "has_billed_bytes", False)
+                    else "processed bytes — an overestimate of what BigQuery actually charges"
+                )
+                text = f"Priced from {window} ({volume}, {scan_basis}) and current published rates."
+            else:
+                # customer_provided / unavailable: the BQ scan basis is irrelevant —
+                # the qualifier below names what the BQ side actually is.
+                text = f"AWS costs priced from {window} ({volume}) and current published rates."
+        elif bq_cost_basis == "modelled":
             text = (
                 "No workload data — compute is a rough range and scan volume a stored-bytes "
                 "proxy. Provide query logs for a measured estimate."
             )
+        else:
+            # No workload data AND no modelled BQ side: don't advise query logs as a
+            # remedy for a state they cannot fix.
+            text = "AWS compute is a rough range (no workload data)."
+        text += bq_basis_qualifier(bq_cost_basis)
         return level, text
 
     def _key_uncertainties(self, slots: SlotUtilization | None) -> list[str]:
@@ -345,8 +427,11 @@ class CostEstimator:
             f"(${v4.V4_ONDEMAND_USD_PER_TIB}/TiB scan, "
             f"${v4.V4_STORAGE_ACTIVE_LOGICAL_USD_PER_GIB_MONTH}/GiB-mo active storage)"
         )
+        aws_side = f"AWS priced for {k.AWS_REGION_SCOPE}"
+        if k.AWS_REGION_MATCH_NOTE:
+            aws_side += f" ({k.AWS_REGION_MATCH_NOTE})"
         notes = [
-            f"{bq_side}; AWS priced for {k.AWS_REGION_SCOPE}.",
+            f"{bq_side}; {aws_side}.",
             ("Athena priced at $5.00/TB scanned (on-demand, region-invariant; verified 2026-07-21); "
             "DDL and failed queries are not billed; a 10 MB per-query minimum applies."),
             ("Athena one-time OPTIMIZE compaction estimated at $5/TB of stored data — an upper bound "
@@ -1210,14 +1295,33 @@ class CostEstimator:
     def _bigquery_runrate(self, total_bytes, pricing, slots, override):
         """BigQuery monthly run-rate + breakdown + availability (R18.2 / R16.4 / 2026-08-10)."""
         if override is not None:
-            line = CostLine(
-                label="BigQuery (customer-provided)", monthly=round(float(override), 4),
-                monthly_low=None, monthly_high=None, confidence=ConfidenceLevel.HIGH,
-                source_note=(
+            supplied_on = getattr(pricing, "customer_cost_supplied_on", None)
+            from_bundle = (
+                pricing is not None
+                and pricing.customer_monthly_cost is not None
+                and float(override) == float(pricing.customer_monthly_cost)
+                and supplied_on
+            )
+            if from_bundle:
+                # Bundle-carried figure: date it so a months-old bill is never
+                # mistaken for a current one (2026-08-12 review F4).
+                label = f"BigQuery (customer-provided {supplied_on})"
+                note = (
+                    f"customer-supplied total monthly BigQuery bill, recorded at "
+                    f"collection on {supplied_on} (--bigquery-monthly-cost; not "
+                    f"decomposable into compute vs storage)"
+                )
+            else:
+                label = "BigQuery (customer-provided)"
+                note = (
                     "customer-supplied total monthly BigQuery bill via "
                     "--bigquery-monthly-cost (no price-list date; not decomposable "
                     "into compute vs storage)"
-                ),
+                )
+            line = CostLine(
+                label=label, monthly=round(float(override), 4),
+                monthly_low=None, monthly_high=None, confidence=ConfidenceLevel.HIGH,
+                source_note=note,
             )
             return float(override), [line], {"available": True, "basis": "customer_provided", "reason": ""}
 
@@ -1419,7 +1523,7 @@ class CostEstimator:
                 # utilization ratio, not 1.0 — at low utilization most of the cost would
                 # be attributed to nobody, understating BQ cost (and overstating AWS
                 # savings). Floor each share at equal headcount so the idle-capacity
-                # cost is still carried (verified 2026-08-10).
+                # cost is still carried (storm-verified 2026-08-10).
                 usage_share = min(project_slot_ms / reservation_total_slot_ms, 1.0)
                 headcount_share = 1.0 / pricing.assigned_count
                 proration = max(usage_share, headcount_share)
@@ -1541,7 +1645,7 @@ class CostEstimator:
         minimum; the upper figure models 50-slot steps spread over busy hours.
         Neither endpoint is a hard bound: billing follows per-minute scaled peaks,
         so a bursty workload's real bill can EXCEED the upper estimate, and hourly
-        aggregates can't distinguish that case (verified 2026-08-10). Totals
+        aggregates can't distinguish that case (storm-verified 2026-08-10). Totals
         use the upper estimate (headline) as the less-flattering-to-AWS anchor.
         HIGH confidence is reserved for the reservation-timeline path.
         """
@@ -1613,7 +1717,7 @@ class CostEstimator:
         """Hard stop: capacity detected but rate AND quantity are unknowable — no estimate.
 
         Returns (0.0, lines, reason). The 0.0 is deliberate: the storage figure must
-        not masquerade as the BigQuery bill in the comparison (2026-08-10 sandbox validation:
+        not masquerade as the BigQuery bill in the comparison (2026-08-10 SpinLab:
         storage-only $2,986 rendered as 'BigQuery (Current)' and produced a fabricated
         'Save $412/mo'). Storage is still shown as a line inside the notice.
         """
@@ -1682,7 +1786,7 @@ class CostEstimator:
         # Core justification: volume, crossover, pattern. The crossover-assumptions
         # sentence describes Serverless's 4-RPU minimum posture — only relevant when
         # the recommended scenario IS Serverless (a provisioned recommendation
-        # mentioning "4 RPU" reads as a contradiction — sandbox feedback).
+        # mentioning "4 RPU" reads as a contradiction — SpinLab feedback).
         justification = (
             f"Your workload scans {monthly_scanned_tb:.2f} TB/month ({daily_scanned_tb:.2f} TB/day, "
             f"{qpd:,.0f} queries/day) — far below the ~{crossover:.2f} TB/day crossover where "
@@ -2015,6 +2119,40 @@ def _bq_breakdown_low(lines: list, total: float) -> float | None:
     return round(min(low, total), 4)
 
 
+def estimate_basis_level(*line_groups, bq_cost_available: bool) -> ConfidenceLevel:
+    """The cost section's one confidence level: min over priced lines, CAPPED at
+    MEDIUM when the BigQuery cost is unavailable (Ryan, 2026-08-13) — a report
+    whose BigQuery half is missing must never badge HIGH, even when every
+    remaining priced line (measured storage + provisioned compute) is HIGH.
+    Shared by CostEstimator._estimate_basis and comparison._derive_estimate_basis.
+    """
+    level = min_line_confidence(*line_groups)
+    if not bq_cost_available and level is ConfidenceLevel.HIGH:
+        return ConfidenceLevel.MEDIUM
+    return level
+
+
+def bq_basis_qualifier(bq_cost_basis: str) -> str:
+    """One sentence describing the BigQuery side of the estimate basis — the
+    SINGLE wording owner for the customer-provided and unavailable states
+    (2026-08-13 review: two divergent sentence trees drifted, and the HTML-
+    geometry phrase 'see the notice above' leaked into the JSON export).
+    Returns '' for the modelled state (the base sentence already covers it).
+    Appended by BOTH basis builders so the paths cannot drift.
+    """
+    if bq_cost_basis == "customer_provided":
+        return (
+            " The BigQuery figure is customer-supplied (--bigquery-monthly-cost), "
+            "not modelled from rates."
+        )
+    if bq_cost_basis == "unavailable":
+        return (
+            " BigQuery cost could not be determined — this report prices the AWS "
+            "side only (see the BigQuery cost notice in this report)."
+        )
+    return ""
+
+
 def _breakeven(onetime: float, monthly_delta: float) -> float:
     if monthly_delta <= 0:
         return k.BREAKEVEN_NEVER
@@ -2096,7 +2234,7 @@ def apply_rms_storage_split(
         return
     # Suppress a line that would render $0.00 (empty RMS-placed tables) —
     # a zero-value line item is noise; the placement itself still shows on
-    # the entities (2026-08-04 audit: sandbox estate carried '0.0 GB × rate = $0.00').
+    # the entities (2026-08-04 audit: spinlab carried '0.0 GB × rate = $0.00').
     if total_rms_bytes * k.GB_PER_BYTE * k.V6_MANAGED_STORAGE_USD_PER_GB_MONTH < 0.005:
         return
 

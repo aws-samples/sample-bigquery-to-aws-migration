@@ -434,7 +434,7 @@ class TestDeriveEstimateBasis:
             confidence=ConfidenceLevel.MEDIUM,
         )
         _level, text = _derive_estimate_basis(
-            [], athena_scenario, _low_volume_profile()
+            [], athena_scenario, _low_volume_profile(), bq_cost_basis="modelled"
         )
         assert "Athena" in text
 
@@ -442,9 +442,41 @@ class TestDeriveEstimateBasis:
         """Redshift scenario with workload data mentions Redshift."""
         rs_scenario = _serverless_scenario()
         _level, text = _derive_estimate_basis(
-            [], rs_scenario, _low_volume_profile()
+            [], rs_scenario, _low_volume_profile(), bq_cost_basis="modelled"
         )
         assert "Redshift" in text
+
+    def test_unavailable_bq_line_does_not_drag_level_to_low(self):
+        """When BQ cost is unavailable, its LOW placeholder line must not gate the
+        basis level — there is no BQ estimate for that LOW to describe, and the
+        report already renders the unavailable notice (2026-08-12: spinlab showed
+        'Low Confidence Cost Estimate' over a MEDIUM AWS estimate)."""
+        unavailable_line = CostLine(
+            label="BigQuery capacity (ENTERPRISE) — UNAVAILABLE", monthly=None,
+            monthly_low=None, monthly_high=None,
+            confidence=ConfidenceLevel.LOW, source_note="permission denied",
+        )
+        rs_scenario = _serverless_scenario()   # MEDIUM lines
+        level, _text = _derive_estimate_basis(
+            [unavailable_line], rs_scenario, _low_volume_profile(),
+            bq_cost_basis="unavailable",
+        )
+        assert level is not ConfidenceLevel.LOW
+
+    def test_available_low_bq_line_still_gates(self):
+        """When BQ cost IS available, a LOW BQ line still caps the level — the
+        chain stays as strong as its weakest real input."""
+        low_line = CostLine(
+            label="BigQuery capacity (ENTERPRISE)", monthly=100.0,
+            monthly_low=None, monthly_high=None,
+            confidence=ConfidenceLevel.LOW, source_note="proxy",
+        )
+        rs_scenario = _serverless_scenario()
+        level, _text = _derive_estimate_basis(
+            [low_line], rs_scenario, _low_volume_profile(),
+            bq_cost_basis="modelled",
+        )
+        assert level is ConfidenceLevel.LOW
 
 
 # ---- Task 3: BQ cost unavailable state survives engine comparison ----
@@ -588,3 +620,83 @@ class TestConcurrencyHeuristic:
         )
         assert "See signal breakdown below" not in reasoning
         assert "Signal detail available in the JSON export" in reasoning
+
+
+class TestEstimateBasisMediumCapAndWording:
+    """2026-08-13 review fixes: unavailable BQ cost caps the badge at MEDIUM,
+    and the BQ-side wording comes from one shared qualifier in both paths."""
+
+    def _all_high_scenario(self) -> AWSScenario:
+        return AWSScenario(
+            label="Redshift Provisioned 2x ra3 (3yr Reserved)",
+            category="PROVISIONED_RI",
+            lines=[
+                _storage_line(),   # HIGH
+                CostLine(
+                    label="Redshift Provisioned compute", monthly=2500.0,
+                    monthly_low=None, monthly_high=None,
+                    confidence=ConfidenceLevel.HIGH, source_note="list rates",
+                ),
+            ],
+            monthly_total=2510.0,
+            confidence=ConfidenceLevel.HIGH,
+        )
+
+    def test_unavailable_caps_level_at_medium_even_when_all_lines_high(self):
+        """A report with NO BigQuery figure must never badge HIGH (Ryan 2026-08-13)."""
+        bq_storage_high = CostLine(
+            label="BigQuery storage", monthly=100.0, monthly_low=None,
+            monthly_high=None, confidence=ConfidenceLevel.HIGH, source_note="measured",
+        )
+        unavailable = CostLine(
+            label="BigQuery capacity (ENTERPRISE) — UNAVAILABLE", monthly=None,
+            monthly_low=None, monthly_high=None,
+            confidence=ConfidenceLevel.LOW, source_note="permission denied",
+        )
+        level, _ = _derive_estimate_basis(
+            [bq_storage_high, unavailable], self._all_high_scenario(),
+            _low_volume_profile(), bq_cost_basis="unavailable",
+        )
+        assert level is ConfidenceLevel.MEDIUM
+
+    def test_modelled_all_high_still_floats_to_high(self):
+        """The cap applies ONLY to the unavailable state — a fully priced
+        comparison keeps its earned level."""
+        bq_line = CostLine(
+            label="BigQuery bytes scanned", monthly=500.0, monthly_low=None,
+            monthly_high=None, confidence=ConfidenceLevel.HIGH, source_note="billed",
+        )
+        level, _ = _derive_estimate_basis(
+            [bq_line], self._all_high_scenario(), _low_volume_profile(),
+            bq_cost_basis="modelled",
+        )
+        assert level is ConfidenceLevel.HIGH
+
+    def test_unavailable_wording_has_no_html_geometry(self):
+        """'see the notice above' leaked into the JSON export where no notice
+        exists — the shared qualifier must not reference page layout."""
+        _, text = _derive_estimate_basis(
+            [], self._all_high_scenario(), _low_volume_profile(),
+            bq_cost_basis="unavailable",
+        )
+        assert "BigQuery cost could not be determined" in text
+        assert "notice above" not in text
+
+    def test_customer_provided_wording_survives_the_unified_path(self):
+        """With --bigquery-monthly-cost + workload data, assemble overwrites the
+        estimator's basis — the provenance disclosure must survive that rebuild
+        (2026-08-13 review: it used to be silently replaced)."""
+        _, text = _derive_estimate_basis(
+            [], self._all_high_scenario(), _low_volume_profile(),
+            bq_cost_basis="customer_provided",
+        )
+        assert "customer-supplied" in text
+        assert "--bigquery-monthly-cost" in text
+
+    def test_no_data_unavailable_does_not_advise_query_logs(self):
+        """Query logs cannot fix an unavailable BQ side — don't advise them."""
+        no_data = WorkloadProfile()
+        _, text = _derive_estimate_basis(
+            [], self._all_high_scenario(), no_data, bq_cost_basis="unavailable",
+        )
+        assert "Provide query logs" not in text

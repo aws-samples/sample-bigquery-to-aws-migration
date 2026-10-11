@@ -79,7 +79,7 @@ def _format_savings(value, suffix="/mo"):
     Single formatter for hero, tiles, and scenario rows — ensures consistent
     rendering across all savings-display paths. Sign semantics: positive delta =
     AWS cheaper. Negative deltas say '$X more' explicitly — the previous bare
-    '+$X' under a "Savings" label read as a saving (2026-07-31 sandbox validation:
+    '+$X' under a "Savings" label read as a saving (2026-07-31 SpinLab sandbox:
     a $356/mo cost increase rendered as '+$355.59/mo' in green).
     """
     if value is None or isinstance(value, Undefined):
@@ -162,9 +162,10 @@ class HTMLWriter:
 
         query_sample_chunks: list[dict] = []
         entity_to_chunk: dict[str, int] = {}
+        samples_omitted_count = 0
         if query_workloads:
-            query_sample_chunks, entity_to_chunk = build_query_sample_chunks(
-                query_workloads
+            query_sample_chunks, entity_to_chunk, samples_omitted_count = (
+                build_query_sample_chunks(query_workloads)
             )
 
         # query_workload is an EntityReport field, so the serialized dicts (and
@@ -188,7 +189,9 @@ class HTMLWriter:
 
         query_entities = [_annotate(d) for d in query_entities]
 
-        report_rows, detail_chunks = build_report_rows(effort_entities, query_entities)
+        report_rows, detail_chunks, detail_omitted_count = build_report_rows(
+            effort_entities, query_entities
+        )
 
         rg_4xl = k.V7_RG_NODE_TYPES["rg.4xlarge"]
         rg_xl = k.V7_RG_NODE_TYPES["rg.xlarge"]
@@ -239,6 +242,8 @@ class HTMLWriter:
             **landing_data,
             "report_rows": report_rows,
             "detail_chunks": detail_chunks,
+            "detail_omitted_count": detail_omitted_count,
+            "samples_omitted_count": samples_omitted_count,
             "query_sample_chunks": query_sample_chunks,
             "sql_counts": sql_counts,
             "recommended_engine": recommended_engine,

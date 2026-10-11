@@ -142,7 +142,7 @@ def test_landing_donut_scoped_to_sql_entities():
     """The landing Query Complexity donut must use the same scope as the tab
     it summarizes (SQL-owning entities), not all-entity complexity_counts —
     pdp22 showed 68 Adapt of 208 on the donut vs 7 of 7 on the tab
-    (2026-08-03 sandbox review)."""
+    (2026-08-03 SpinLab review)."""
     raw = (TEMPLATES / "combined.html.j2").read_text()
     donut_block = raw[raw.index('charts.donut("Query Complexity'):]
     donut_block = donut_block[:donut_block.index("]) }}")]
@@ -174,7 +174,7 @@ def _donut_center(html: str) -> str:
 def test_donut_center_shows_dominant_segment():
     """Center headline must be the biggest slice, not blindly segments[0] —
     an all-Adapt estate rendered '0% Portable' inside an all-amber ring
-    (2026-08-03 sandbox review)."""
+    (2026-08-03 SpinLab review)."""
     html = _render_donut([
         {"label": "Portable", "count": 0, "color": "green"},
         {"label": "Adapt", "count": 7, "color": "amber"},

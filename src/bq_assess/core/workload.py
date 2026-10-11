@@ -6,7 +6,7 @@ lookback window, and derives a Slot Time utilization curve: average / P50 / P99 
 concurrent slots plus an active-hour fraction (idle vs busy). The result grounds the AWS
 compute estimate (R18) in real utilization.
 
-Scale note (2026-07-08, deep audit): the live path reads HOURLY aggregates
+Scale note (2026-07-08, storm audit): the live path reads HOURLY aggregates
 (``jobs_query.read_jobs_hourly`` — ≤ 24×days rows) rather than per-job rows. Every curve
 metric was already derived from hourly buckets or grand sums, so aggregating server-side
 removes the multi-GB row stream a busy Source produced (the 10 PB-scale OOM risk). The

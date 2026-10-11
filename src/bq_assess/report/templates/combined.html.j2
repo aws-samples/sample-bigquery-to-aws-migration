@@ -129,7 +129,7 @@
     {# Scoped to SQL-owning entities (population REBUILT) — the same counts the
        Query Complexity tab shows. summary.complexity_counts spans ALL entities
        (plain tables can score ADAPT via the hub-entity bonus), which made the
-       landing donut disagree with the tab it summarizes (2026-08-03 sandbox validation
+       landing donut disagree with the tab it summarizes (2026-08-03 SpinLab
        review: donut said 68 Adapt / 208, tab said 7 of 7). #}
     {{ charts.donut("Query Complexity (SQL entities)", [
       {"label": "Portable", "count": sql_counts.PORTABLE, "color": "green"},
@@ -209,7 +209,7 @@
     <div class="cost-hero__block cost-hero__block--aws">
       <div class="cost-hero__label">AWS Lakehouse{% if cost.recommendation %} ({{ cost.recommendation.recommended_scenario }}){% endif %}</div>
       <div class="cost-hero__value" style="color: var(--color-severity-success);">{% if cost.aws_monthly_low == cost.aws_monthly_high %}{{ cost.aws_monthly_low|currency_precise }}{% else %}{{ cost.aws_monthly_low|currency_precise }} &ndash; {{ cost.aws_monthly_high|currency_precise }}{% endif %}</div>
-      <div class="cost-hero__sub">{% if cost.aws_pricing_region %}{{ cost.aws_pricing_region }}{% endif %}</div>
+      <div class="cost-hero__sub">{% if cost.aws_pricing_region %}{{ cost.aws_pricing_region }}{% endif %}{% if cost.aws_region_match_label %} <span class="badge badge-medium tip" tabindex="0" data-tip="{{ cost.aws_region_match_note }}" title="{{ cost.aws_region_match_note }}">{{ cost.aws_region_match_label }}</span>{% endif %}</div>
     </div>
   </div>
 
@@ -223,7 +223,7 @@
   {% endif %}
 
   {# Label and color follow the sign — a cost increase must never render as a
-     green "Savings" (2026-07-31 sandbox validation). When the delta range straddles
+     green "Savings" (2026-07-31 SpinLab sandbox). When the delta range straddles
      zero (AWS high bound costs more, low bound saves — the Intelligent-Tiering
      month-1 vs steady-state spread), show both bounds. #}
   {% set _delta_color = "var(--color-severity-success)" if cost.monthly_delta_low >= 0 else "var(--color-severity-warning)" %}
@@ -356,7 +356,7 @@
         <td><strong>{{ line.label }}</strong>{% if line.confidence == "LOW" %} <span class="badge badge-low tip" tabindex="0" data-tip="{{ help.CONFIDENCE_HELP['cost'][line.confidence] }}">LOW CONFIDENCE</span>{% endif %}</td>
         {# .get(): the serializer omits None-valued keys, so a range line has NO
            "monthly" key — bare `line.monthly is not none` is Undefined-is-not-none
-           = TRUE and rendered "N/A" (2026-07-31 sandbox regression). #}
+           = TRUE and rendered "N/A" (2026-07-31 SpinLab regression). #}
         <td style="text-align:right">
           {% if line.get("monthly") is not none %}
             {{ line.monthly|currency_precise }}
@@ -654,6 +654,15 @@
 
 <div class="section">
   <p class="text-muted" style="font-size:.8125rem; margin-bottom: var(--space-sm);">Click a row to expand conversion details (DDL, lossy casts, warnings).</p>
+  {% if detail_omitted_count %}
+  <div class="alert alert-info">
+    <strong>Large estate:</strong> generated DDL/DML/SQL is embedded for the entities that need
+    attention first (SQL definitions, then flagged tables, then by size).
+    {{ '{:,}'.format(detail_omitted_count) }} entities exceed this report's embed budget — their
+    expanded rows point to <code>migration/plan.json</code> and
+    <code>migration/redshift_phase.sql</code>, which always carry every entity.
+  </div>
+  {% endif %}
   <div class="table-toolbar">
     <input type="search" class="search-input" data-search-target="effort" placeholder="Filter by entity name&hellip;" aria-label="Filter tables by entity name">
   </div>
@@ -755,6 +764,17 @@
 
 <div class="section">
   <p class="text-muted" style="font-size:.8125rem; margin-bottom: var(--space-sm);">Click a row to expand analysis details (flags, rewrite guidance, translated SQL, placement). Entities with no visible SQL surface have no details.</p>
+  {% if detail_omitted_count or samples_omitted_count %}
+  <div class="alert alert-info">
+    <strong>Large estate:</strong>
+    {% if detail_omitted_count %}{{ '{:,}'.format(detail_omitted_count) }} entities exceed this
+    report's embed budget for generated SQL detail — their expanded rows point to
+    <code>migration/plan.json</code> and <code>migration/redshift_phase.sql</code>.{% endif %}
+    {% if samples_omitted_count %}Embedded query samples cover the heaviest workloads;
+    {{ '{:,}'.format(samples_omitted_count) }} entities show workload stats without SQL samples
+    (full statements in <code>query-workload/</code>).{% endif %}
+  </div>
+  {% endif %}
   <div class="table-toolbar">
     <input type="search" class="search-input" data-search-target="query" placeholder="Filter by entity name&hellip;" aria-label="Filter entities by name">
     <label class="show-all-toggle">
@@ -781,7 +801,14 @@
 </div><!-- end tab-query -->
 
 <div class="footer">
-  Generated by <strong>bq-assess</strong> &middot; {{ generated_at|timestamp }}
+  {# Provenance (#61): this file is emailed and archived detached from the run
+     that made it, and previously carried no version — only a timestamp. #}
+  Generated by <strong>bq-assess {{ tool_version }}</strong> &middot; {{ generated_at|timestamp }}
+  <div class="provenance">
+    source project <code>{{ project_id }}</code>
+    &middot; assessment <code>{{ assessment_id }}</code>
+    &middot; report schema v{{ schema_version }}
+  </div>
   <div class="disclaimer">
     <strong>Beta &amp; Disclaimer Notice</strong>
     {% for para in disclaimer_paragraphs %}
@@ -997,6 +1024,21 @@ function bulletList(items, muted) {
   return ul;
 }
 
+// Rows past the report's detail-embed byte budget (large estates) carry
+// detail_omitted — the generated DDL/DML/SQL lives only in the migration/
+// artifacts, which always cover every entity.
+function detailOmittedNote() {
+  var p = el('p', 'text-muted');
+  p.appendChild(document.createTextNode(
+    'Generated DDL, load DML, and translated SQL for this entity are in '));
+  p.appendChild(el('code', null, 'migration/plan.json'));
+  p.appendChild(document.createTextNode(' and '));
+  p.appendChild(el('code', null, 'migration/redshift_phase.sql'));
+  p.appendChild(document.createTextNode(
+    ' — omitted from this HTML to keep the report loadable at this estate’s scale.'));
+  return p;
+}
+
 function buildEffortDetail(e) {
   var td = document.createElement('td');
   td.setAttribute('colspan', '7');
@@ -1004,6 +1046,7 @@ function buildEffortDetail(e) {
 
   if (eff.reasoning) td.appendChild(scoreBreakdown(eff.reasoning));
   if (eff.flags && eff.flags.length) td.appendChild(flagsParagraph('What to review:', eff.flags));
+  if (e.detail_omitted) td.appendChild(detailOmittedNote());
 
   if (e.conversion) {
     td.appendChild(sectionHeading('Iceberg DDL (Athena)', 'Generated CREATE TABLE for the Iceberg Storage Target, in Athena engine v3 dialect — Athena creates the tables; Redshift queries them via an external schema. Review flagged type casts and partition decisions before running.'));
@@ -1159,6 +1202,7 @@ function buildQueryDetail(e) {
   }
 
   if (c.flags && c.flags.length) td.appendChild(flagsParagraph('What needs attention:', c.flags));
+  if (e.detail_omitted) td.appendChild(detailOmittedNote());
 
   if (e.depends_on && e.depends_on.length) {
     var dp = el('p');
@@ -1296,11 +1340,11 @@ function nonEmpty(v) {
 // Heavy fields (conversion, migration_plan, translated_sql) live in lazy detail
 // chunks — a non-null detail_chunk means at least one of them exists for this row.
 function effortHasDetail(e) {
-  return !!(e.effort.reasoning || nonEmpty(e.effort.flags) || e.detail_chunk != null || e.storage_placement);
+  return !!(e.effort.reasoning || nonEmpty(e.effort.flags) || e.detail_chunk != null || e.storage_placement || e.detail_omitted);
 }
 
 function queryHasDetail(e) {
-  return !!(e.complexity.score > 0 || nonEmpty(e.complexity.flags) || nonEmpty(e.rewrite_guidance) || e.placement || e.has_translated_sql || e.has_workload);
+  return !!(e.complexity.score > 0 || nonEmpty(e.complexity.flags) || nonEmpty(e.rewrite_guidance) || e.placement || e.has_translated_sql || e.has_workload || e.detail_omitted);
 }
 
 function renderEffortRow(e, tr) {

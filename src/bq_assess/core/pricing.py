@@ -165,7 +165,7 @@ class PricingDetector:
 
         Delegates to ``core.jobs_query.read_reservation_groups`` (JOBS_BY_PROJECT,
         completed-query lookback, project/region-qualified, GROUP BY reservation/edition) —
-        a handful of rows regardless of the Source's query volume (2026-07-08 deep audit:
+        a handful of rows regardless of the Source's query volume (2026-07-08 storm audit:
         the per-job read was a multi-GB row stream on busy projects). Returns ``[]`` if the
         query cannot be run (e.g. missing ``jobs.listAll``) — the caller treats no-signal
         as undeterminable (R16.3), never an error.

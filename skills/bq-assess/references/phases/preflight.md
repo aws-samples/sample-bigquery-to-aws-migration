@@ -85,7 +85,7 @@ Once all preflight checks pass (`bq_assess_installed`, `gcloud_installed`, and `
 
 - **`skip_workload`** — Ask: "Query-log analysis runs by default and produces the most accurate cost estimate. Skip it? (yes/no)"
   - Default: **no** (i.e. let the workload analysis run)
-  - Answer yes only when the account is known to lack `bigquery.jobs.listAll`, or reading job history is not permitted. If skipped, note that the cost comparison becomes a rough range and complexity scoring is heuristic-only.
+  - Answer yes only when the user knows the account lacks `bigquery.jobs.listAll`, or the customer forbids reading job history. If skipped, note that the cost comparison becomes a rough range and complexity scoring is heuristic-only.
   - Opting out uses `--skip-workload`. There is no `--include-query-logs` flag to pass.
 
 - **`query_log_days`** — Only ask if `skip_workload` is no.

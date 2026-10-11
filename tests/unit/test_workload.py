@@ -365,7 +365,7 @@ def test_all_carrying_export_keeps_billed_basis(tmp_path) -> None:
     assert slots.total_bytes_billed == 2 * 10**9
 
 
-# --- Hourly aggregation (2026-07-08 deep audit: 10 PB-scale OOM fix) ------------------
+# --- Hourly aggregation (2026-07-08 storm audit: 10 PB-scale OOM fix) ------------------
 
 def test_api_reads_hourly_aggregates() -> None:
     """The live path GROUPs BY hour server-side — bounded rows regardless of query volume."""
@@ -581,7 +581,7 @@ def test_garbage_missing_billed_count_degrades_not_promotes(tmp_path) -> None:
 def test_corrupt_far_future_timestamp_is_dropped_not_series_inflating(tmp_path) -> None:
     """A parseable-but-corrupt timestamp (year 9999) must be DROPPED, not zero-fill the
     hourly series across ~70M idle hours — the OOM class the hourly aggregation was
-    built to remove (2026-07-08 deep audit, MRI-4). The real workload survives."""
+    built to remove (2026-07-08 storm assess, MRI-4). The real workload survives."""
     entries = [
         {"hour_bucket": "2025-06-02T09:00:00Z", "total_slot_ms": _HOUR, "job_count": 1,
          "total_bytes_processed": 10**9},
@@ -618,7 +618,7 @@ def test_single_entry_workload_is_never_dropped_as_outlier(tmp_path) -> None:
 def test_float_formatted_numeric_strings_are_parsed_not_zeroed(tmp_path) -> None:
     """Float-formatted numeric strings ("3600000.0", "1e6") from spreadsheet-mediated
     exports must parse, not silently zero the compute curve — the underestimate
-    direction the module forbids (2026-07-08 deep audit, MRI-5). True garbage still
+    direction the module forbids (2026-07-08 storm assess, MRI-5). True garbage still
     coerces to 0."""
     from bq_assess.core.workload import _safe_int
 

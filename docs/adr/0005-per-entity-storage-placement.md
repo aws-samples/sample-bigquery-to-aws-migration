@@ -48,6 +48,6 @@ scripts contradict is worse than none.
   2026-07-22), remaining bytes stay on the S3 Tables tier. RMS at $0.024/GB is
   cheaper than S3 Tables tier 1 at $0.0265/GB, so RMS placements slightly lower
   the estimate. (The original "all-Iceberg is conservative" framing was revised
-  by the 2026-07-22 deep audit: the RMS line is real and must appear.)
+  by the 2026-07-22 storm audit: the RMS line is real and must appear.)
 - Entities placed on RMS lose multi-engine access — the advisor must never place
   an entity consumed by Athena (per engine placement) onto RMS.

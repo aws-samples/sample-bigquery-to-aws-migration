@@ -281,10 +281,322 @@ class TestTranslateToAthena:
         assert "UUID()" in result
 
     def test_date_sub_nested_first_arg(self):
+        # The nested DATE_TRUNC is also translated now (#71): BQ takes
+        # (expr, UNIT), Trino takes ('unit', expr). This assertion previously
+        # expected the inner call to stay in BigQuery form, which pinned the bug
+        # that made Trino read the bare unit as a column name.
         result = translate_to_athena(
             "SELECT DATE_SUB(DATE_TRUNC(d, MONTH), INTERVAL 1 MONTH)"
         )
-        assert "DATE_ADD('month', -1, DATE_TRUNC(d, MONTH))" in result
+        assert "DATE_ADD('month', -1, DATE_TRUNC('month', d))" in result
+
+    def test_date_trunc_arg_order_swapped(self):
+        """BQ DATE_TRUNC(expr, UNIT) -> Trino DATE_TRUNC('unit', expr) (#71).
+
+        Untranslated, Trino parses the bare unit as a column and fails with
+        "Column 'month' cannot be resolved" — 4 of 49 live statements.
+        """
+        assert "DATE_TRUNC('month', order_date)" in translate_to_athena(
+            "SELECT DATE_TRUNC(order_date, MONTH) AS month FROM t"
+        )
+
+    def test_date_trunc_already_trino_is_untouched(self):
+        """Idempotent: the fixed-point pass must not re-scramble its own output."""
+        sql = "SELECT DATE_TRUNC('month', order_date) FROM t"
+        assert translate_to_athena(sql) == sql
+
+    def test_date_trunc_anonymized_unit_left_alone(self):
+        """An anonymized unit ('?') cannot be quoted meaningfully — skip it."""
+        assert "DATE_TRUNC(d, ?)" in translate_to_athena("SELECT DATE_TRUNC(d, ?) FROM t")
+
+    def test_safe_divide_to_nullif(self):
+        """BQ SAFE_DIVIDE -> Trino a / NULLIF(b, 0), same NULL-on-zero result."""
+        assert "(a / NULLIF(b, 0))" in translate_to_athena("SELECT SAFE_DIVIDE(a, b) FROM t")
+
+    def test_countif_to_count_if(self):
+        assert "COUNT_IF(x IS NOT NULL)" in translate_to_athena(
+            "SELECT COUNTIF(x IS NOT NULL) FROM t"
+        )
+
+    def test_count_if_not_double_rewritten(self):
+        """Guard against COUNT_IF -> COUNT__IF on the already-translated form."""
+        assert "COUNT__IF" not in translate_to_athena("SELECT COUNT_IF(x) FROM t")
+
+    def test_json_value_to_extract_scalar(self):
+        """Trino JSON_VALUE demands a lax/strict path mode; json_extract_scalar does not."""
+        out = translate_to_athena("SELECT JSON_VALUE(metrics, '$.revenue') FROM t")
+        assert "JSON_EXTRACT_SCALAR(metrics, '$.revenue')" in out
+
+    def test_approx_quantiles_to_percentile(self):
+        out = translate_to_athena("SELECT APPROX_QUANTILES(price, 4) FROM t")
+        assert "approx_percentile(price, ARRAY[0.25, 0.5, 0.75])" in out
+
+    def test_safe_prefix_becomes_try(self):
+        """BQ SAFE.fn(x) means NULL-on-error; Trino's equivalent is TRY(fn(x))."""
+        out = translate_to_athena("SELECT SAFE.ST_GEOGFROMTEXT(loc) FROM t")
+        assert "TRY(ST_GeometryFromText(loc))" in out
+
+    def test_untranslatable_construct_is_flagged(self):
+        """Unhandled BQ-only constructs must be named, not passed off as translated (#71)."""
+        out = translate_to_athena("SELECT * EXCEPT (a) FROM t")
+        assert "NOT FULLY TRANSLATED" in out
+        assert "EXCEPT" in out
+
+    def test_clean_query_gets_no_warning_banner(self):
+        """No false positives: a fully translatable query stays banner-free."""
+        out = translate_to_athena("SELECT COUNTIF(x) FROM t")
+        assert "NOT FULLY TRANSLATED" not in out
+
+
+class TestUnnestAliasAthena:
+    """BQ's ``UNNEST(expr) alias`` names the element; Trino's names the relation.
+
+    Measured on a live Athena workgroup: the BQ form fails COLUMN_NOT_FOUND,
+    ``AS rel(col)`` succeeds, and a 2-entry alias list over a 2-field row is
+    rejected — i.e. UNNEST of array(row) yields ONE row-typed column, so no
+    schema knowledge is needed to rewrite this. 5 of 49 live statements.
+    """
+
+    def test_comma_join_struct_array(self):
+        out = translate_to_athena(
+            "SELECT p.category FROM `p.d.user_profiles` up, UNNEST(up.preferences) p"
+        )
+        assert "UNNEST(up.preferences) AS p_u(p)" in out
+
+    def test_explicit_as_is_replaced_not_duplicated(self):
+        out = translate_to_athena("SELECT i.c FROM t c, UNNEST(c.items) AS i")
+        assert "UNNEST(c.items) AS i_u(i)" in out
+        assert "AS i AS" not in out
+
+    def test_nested_field_path_argument(self):
+        """The UNNEST argument is itself a struct path — paren scan must hold."""
+        out = translate_to_athena(
+            "SELECT i.category FROM t c, UNNEST(c.ecommerce.items) i"
+        )
+        assert "UNNEST(c.ecommerce.items) AS i_u(i)" in out
+
+    def test_scalar_array_alias_also_rewritten(self):
+        """Same defect for scalar arrays: bare ``tag`` cannot resolve either."""
+        out = translate_to_athena("SELECT tag FROM t, UNNEST(t.tags) tag")
+        assert "UNNEST(t.tags) AS tag_u(tag)" in out
+
+    def test_cross_join_form_rewritten(self):
+        out = translate_to_athena("SELECT i.c FROM t CROSS JOIN UNNEST(t.items) i")
+        assert "CROSS JOIN UNNEST(t.items) AS i_u(i)" in out
+
+    def test_already_trino_form_is_untouched(self):
+        """Idempotent — must not wrap its own output on a second pass."""
+        sql = "SELECT p.category FROM t up, UNNEST(up.preferences) AS p_u(p)"
+        assert translate_to_athena(sql) == sql
+
+    def test_unaliased_unnest_left_alone(self):
+        out = translate_to_athena("SELECT * FROM t, UNNEST(t.items)")
+        assert "UNNEST(t.items)" in out
+        assert "_u(" not in out
+
+    def test_trailing_keyword_not_eaten_as_alias(self):
+        """``WHERE``/``GROUP`` after UNNEST is a clause, not an alias."""
+        out = translate_to_athena("SELECT * FROM t, UNNEST(t.items) WHERE x > 1")
+        assert "UNNEST(t.items) WHERE" in out
+        assert "WHERE_u" not in out
+
+    def test_multiple_unnests_all_rewritten(self):
+        out = translate_to_athena(
+            "SELECT a.x, b.y FROM t, UNNEST(t.first) a, UNNEST(t.second) b"
+        )
+        assert "UNNEST(t.first) AS a_u(a)" in out
+        assert "UNNEST(t.second) AS b_u(b)" in out
+
+    def test_with_offset_flagged_not_guessed(self):
+        """WITH OFFSET changes the alias arity — disclose instead of rewriting."""
+        out = translate_to_athena("SELECT x, i FROM t, UNNEST(t.arr) x WITH OFFSET i")
+        assert "NOT FULLY TRANSLATED" in out
+        assert "WITH ORDINALITY" in out
+        assert "x_u" not in out
+
+    def test_redshift_path_unaffected(self):
+        """This is a Trino-shaped fix; Redshift still gets the review warning."""
+        out = translate_to_redshift("SELECT p.c FROM t up, UNNEST(up.preferences) p")
+        assert "_u(" not in out
+        assert "NOT FULLY TRANSLATED" in out
+
+
+class TestGroupByAliasAthena:
+    """BigQuery resolves SELECT output aliases in GROUP BY; Trino does not.
+
+    Measured on a live Athena workgroup: ``SELECT status AS s ... GROUP BY s``
+    fails COLUMN_NOT_FOUND while ``GROUP BY status`` succeeds. ORDER BY on an
+    alias is fine on both, since ordering happens after projection. 6 of 49
+    live statements hit this.
+    """
+
+    def test_alias_replaced_by_expression(self):
+        out = translate_to_athena("SELECT status AS s, COUNT(*) AS n FROM t GROUP BY s")
+        assert "GROUP BY status" in out
+
+    def test_function_expression_substituted(self):
+        out = translate_to_athena(
+            "SELECT DATE(event_timestamp) AS d, COUNT(*) AS n FROM t GROUP BY d"
+        )
+        assert "GROUP BY DATE(event_timestamp)" in out
+
+    def test_struct_path_substituted(self):
+        out = translate_to_athena(
+            "SELECT f.user.tier AS tier, COUNT(*) AS n FROM t f GROUP BY tier"
+        )
+        assert "GROUP BY f.user.tier" in out
+
+    def test_mixed_alias_and_plain_column(self):
+        out = translate_to_athena(
+            "SELECT a.b, c.d AS dd, COUNT(*) AS n FROM t GROUP BY a.b, dd"
+        )
+        assert "GROUP BY a.b, c.d" in out
+
+    def test_order_by_alias_left_alone(self):
+        """ORDER BY resolves aliases on Trino — rewriting it would add noise."""
+        out = translate_to_athena(
+            "SELECT status AS s, COUNT(*) AS n FROM t GROUP BY s ORDER BY n DESC"
+        )
+        assert "ORDER BY n DESC" in out
+
+    def test_cte_scoped_to_its_own_select(self):
+        """The GROUP BY inside a CTE must resolve against the CTE's select list."""
+        out = translate_to_athena(
+            "WITH m AS (SELECT DATE_TRUNC(order_date, MONTH) AS month, SUM(x) AS r "
+            "FROM t GROUP BY month) SELECT month, r FROM m ORDER BY month"
+        )
+        assert "GROUP BY DATE_TRUNC('month', order_date)" in out
+
+    def test_plain_column_group_by_untouched(self):
+        sql = "SELECT status, COUNT(*) AS n FROM t GROUP BY status"
+        assert translate_to_athena(sql) == sql
+
+    def test_aggregate_alias_not_substituted(self):
+        """Grouping by an aggregate is invalid on both engines — don't 'fix' it."""
+        out = translate_to_athena("SELECT COUNT(*) AS n, status FROM t GROUP BY n")
+        assert "GROUP BY n" in out
+
+    def test_idempotent(self):
+        sql = "SELECT status AS s, COUNT(*) AS n FROM t GROUP BY status"
+        assert translate_to_athena(sql) == sql
+
+    def test_having_alias_gets_the_aggregate(self):
+        """HAVING runs pre-projection on Trino too — and there an aggregate is
+        exactly what belongs, unlike in GROUP BY."""
+        out = translate_to_athena(
+            "SELECT s, COUNT(*) AS sessions FROM t GROUP BY s HAVING sessions > ?"
+        )
+        assert "HAVING COUNT(*) > ?" in out
+
+    def test_having_compound_expression_parenthesized(self):
+        out = translate_to_athena(
+            "SELECT s, SUM(a) / SUM(b) AS ratio FROM t GROUP BY s HAVING ratio > ?"
+        )
+        assert "HAVING (SUM(a) / SUM(b)) > ?" in out
+
+    def test_having_stops_before_order_by(self):
+        out = translate_to_athena(
+            "SELECT s, COUNT(*) AS n FROM t GROUP BY s HAVING n > ? ORDER BY n DESC"
+        )
+        assert "HAVING COUNT(*) > ?" in out
+        assert "ORDER BY n DESC" in out
+
+    def test_having_qualified_name_untouched(self):
+        out = translate_to_athena("SELECT COUNT(*) AS n FROM t GROUP BY x HAVING t.n > 1")
+        assert "HAVING t.n > 1" in out
+
+    def test_having_function_name_untouched(self):
+        """An alias that collides with a function name must not eat the call."""
+        out = translate_to_athena(
+            "SELECT COUNT(*) AS count FROM t GROUP BY x HAVING count(*) > 1"
+        )
+        assert "HAVING count(*) > 1" in out
+
+    def test_having_string_literal_untouched(self):
+        out = translate_to_athena(
+            "SELECT s, COUNT(*) AS n FROM t GROUP BY s HAVING n > 1 AND s = 'n'"
+        )
+        assert "s = 'n'" in out
+        assert "HAVING COUNT(*) > 1" in out
+
+
+class TestUsingJoinDisclosureAthena:
+    """Trino merges a USING column; BigQuery keeps both sides qualifiable.
+
+    Verified live: the same query fails with USING + ``o.user_id`` and succeeds
+    with an explicit ON. Rewriting needs the left-hand alias, which is ambiguous
+    once joins chain, so this is disclosed rather than guessed.
+    """
+
+    def test_inner_join_qualifier_is_stripped(self):
+        """Measured with literal rows: for an inner join the merged column equals
+        both sides, so dropping the qualifier is an exact rewrite."""
+        out = translate_to_athena(
+            "SELECT COUNT(DISTINCT o.user_id) FROM orders o JOIN users u USING (user_id)"
+        )
+        assert "COUNT(DISTINCT user_id)" in out
+        assert "NOT FULLY TRANSLATED" not in out
+
+    def test_outer_join_qualifier_is_disclosed_not_stripped(self):
+        """RIGHT JOIN ... USING(id) returned [2, 3] where the ON form qualified to
+        the left table returned [2, NULL] — the merged column is COALESCE-like, so
+        stripping would silently change the answer."""
+        out = translate_to_athena(
+            "SELECT COUNT(DISTINCT o.user_id) FROM orders o "
+            "LEFT JOIN users u USING (user_id)"
+        )
+        assert "o.user_id" in out
+        assert "NOT FULLY TRANSLATED" in out
+        assert "OUTER JOIN" in out
+
+    def test_non_using_qualifiers_preserved(self):
+        """Only USING columns merge; ``a.av`` stays resolvable alongside USING(id)."""
+        out = translate_to_athena(
+            "SELECT o.order_date, u.country FROM orders o JOIN users u USING (user_id)"
+        )
+        assert "o.order_date" in out
+        assert "u.country" in out
+
+    def test_correlated_subquery_reference_not_rebound(self):
+        """The regression that matters: an unscoped strip turned
+        ``x.user_id = o.user_id`` into ``x.user_id = user_id``, which rebinds to
+        the inner relation and quietly returns the wrong rows. Must disclose
+        instead of rewriting."""
+        out = translate_to_athena(
+            "SELECT o.order_date FROM orders o JOIN users u USING (user_id) "
+            "WHERE EXISTS (SELECT ? FROM carts x WHERE x.user_id = o.user_id)"
+        )
+        assert "x.user_id = o.user_id" in out
+        assert "NOT FULLY TRANSLATED" in out
+
+    def test_aggregate_parens_do_not_count_as_a_scope(self):
+        """COUNT(...) parens must not look like a subquery, or the real-world
+        ``COUNT(DISTINCT o.user_id)`` case would be skipped."""
+        out = translate_to_athena(
+            "SELECT o.d, COUNT(DISTINCT o.user_id) AS n FROM orders o "
+            "JOIN users u USING (user_id) GROUP BY o.d"
+        )
+        assert "COUNT(DISTINCT user_id)" in out
+
+    def test_multi_column_using(self):
+        out = translate_to_athena("SELECT a.k1, a.k2 FROM a JOIN b USING (k1, k2)")
+        assert "SELECT k1, k2" in out
+
+    def test_using_without_qualified_reference_not_flagged(self):
+        """No false positive: this shape runs fine on Trino."""
+        out = translate_to_athena(
+            "SELECT o.order_date, p.category FROM orders o "
+            "JOIN order_items oi USING (order_id) JOIN products p USING (product_id) "
+            "GROUP BY o.order_date, p.category"
+        )
+        assert "NOT FULLY TRANSLATED" not in out
+        assert "o.order_date" in out
+
+    def test_anonymized_approx_quantiles_is_flagged(self):
+        """A '?' bucket count leaves no literal to expand — disclose it."""
+        out = translate_to_athena("SELECT APPROX_QUANTILES(price, ?) AS q FROM t")
+        assert "NOT FULLY TRANSLATED" in out
+        assert "APPROX_QUANTILES" in out
 
     def test_struct_to_row_valid_trino(self):
         result = translate_to_athena("SELECT STRUCT(a, b)")

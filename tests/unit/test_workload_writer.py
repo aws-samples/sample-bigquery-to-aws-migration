@@ -129,7 +129,7 @@ class TestQuerySampleChunkClipping:
 
         long_sql = "SELECT " + ", ".join(f"col_{i}" for i in range(2000))
         assert len(long_sql) > MAX_SAMPLE_SQL_CHARS
-        chunks, index = build_query_sample_chunks({
+        chunks, index, _omitted = build_query_sample_chunks({
             "ds.t": {"samples": [{
                 "query": long_sql, "translated": long_sql,
                 "statement_type": "SELECT", "total_slot_ms": 1000,
@@ -144,7 +144,7 @@ class TestQuerySampleChunkClipping:
     def test_short_sql_untouched(self):
         from bq_assess.report._serialize import build_query_sample_chunks
 
-        chunks, _ = build_query_sample_chunks({
+        chunks, _, _omitted = build_query_sample_chunks({
             "ds.t": {"samples": [{
                 "query": "SELECT 1", "translated": "SELECT 1",
                 "statement_type": "SELECT", "total_slot_ms": 1000,

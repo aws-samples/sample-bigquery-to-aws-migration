@@ -24,6 +24,15 @@ AWS_CONFIRMED_DATE: str = "2026-06-24"
 AWS_REGION_SCOPE: str = "US East (N. Virginia) / us-east-1"
 # The AWS region the module-level constants currently reflect (set by apply_aws_region).
 AWS_PRICING_REGION: str = "us-east-1"
+# Non-empty when the region choice was not a clean nearest match (pinned judgment call,
+# distant nearest-with-stack, or unknown-location fallback). Rendered in the report's
+# methodology text so a non-obvious choice is never silent (set by apply_aws_region).
+AWS_REGION_MATCH_NOTE: str = ""
+# Badge text for the report's cost hero ("pinned region" | "fallback region" |
+# "distant region"); empty = no badge. Quiet pins (us/eu multi-regions) keep their
+# note but suppress the badge — badging the most common case trains readers to
+# ignore it (set by apply_aws_region, sourced from RegionMatch.ui_label).
+AWS_REGION_MATCH_LABEL: str = ""
 V1_SOURCE_URL: str = "https://aws.amazon.com/redshift/pricing/"
 V2_SOURCE_URL: str = "https://aws.amazon.com/s3/pricing/"
 
@@ -267,7 +276,7 @@ V6_CONCURRENCY_SCALING_OVERHEAD_FRACTION: float = 0.20
 
 # =============================================================================
 # Region cascade — BigQuery dataset location → nearest AWS region, plus verified
-# per-region AWS rates. Verified 2026-07-02 against the AWS Price List API
+# per-region AWS rates. Verified 2026-08-13 against the AWS Price List API
 # (AmazonRedshift + AmazonS3 regional offer files). The comparison must price both
 # clouds in the same geography: an australia-southeast1 Source gets its Query Engine
 # (Redshift Serverless / provisioned nodes) and storage priced in ap-southeast-2,
@@ -279,27 +288,127 @@ V6_CONCURRENCY_SCALING_OVERHEAD_FRACTION: float = 0.20
 # manifest without importing the engine). Re-exported here for existing call sites.
 from bq_assess.core.region_mapping import (  # noqa: F401
     BQ_LOCATION_TO_AWS_REGION,
+    RegionMatch,
     bq_location_to_aws_region,
+    match_bq_location,
 )
 
-# Per-AWS-region rates (Price List API, 2026-07-02). Only rg.xlarge and rg.4xlarge exist
-# (verified 2026-07-15; rg.16xlarge was removed — the node type does not exist).
+# Per-AWS-region rates (Price List API, verified 2026-08-13). Every region in this table
+# offers the full target stack (S3 Tables + Redshift Serverless + rg nodes) — the set is
+# AWS_REGIONS_WITH_STACK in core/region_mapping.py; a test asserts the two stay in sync.
+# Only rg.xlarge and rg.4xlarge exist (rg.16xlarge is not a real node type).
 AWS_REGIONAL_RATES: dict[str, dict] = {
-    "us-east-1": {
-        "label": "US East (N. Virginia)",
-        "rpu_hour": 0.375, "rms": 0.024,
-        "s3_tables": (0.0265, 0.0253, 0.0242),
-        "s3_int": (0.0144, 0.0046),
-        "rg.xlarge": (0.76, 0.532, 0.331), "rg.4xlarge": (3.043, 2.130, 1.324),
-        "ra3.xlplus": (1.086, 0.760, 0.473), "ra3.4xlarge": (3.26, 2.282, 1.418), "ra3.16xlarge": (13.04, 9.128, 5.672),
+    "af-south-1": {
+        "label": "Africa (Cape Town)",
+        "rpu_hour": 0.46053, "rms": 0.029,
+        "s3_tables": (0.0315, 0.0301, 0.0288),
+        "s3_int": (0.0171, 0.0058),
+        "rg.xlarge": (1.001, 0.70049, 0.43561), "rg.4xlarge": (4.004, 2.79888, 1.74375),
+        "ra3.xlplus": (1.43, 1.0007, 0.6223), "ra3.4xlarge": (4.29, 2.9988, 1.8683), "ra3.16xlarge": (17.16, 12.019, 7.461),
     },
-    "us-west-2": {
-        "label": "US West (Oregon)",
-        "rpu_hour": 0.36, "rms": 0.024,
-        "s3_tables": (0.0265, 0.0253, 0.0242),
-        "s3_int": (0.0144, 0.0046),
-        "rg.xlarge": (0.7602, 0.53214, 0.33075), "rg.4xlarge": (3.04267, 2.12987, 1.32356),
-        "ra3.xlplus": (1.086, 0.7602, 0.4725), "ra3.4xlarge": (3.26, 2.282, 1.4181), "ra3.16xlarge": (13.04, 9.128, 5.6724),
+    "ap-east-1": {
+        "label": "Asia Pacific (Hong Kong)",
+        "rpu_hour": 0.495, "rms": 0.024,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.7602, 0.532, 0.3311), "rg.4xlarge": (3.04267, 2.128, 1.32533),
+        "ra3.xlplus": (1.086, 0.76, 0.473), "ra3.4xlarge": (3.26, 2.28, 1.42), "ra3.16xlarge": (13.04, 9.13, 5.67),
+    },
+    "ap-east-2": {
+        "label": "Asia Pacific (Taipei)",
+        "rpu_hour": 0.4446, "rms": 0.02349,
+        "s3_tables": (0.025875, 0.02484, 0.023805),
+        "s3_int": (0.014283, 0.00575),
+        "rg.xlarge": (0.80514, 0.5642, 0.35049), "rg.4xlarge": (3.22224, 2.25587, 1.401867),
+        "ra3.xlplus": (1.1502, 0.806, 0.5007), "ra3.4xlarge": (3.4524, 2.417, 1.502), "ra3.16xlarge": (13.8123, 9.669, 6.008),
+    },
+    "ap-northeast-1": {
+        "label": "Asia Pacific (Tokyo)",
+        "rpu_hour": 0.494, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.8946, 0.62622, 0.3892), "rg.4xlarge": (3.58027, 2.50619, 1.55745),
+        "ra3.xlplus": (1.278, 0.8946, 0.556), "ra3.4xlarge": (3.836, 2.6852, 1.6687), "ra3.16xlarge": (15.347, 10.7429, 6.676),
+    },
+    "ap-northeast-2": {
+        "label": "Asia Pacific (Seoul)",
+        "rpu_hour": 0.438, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.8946, 0.62622, 0.3892), "rg.4xlarge": (3.58027, 2.50619, 1.55745),
+        "ra3.xlplus": (1.278, 0.8946, 0.556), "ra3.4xlarge": (3.836, 2.6852, 1.6687), "ra3.16xlarge": (15.347, 10.7429, 6.676),
+    },
+    "ap-northeast-3": {
+        "label": "Asia Pacific (Osaka)",
+        "rpu_hour": 0.45, "rms": 0.026,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.896, 0.6265, 0.3892), "rg.4xlarge": (3.584, 2.51067, 1.55867),
+        "ra3.xlplus": (1.28, 0.895, 0.556), "ra3.4xlarge": (3.84, 2.69, 1.67), "ra3.16xlarge": (15.35, 10.7, 6.68),
+    },
+    "ap-south-1": {
+        "label": "Asia Pacific (Mumbai)",
+        "rpu_hour": 0.4275, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.8645, 0.60515, 0.37611), "rg.4xlarge": (3.45893, 2.42125, 1.50472),
+        "ra3.xlplus": (1.235, 0.8645, 0.5373), "ra3.4xlarge": (3.706, 2.5942, 1.6122), "ra3.16xlarge": (14.827, 10.3789, 6.4498),
+    },
+    "ap-south-2": {
+        "label": "Asia Pacific (Hyderabad)",
+        "rpu_hour": 0.4275, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.8645, 0.6041, 0.3759), "rg.4xlarge": (3.45893, 2.41733, 1.50267),
+        "ra3.xlplus": (1.235, 0.863, 0.537), "ra3.4xlarge": (3.706, 2.59, 1.61), "ra3.16xlarge": (14.827, 10.38, 6.45),
+    },
+    "ap-southeast-1": {
+        "label": "Asia Pacific (Singapore)",
+        "rpu_hour": 0.45, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
+        "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
+    },
+    "ap-southeast-2": {
+        "label": "Asia Pacific (Sydney)",
+        "rpu_hour": 0.419, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
+        "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
+    },
+    "ap-southeast-3": {
+        "label": "Asia Pacific (Jakarta)",
+        "rpu_hour": 0.45, "rms": 0.0261,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
+        "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.363, 10.9452, 6.8017),
+    },
+    "ap-southeast-4": {
+        "label": "Asia Pacific (Melbourne)",
+        "rpu_hour": 0.419, "rms": 0.026,
+        "s3_tables": (0.0288, 0.0276, 0.0265),
+        "s3_int": (0.0159, 0.0058),
+        "rg.xlarge": (0.9121, 0.6384, 0.3969), "rg.4xlarge": (3.6484, 2.55733, 1.58667),
+        "ra3.xlplus": (1.303, 0.912, 0.567), "ra3.4xlarge": (3.909, 2.74, 1.7), "ra3.16xlarge": (15.636, 10.95, 6.8),
+    },
+    "ap-southeast-5": {
+        "label": "Asia Pacific (Malaysia)",
+        "rpu_hour": 0.405, "rms": 0.02349,
+        "s3_tables": (0.0259, 0.0248, 0.0238),
+        "s3_int": (0.0143, 0.0052),
+        "rg.xlarge": (0.82089, 0.5747, 0.357), "rg.4xlarge": (3.28356, 2.29787, 1.42893),
+        "ra3.xlplus": (1.1727, 0.821, 0.51), "ra3.4xlarge": (3.5181, 2.462, 1.531), "ra3.16xlarge": (14.0724, 9.851, 6.122),
+    },
+    "ap-southeast-7": {
+        "label": "Asia Pacific (Thailand)",
+        "rpu_hour": 0.405, "rms": 0.02349,
+        "s3_tables": (0.0259, 0.0248, 0.0238),
+        "s3_int": (0.0143, 0.0052),
+        "rg.xlarge": (0.82089, 0.5747, 0.357), "rg.4xlarge": (3.28356, 2.2988, 1.428),
+        "ra3.xlplus": (1.1727, 0.821, 0.51), "ra3.4xlarge": (3.5181, 2.463, 1.53), "ra3.16xlarge": (14.0724, 9.852, 6.12),
     },
     "ca-central-1": {
         "label": "Canada (Central)",
@@ -309,13 +418,37 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "rg.xlarge": (0.8414, 0.58898, 0.36603), "rg.4xlarge": (3.36653, 2.35723, 1.46487),
         "ra3.xlplus": (1.202, 0.8414, 0.5229), "ra3.4xlarge": (3.607, 2.5256, 1.5695), "ra3.16xlarge": (14.43, 10.101, 6.2771),
     },
-    "sa-east-1": {
-        "label": "South America (São Paulo)",
-        "rpu_hour": 0.5976, "rms": 0.043,
-        "s3_tables": (0.0466, 0.0449, 0.0426),
-        "s3_int": (0.0254, 0.0095),
-        "rg.xlarge": (1.2117, 0.8484, 0.5271), "rg.4xlarge": (4.84867, 3.39407, 2.10924),
-        "ra3.xlplus": (1.731, 1.212, 0.753), "ra3.4xlarge": (5.195, 3.6365, 2.2599), "ra3.16xlarge": (20.78, 14.546, 9.0393),
+    "eu-central-1": {
+        "label": "Europe (Frankfurt)",
+        "rpu_hour": 0.451, "rms": 0.0256,
+        "s3_tables": (0.0282, 0.027, 0.0259),
+        "s3_int": (0.0155, 0.0058),
+        "rg.xlarge": (0.9086, 0.63602, 0.39529), "rg.4xlarge": (3.6344, 2.54408, 1.58097),
+        "ra3.xlplus": (1.298, 0.9086, 0.5647), "ra3.4xlarge": (3.894, 2.7258, 1.6939), "ra3.16xlarge": (15.578, 10.9046, 6.7765),
+    },
+    "eu-north-1": {
+        "label": "Europe (Stockholm)",
+        "rpu_hour": 0.374, "rms": 0.024,
+        "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
+        "rg.xlarge": (0.7973, 0.55811, 0.34685), "rg.4xlarge": (3.19013, 2.23309, 1.38777),
+        "ra3.xlplus": (1.139, 0.7973, 0.4955), "ra3.4xlarge": (3.418, 2.3926, 1.4869), "ra3.16xlarge": (13.675, 9.5725, 5.9487),
+    },
+    "eu-south-1": {
+        "label": "Europe (Milan)",
+        "rpu_hour": 0.40635, "rms": 0.025,
+        "s3_tables": (0.0276, 0.0265, 0.0253),
+        "s3_int": (0.0151, 0.0058),
+        "rg.xlarge": (0.882, 0.6181, 0.38437), "rg.4xlarge": (3.53733, 2.4696, 1.5386),
+        "ra3.xlplus": (1.26, 0.883, 0.5491), "ra3.4xlarge": (3.79, 2.646, 1.6485), "ra3.16xlarge": (15.15, 10.605, 6.5835),
+    },
+    "eu-south-2": {
+        "label": "Europe (Spain)",
+        "rpu_hour": 0.387, "rms": 0.024,
+        "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0058),
+        "rg.xlarge": (0.8414, 0.5887, 0.3661), "rg.4xlarge": (3.3656, 2.352, 1.46533),
+        "ra3.xlplus": (1.202, 0.841, 0.523), "ra3.4xlarge": (3.606, 2.52, 1.57), "ra3.16xlarge": (14.424, 10.1, 6.27),
     },
     "eu-west-1": {
         "label": "Europe (Ireland)",
@@ -333,62 +466,82 @@ AWS_REGIONAL_RATES: dict[str, dict] = {
         "rg.xlarge": (0.8848, 0.61936, 0.38493), "rg.4xlarge": (3.54013, 2.47809, 1.54),
         "ra3.xlplus": (1.264, 0.8848, 0.5499), "ra3.4xlarge": (3.793, 2.6551, 1.65), "ra3.16xlarge": (15.174, 10.6218, 6.6007),
     },
-    "eu-central-1": {
-        "label": "Europe (Frankfurt)",
-        "rpu_hour": 0.451, "rms": 0.0256,
-        "s3_tables": (0.0282, 0.027, 0.0259),
-        "s3_int": (0.0155, 0.0058),
-        "rg.xlarge": (0.9086, 0.63602, 0.39529), "rg.4xlarge": (3.6344, 2.54408, 1.58097),
-        "ra3.xlplus": (1.298, 0.9086, 0.5647), "ra3.4xlarge": (3.894, 2.7258, 1.6939), "ra3.16xlarge": (15.578, 10.9046, 6.7765),
+    "eu-west-3": {
+        "label": "Europe (Paris)",
+        "rpu_hour": 0.406, "rms": 0.025,
+        "s3_tables": (0.0276, 0.0265, 0.0253),
+        "s3_int": (0.0151, 0.0058),
+        "rg.xlarge": (0.8855, 0.61985, 0.38521), "rg.4xlarge": (3.542, 2.4794, 1.54084),
+        "ra3.xlplus": (1.265, 0.8855, 0.5503), "ra3.4xlarge": (3.795, 2.6565, 1.6509), "ra3.16xlarge": (15.18, 10.626, 6.6033),
     },
-    "ap-southeast-2": {
-        "label": "Asia Pacific (Sydney)",
-        "rpu_hour": 0.419, "rms": 0.0261,
-        "s3_tables": (0.0288, 0.0276, 0.0265),
-        "s3_int": (0.0159, 0.0058),
-        "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
-        "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
+    "mx-central-1": {
+        "label": "Mexico (Central)",
+        "rpu_hour": 0.39375, "rms": 0.0252,
+        "s3_tables": (0.0278, 0.0266, 0.0254),
+        "s3_int": (0.0151, 0.0048),
+        "rg.xlarge": (0.79821, 0.5586, 0.3472), "rg.4xlarge": (3.1948, 2.23533, 1.3888),
+        "ra3.xlplus": (1.1403, 0.798, 0.496), "ra3.4xlarge": (3.423, 2.395, 1.488), "ra3.16xlarge": (13.692, 9.579, 5.954),
     },
-    "ap-southeast-1": {
-        "label": "Asia Pacific (Singapore)",
-        "rpu_hour": 0.45, "rms": 0.0261,
-        "s3_tables": (0.0288, 0.0276, 0.0265),
-        "s3_int": (0.0159, 0.0058),
-        "rg.xlarge": (0.9121, 0.63847, 0.39683), "rg.4xlarge": (3.6484, 2.55388, 1.58713),
-        "ra3.xlplus": (1.303, 0.9121, 0.5669), "ra3.4xlarge": (3.909, 2.7363, 1.7005), "ra3.16xlarge": (15.636, 10.9452, 6.8017),
+    "sa-east-1": {
+        "label": "South America (São Paulo)",
+        "rpu_hour": 0.5976, "rms": 0.043,
+        "s3_tables": (0.0466, 0.0449, 0.0426),
+        "s3_int": (0.0254, 0.0095),
+        "rg.xlarge": (1.2117, 0.8484, 0.5271), "rg.4xlarge": (4.84867, 3.39407, 2.10924),
+        "ra3.xlplus": (1.731, 1.212, 0.753), "ra3.4xlarge": (5.195, 3.6365, 2.2599), "ra3.16xlarge": (20.78, 14.546, 9.0393),
     },
-    "ap-northeast-1": {
-        "label": "Asia Pacific (Tokyo)",
-        "rpu_hour": 0.494, "rms": 0.0261,
-        "s3_tables": (0.0288, 0.0276, 0.0265),
-        "s3_int": (0.0159, 0.0058),
-        "rg.xlarge": (0.8946, 0.62622, 0.3892), "rg.4xlarge": (3.58027, 2.50619, 1.55745),
-        "ra3.xlplus": (1.278, 0.8946, 0.556), "ra3.4xlarge": (3.836, 2.6852, 1.6687), "ra3.16xlarge": (15.347, 10.7429, 6.676),
+    "us-east-1": {
+        "label": "US East (N. Virginia)",
+        "rpu_hour": 0.375, "rms": 0.024,
+        "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
+        "rg.xlarge": (0.7602, 0.53214, 0.33075), "rg.4xlarge": (3.04267, 2.12987, 1.32356),
+        "ra3.xlplus": (1.086, 0.7602, 0.4725), "ra3.4xlarge": (3.26, 2.282, 1.4181), "ra3.16xlarge": (13.04, 9.128, 5.6724),
     },
-    "ap-south-1": {
-        "label": "Asia Pacific (Mumbai)",
-        "rpu_hour": 0.4275, "rms": 0.0261,
-        "s3_tables": (0.0288, 0.0276, 0.0265),
-        "s3_int": (0.0159, 0.0058),
-        "rg.xlarge": (0.8645, 0.60515, 0.37611), "rg.4xlarge": (3.45893, 2.42125, 1.50472),
-        "ra3.xlplus": (1.235, 0.8645, 0.5373), "ra3.4xlarge": (3.706, 2.5942, 1.6122), "ra3.16xlarge": (14.827, 10.3789, 6.4498),
+    "us-east-2": {
+        "label": "US East (Ohio)",
+        "rpu_hour": 0.36, "rms": 0.024,
+        "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
+        "rg.xlarge": (0.7602, 0.53214, 0.33075), "rg.4xlarge": (3.04267, 2.12987, 1.32356),
+        "ra3.xlplus": (1.086, 0.7602, 0.4725), "ra3.4xlarge": (3.26, 2.282, 1.4181), "ra3.16xlarge": (13.04, 9.128, 5.6724),
+    },
+    "us-west-1": {
+        "label": "US West (N. California)",
+        "rpu_hour": 0.469, "rms": 0.0271,
+        "s3_tables": (0.0299, 0.0288, 0.0276),
+        "s3_int": (0.0166, 0.0058),
+        "rg.xlarge": (0.8414, 0.58898, 0.36603), "rg.4xlarge": (3.3656, 2.35592, 1.46412),
+        "ra3.xlplus": (1.202, 0.8414, 0.5229), "ra3.4xlarge": (3.606, 2.5242, 1.5687), "ra3.16xlarge": (14.424, 10.0968, 6.2745),
+    },
+    "us-west-2": {
+        "label": "US West (Oregon)",
+        "rpu_hour": 0.36, "rms": 0.024,
+        "s3_tables": (0.0265, 0.0253, 0.0242),
+        "s3_int": (0.0144, 0.0046),
+        "rg.xlarge": (0.7602, 0.53214, 0.33075), "rg.4xlarge": (3.04267, 2.12987, 1.32356),
+        "ra3.xlplus": (1.086, 0.7602, 0.4725), "ra3.4xlarge": (3.26, 2.282, 1.4181), "ra3.16xlarge": (13.04, 9.128, 5.6724),
     },
 }
 
 
-def apply_aws_region(region: str) -> bool:
+def apply_aws_region(region: str, match_note: str = "", match_label: str = "") -> bool:
     """Re-point the module-level AWS rate constants at ``region``'s verified rates.
 
     Returns True when the region is in the verified table (constants updated), False when
     unknown (constants left at us-east-1 so callers can attach a caveat). Same
     overridable-module-assignment contract as apply_live_rates (R18.7).
+
+    ``match_note`` / ``match_label`` (from RegionMatch.note / .ui_label) record why a
+    non-obvious region was chosen; stored in AWS_REGION_MATCH_NOTE / _LABEL and rendered
+    in the report's methodology text and hero badge respectively.
     """
     global V1_RPU_HOUR_USD, V1_SERVERLESS_1YR_ALL_UPFRONT_RPU_HOUR_USD
     global V1_SERVERLESS_1YR_NO_UPFRONT_RPU_HOUR_USD, V1_SERVERLESS_3YR_RPU_HOUR_USD
     global V2_S3_TABLES_USD_PER_GB_MONTH_TIER1, V2_S3_TABLES_USD_PER_GB_MONTH_TIER2
     global V2_S3_TABLES_USD_PER_GB_MONTH_TIER3, V6_MANAGED_STORAGE_USD_PER_GB_MONTH
     global V2_INT_IA_USD_PER_GB_MONTH, V2_INT_AIA_USD_PER_GB_MONTH
-    global AWS_PRICING_REGION, AWS_REGION_SCOPE
+    global AWS_PRICING_REGION, AWS_REGION_SCOPE, AWS_REGION_MATCH_NOTE, AWS_REGION_MATCH_LABEL
     global V8_DATA_TRANSFER_OUT_USD_PER_GB
 
     rates = AWS_REGIONAL_RATES.get(region)
@@ -426,12 +579,15 @@ def apply_aws_region(region: str) -> bool:
 
     AWS_PRICING_REGION = region
     AWS_REGION_SCOPE = f"{rates['label']} / {region}"
+    AWS_REGION_MATCH_NOTE = match_note
+    AWS_REGION_MATCH_LABEL = match_label
     return True
 
 
 # =============================================================================
 # V8 — AWS Data Transfer Out (internet), $/GB (first 10 TB/month tier)
-# Source: https://aws.amazon.com/ec2/pricing/on-demand/#Data_Transfer (2026-08-04)
+# Source: AWS Price List API, AWSDataTransfer offer (AWS Outbound → External,
+# first paid tier per fromRegionCode), verified 2026-08-13 — all 28 stack regions.
 # This is the equivalent of BQ Storage Read API egress on the AWS side — data leaving
 # the VPC to internet consumers (BI tools, pandas clients, etc). Within-VPC = $0.
 # =============================================================================
@@ -439,18 +595,34 @@ def apply_aws_region(region: str) -> bool:
 V8_DATA_TRANSFER_OUT_USD_PER_GB: float = 0.09  # us-east-1 default
 
 V8_DT_OUT_REGIONAL_RATES: dict[str, float] = {
-    "us-east-1": 0.09,
-    "us-west-2": 0.09,
-    "us-east-2": 0.09,
+    "af-south-1": 0.154,
+    "ap-east-1": 0.12,
+    "ap-east-2": 0.1083,
+    "ap-northeast-1": 0.114,
+    "ap-northeast-2": 0.126,
+    "ap-northeast-3": 0.114,
+    "ap-south-1": 0.1093,
+    "ap-south-2": 0.1093,
+    "ap-southeast-1": 0.12,
+    "ap-southeast-2": 0.114,
+    "ap-southeast-3": 0.132,
+    "ap-southeast-4": 0.114,
+    "ap-southeast-5": 0.108,
+    "ap-southeast-7": 0.108,
     "ca-central-1": 0.09,
+    "eu-central-1": 0.09,
+    "eu-north-1": 0.09,
+    "eu-south-1": 0.09,
+    "eu-south-2": 0.09,
     "eu-west-1": 0.09,
     "eu-west-2": 0.09,
-    "eu-central-1": 0.09,
-    "ap-southeast-2": 0.114,
-    "ap-southeast-1": 0.12,
-    "ap-northeast-1": 0.114,
-    "ap-south-1": 0.1093,
+    "eu-west-3": 0.09,
+    "mx-central-1": 0.09,
     "sa-east-1": 0.15,
+    "us-east-1": 0.09,
+    "us-east-2": 0.09,
+    "us-west-1": 0.09,
+    "us-west-2": 0.09,
 }
 
 

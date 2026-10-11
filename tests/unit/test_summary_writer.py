@@ -122,7 +122,7 @@ class TestSummaryScopesAndRanges:
         """The 'SQL portable' stat must count SQL-owning entities only.
         summary.complexity_counts spans all entities (plain tables score
         PORTABLE by definition) — at fleet scale that rendered '100.0% SQL
-        portable, 0 need rewrite' over 12,599 entities (2026-07-31 sandbox validation)."""
+        portable, 0 need rewrite' over 12,599 entities (2026-07-31 SpinLab)."""
         a = _assessment("proj-sql", 5000.0, 2000.0)
         # summary says everything is portable (the misleading all-entities view)
         a.summary.complexity_counts = {"PORTABLE": 100, "ADAPT": 0, "REWRITE": 0}

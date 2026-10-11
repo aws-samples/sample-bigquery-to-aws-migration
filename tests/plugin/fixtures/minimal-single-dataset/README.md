@@ -6,7 +6,7 @@ This fixture represents a small BigQuery warehouse with a single dataset contain
 
 ## Expected Phase Flow
 
-1. **Preflight** — All environment checks pass (`bq-assess` installed, `gcloud` installed, ADC present). The SA provides `gcp_project: my-project` and `datasets: sample_dataset`.
+1. **Preflight** — All environment checks pass (`bq-assess` installed, `gcloud` installed, ADC present). The user provides `gcp_project: my-project` and `datasets: sample_dataset`.
 2. **Scan** — The CLI executes with `--use-adc --format json,html --output reports/` and exits 0. A JSON report is written to `reports/assessment-*.json`.
 3. **Interpret** — The skill reads the JSON report and produces a summary with a mix of AUTO, REVIEW, and MANUAL complexity categories. It highlights the top MANUAL tables by score and the top tables by size, then points the user to the generated HTML report. Because `query_logs_provided` is `false`, the skill calls out LOW confidence and suggests a follow-up run with `--include-query-logs`.
 

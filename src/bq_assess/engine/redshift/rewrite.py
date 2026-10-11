@@ -4,7 +4,8 @@ Per detected construct, emit a human-readable required change + effort indicatio
 For entities with SQL surface, also produce a best-effort Redshift translation using
 sqlglot (illustrative only — requires validation before production use).
 
-Translation pipeline (2026-07-16 rework, from the translation deep-audit):
+Translation pipeline (2026-07-16 rework — see
+storm-aws-report/2026-07-16-assess-bq-assess-translation-fixes.md):
 sqlglot's Redshift generator emits BigQuery's DATETIME()/TIMESTAMP() and STRUCT()
 silently (no ``unsupported()`` call), so ``transpile()`` alone shipped SQL that cannot
 run on Redshift at HIGH confidence. We now parse per statement, rewrite temporal

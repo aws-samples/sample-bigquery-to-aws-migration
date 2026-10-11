@@ -95,7 +95,8 @@ def test_estimate_signature_matches_contract() -> None:
     sig = inspect.signature(CostEstimator.estimate)
     params = list(sig.parameters)
     assert params == ["self", "entities", "pricing", "slots", "bq_monthly_override",
-                      "effort_total", "location", "storage_basis", "as_of", "egress_gib"]
+                      "effort_total", "location", "aws_region_override",
+                      "storage_basis", "as_of", "egress_gib"]
     assert sig.parameters["location"].kind is inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["location"].default is None
     assert sig.parameters["storage_basis"].kind is inspect.Parameter.KEYWORD_ONLY
@@ -618,13 +619,20 @@ def test_capacity_unavailable_when_unreadable() -> None:
     pricing = capacity_pricing(commitment_slots=100, baseline_slots=100)
     pricing.reservation_readable = False
     pricing.reservation_id = "admin-proj:us-central1.my-reservation"
-    r = _estimate(entities=[entity(size_gb=100)], pricing=pricing)
+    # Measured workload → the AWS side prices at MEDIUM on its own merits
+    slots = slot_util(total_slot_ms=100 * 3_600_000, days_sampled=30, active_fraction=0.9)
+    r = _estimate(entities=[entity(size_gb=100)], pricing=pricing, slots=slots)
     compute_line = next(x for x in r.bigquery_breakdown if "capacity" in x.label.lower())
     assert "UNAVAILABLE" in compute_line.label
     assert compute_line.monthly is None
     # Storage is still reported
     storage_lines = [x for x in r.bigquery_breakdown if "storage" in x.label.lower()]
     assert len(storage_lines) == 1
+    # The placeholder line's LOW confidence must not gate the estimate basis —
+    # there is no BQ estimate for it to describe; the basis grades the AWS side
+    # (2026-08-12: 'Low Confidence Cost Estimate' banner fired over a MEDIUM
+    # AWS estimate on an Enterprise hard-stop report)
+    assert r.estimate_basis_level is not ConfidenceLevel.LOW
 
 
 def test_capacity_baseline_used_even_with_slot_ms() -> None:
@@ -1050,7 +1058,10 @@ def _restore_region_constants():
         "V1_SERVERLESS_1YR_NO_UPFRONT_RPU_HOUR_USD", "V1_SERVERLESS_3YR_RPU_HOUR_USD",
         "V2_S3_TABLES_USD_PER_GB_MONTH_TIER1", "V2_S3_TABLES_USD_PER_GB_MONTH_TIER2",
         "V2_S3_TABLES_USD_PER_GB_MONTH_TIER3", "V6_MANAGED_STORAGE_USD_PER_GB_MONTH",
-        "AWS_PRICING_REGION", "AWS_REGION_SCOPE",
+        "V2_INT_IA_USD_PER_GB_MONTH", "V2_INT_AIA_USD_PER_GB_MONTH",
+        "V8_DATA_TRANSFER_OUT_USD_PER_GB",
+        "AWS_PRICING_REGION", "AWS_REGION_SCOPE", "AWS_REGION_MATCH_NOTE",
+        "AWS_REGION_MATCH_LABEL",
     )}
     import copy
     node_snap = (copy.deepcopy(k.V7_RG_NODE_TYPES), copy.deepcopy(k.V6_RA3_NODE_TYPES))
@@ -1655,7 +1666,7 @@ def test_comparison_module_honors_headline() -> None:
     """engine/comparison.py must use the canonical _line_low/_line_high (which
     honor CostLine.headline) — its local duplicates silently reverted the
     single-figure comparison for every engine-recommendation report
-    (2026-07-31 sandbox regeneration)."""
+    (2026-07-31 SpinLab regeneration)."""
     from bq_assess.engine import comparison
     from bq_assess.engine.redshift import cost as cost_mod
     assert comparison._line_low is cost_mod._line_low
@@ -1857,3 +1868,137 @@ class TestEnterpriseUnavailableHardStop:
         assert result.bq_cost_available is False
         assert result.bq_cost_basis == "unavailable"
         assert "permission" in result.bq_cost_unavailable_reason.lower()
+
+
+class TestBundleCarriedCostOverride:
+    """--bigquery-monthly-cost captured at collection resolves at ONE seam —
+    estimate() — with the supplied-on date rendered in the label (2026-08-12)."""
+
+    def test_bundle_carried_cost_used_when_no_report_flag(self) -> None:
+        pricing = capacity_pricing(
+            edition="ENTERPRISE", commitment_slots=None, baseline_slots=None,
+        )
+        pricing.reservation_readable = False       # would hard-stop without the cost
+        pricing.customer_monthly_cost = 8000.0
+        pricing.customer_cost_supplied_on = "2026-08-12"
+        r = _estimate(entities=[entity(size_gb=0)], pricing=pricing)
+        assert r.bq_cost_available is True
+        assert r.bq_cost_basis == "customer_provided"
+        assert r.bigquery_monthly == pytest.approx(8000.0)
+        line = r.bigquery_breakdown[0]
+        assert "2026-08-12" in line.label          # dated — never mistaken for current
+        assert "recorded at collection" in line.source_note
+
+    def test_report_time_flag_wins_over_bundle_value(self) -> None:
+        pricing = capacity_pricing(
+            edition="ENTERPRISE", commitment_slots=None, baseline_slots=None,
+        )
+        pricing.customer_monthly_cost = 8000.0
+        pricing.customer_cost_supplied_on = "2026-08-12"
+        r = _estimate(entities=[entity(size_gb=0)], pricing=pricing, override=9500.0)
+        assert r.bigquery_monthly == pytest.approx(9500.0)
+        line = r.bigquery_breakdown[0]
+        assert "2026-08-12" not in line.label      # fresh figure, no stale date
+
+
+class TestEstimateBasisAtEstimateLevel:
+    """estimate()-level coverage of the basis states (2026-08-13 review: the
+    no-slots unreadable path had lost its only end-to-end test)."""
+
+    def _unreadable_enterprise(self) -> PricingDetection:
+        p = capacity_pricing(commitment_slots=100, baseline_slots=100)
+        p.reservation_readable = False
+        p.reservation_id = "admin-proj:us-central1.my-reservation"
+        return p
+
+    def test_unreadable_no_slots_caps_medium_and_words_honestly(self) -> None:
+        r = _estimate(entities=[entity(size_gb=100)], pricing=self._unreadable_enterprise())
+        assert r.bq_cost_available is False
+        assert r.estimate_basis_level in (ConfidenceLevel.LOW, ConfidenceLevel.MEDIUM)
+        assert "BigQuery cost could not be determined" in r.estimate_basis
+        assert "notice above" not in r.estimate_basis
+        assert "Provide query logs" not in r.estimate_basis
+
+    def test_unreadable_with_slots_never_badges_high(self) -> None:
+        slots = slot_util(total_slot_ms=100 * 3_600_000, days_sampled=30, active_fraction=0.9)
+        r = _estimate(entities=[entity(size_gb=100)], pricing=self._unreadable_enterprise(),
+                      slots=slots)
+        assert r.bq_cost_available is False
+        assert r.estimate_basis_level is not ConfidenceLevel.HIGH
+        assert r.estimate_basis_level is not ConfidenceLevel.LOW   # AWS side is measured
+        assert "AWS costs priced from" in r.estimate_basis
+        assert "BigQuery cost could not be determined" in r.estimate_basis
+
+    def test_customer_provided_basis_names_the_provenance(self) -> None:
+        r = _estimate(entities=[entity(size_gb=0)], pricing=ondemand_pricing(),
+                      slots=slot_util(), override=5000.0)
+        assert r.bq_cost_basis == "customer_provided"
+        assert "customer-supplied" in r.estimate_basis
+        assert "--bigquery-monthly-cost" in r.estimate_basis
+
+
+# --- Nearest-region policy: match-note provenance (2026-08-13) --------------------------
+
+def test_region_match_note_flows_to_comparison_and_notes(_restore_region_constants) -> None:
+    """A non-obvious region choice (pinned/distant/fallback) must reach both the
+    CostComparison model and the methodology notes — never a silent selection."""
+    r = _estimate_at("me-west1", slots=slot_util())   # Tel Aviv → eu-south-1, distant
+    assert r.aws_pricing_region == "eu-south-1"
+    assert "km" in r.aws_region_match_note
+    assert r.aws_region_match_label == "distant region"   # hero badge text
+    region_note = next(n for n in r.pricing_notes if "AWS priced for" in n)
+    assert "Europe (Milan) / eu-south-1" in region_note
+    assert r.aws_region_match_note in region_note
+
+
+def test_multi_region_pin_keeps_note_but_suppresses_badge(_restore_region_constants) -> None:
+    """The us/eu pins are the common case: note reaches the methodology text,
+    badge (label) stays empty so it never becomes wallpaper."""
+    r = _estimate_at("US", slots=slot_util())
+    assert r.aws_pricing_region == "us-east-1"
+    assert r.aws_region_match_note != ""
+    assert r.aws_region_match_label == ""
+
+
+def test_aws_region_override_beats_policy_rederivation(_restore_region_constants) -> None:
+    """--target-region precedence (2026-08-14 review must-fix): estimate() must not
+    re-derive the policy region over an explicit override — the report was pricing
+    a different region than the console announced."""
+    k.apply_aws_region("eu-west-2", match_note="user-specified via --target-region",
+                       match_label="pinned region")
+    r = CostEstimator(skip_live_pricing=True).estimate(
+        [entity()], ondemand_pricing(), slot_util(), None, 10.0,
+        location="us", aws_region_override="eu-west-2",
+    )
+    assert r.aws_pricing_region == "eu-west-2"            # not the 'us' pin us-east-1
+    assert r.aws_region_match_note == "user-specified via --target-region"
+    assert r.aws_region_match_label == "pinned region"
+
+
+def test_aws_region_override_applied_when_not_preinstalled(_restore_region_constants) -> None:
+    """Direct estimate() callers passing an override get it applied even when the
+    module constants point elsewhere."""
+    k.apply_aws_region("us-east-1")
+    r = CostEstimator(skip_live_pricing=True).estimate(
+        [entity()], ondemand_pricing(), slot_util(), None, 10.0,
+        location="asia-southeast2", aws_region_override="ap-southeast-2",
+    )
+    assert r.aws_pricing_region == "ap-southeast-2"       # not policy's ap-southeast-3
+    assert r.aws_region_match_label == "pinned region"
+
+
+def test_clean_nearest_match_has_no_note(_restore_region_constants) -> None:
+    """Same-metro matches (Jakarta) carry no flag — the note is for exceptions only."""
+    r = _estimate_at("asia-southeast2", slots=slot_util())
+    assert r.aws_pricing_region == "ap-southeast-3"
+    assert r.aws_region_match_note == ""
+    region_note = next(n for n in r.pricing_notes if "AWS priced for" in n)
+    assert "Asia Pacific (Jakarta) / ap-southeast-3" in region_note
+
+
+def test_region_note_does_not_leak_across_estimates(_restore_region_constants) -> None:
+    """A flagged region followed by a clean one must clear the note (skip-guard
+    only fires when the region is unchanged)."""
+    _estimate_at("me-west1", slots=slot_util())
+    r = _estimate_at("asia-southeast2", slots=slot_util())
+    assert r.aws_region_match_note == ""

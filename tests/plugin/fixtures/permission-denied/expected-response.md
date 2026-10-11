@@ -1,6 +1,6 @@
 # Expected Response: Permission Denied — Missing `bigquery.jobs.listAll`
 
-When the CLI fails with the `bigquery.jobs.listAll` permission error, the skill presents the SA with three options:
+When the CLI fails with the `bigquery.jobs.listAll` permission error, the skill presents the user with three options:
 
 ---
 
@@ -14,7 +14,7 @@ gcloud projects add-iam-policy-binding my-project \
   --role="roles/bigquery.resourceViewer"
 ```
 
-> Replace `{sa_email}` with the SA's GCP identity (find it with `gcloud auth list`).
+> Replace `{sa_email}` with the user's GCP identity (find it with `gcloud auth list`).
 
 After granting the role, the skill retries the same `bq-assess` command.
 
@@ -30,7 +30,7 @@ Re-run the CLI with the `--no-query-logs` flag appended to the original command.
 
 ## Option 3: Export Logs Manually
 
-The SA exports query logs from BigQuery to a local JSON file (via `bq query` or the BigQuery console), then re-runs the CLI with:
+The user exports query logs from BigQuery to a local JSON file (via `bq query` or the BigQuery console), then re-runs the CLI with:
 
 ```bash
 --query-logs {path_to_exported_logs}
@@ -43,5 +43,5 @@ This bypasses the `INFORMATION_SCHEMA.JOBS` API call that requires the missing p
 ## Skill Behavior Invariants
 
 - The skill does **not** advance to the Interpret phase after this error.
-- The skill stays in the Scan phase until the SA selects an option.
+- The skill stays in the Scan phase until the user selects an option.
 - The skill asks: "Which option would you like? (1) Grant the permission, (2) Re-run without query logs, or (3) Export logs manually?"

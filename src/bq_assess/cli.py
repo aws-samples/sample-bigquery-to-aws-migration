@@ -28,7 +28,6 @@ from rich.progress import (
     TaskProgressColumn,
     TextColumn,
 )
-from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from bq_assess import __version__
@@ -46,6 +45,7 @@ from bq_assess.core.price_lookup import (
 from bq_assess.core.relationships import RelationshipInferrer
 from bq_assess.core.sql_surface import SQLSurfaceAnalyzer
 from bq_assess.core.storage_stats import effective_physical_bytes
+from bq_assess.core.tty import prompts_enabled
 from bq_assess.engine.comparison import assemble_cost_comparison
 from bq_assess.engine.redshift.cost import CostEstimator, _window_days
 from bq_assess.engine.redshift.placement import PlacementAdvisor
@@ -75,6 +75,7 @@ from bq_assess.models import (
 )
 from bq_assess.report.html_writer import HTMLWriter
 from bq_assess.report.json_writer import JSONWriter
+from bq_assess.report.provenance import provenance as report_provenance
 from bq_assess.scoring.complexity import ComplexityScorer
 from bq_assess.scoring.effort import EffortScorer
 from bq_assess.targets.iceberg.converter import IcebergConverter
@@ -210,116 +211,6 @@ def _merge_config(cli_params: dict, config_values: dict) -> dict:
     return merged
 
 
-def _interactive_prompts(params: dict) -> dict:
-    """Prompt the user for missing values using Rich prompts."""
-    console.print("\n[bold cyan]Interactive configuration mode[/bold cyan]\n")
-
-    if not params.get("gcp_project"):
-        params["gcp_project"] = Prompt.ask("GCP Project ID")
-
-    if not params.get("credentials") and not params.get("use_adc"):
-        cred_choice = Prompt.ask(
-            "Authentication method",
-            choices=["credentials", "adc"],
-            default="adc",
-        )
-        if cred_choice == "credentials":
-            params["credentials"] = Prompt.ask("Path to service account JSON")
-        else:
-            params["use_adc"] = True
-
-    if not params.get("datasets"):
-        ds = Prompt.ask("Datasets to scan (comma-separated, or empty for all)", default="")
-        if ds.strip():
-            params["datasets"] = ds.strip()
-
-    if params.get("include_query_logs") and not params.get("query_logs"):
-        ql = Prompt.ask("Path to exported query logs JSON (or empty for API)", default="")
-        if ql.strip():
-            params["query_logs"] = ql.strip()
-
-    if params.get("include_query_logs") and not params.get("query_logs") and params.get("query_log_days") is None:
-        qld = Prompt.ask("Query log lookback window in days (1-90)", default="30")
-        try:
-            qld_int = int(qld.strip())
-            if 1 <= qld_int <= 90:
-                params["query_log_days"] = qld_int
-            else:
-                console.print("[yellow]Out of range, using default 30 days.[/yellow]")
-        except ValueError:
-            console.print("[yellow]Invalid value, using default 30 days.[/yellow]")
-
-    if params.get("bigquery_monthly_cost") is None:
-        bq_cost = Prompt.ask("Monthly BigQuery cost override (or empty to calculate)", default="")
-        if bq_cost.strip():
-            try:
-                params["bigquery_monthly_cost"] = float(bq_cost.strip())
-            except ValueError:
-                console.print("[yellow]Invalid cost value, will calculate automatically.[/yellow]")
-
-    if not params.get("output"):
-        params["output"] = Prompt.ask("Output directory", default="bq-migration/")
-
-    if not params.get("format"):
-        params["format"] = Prompt.ask("Output formats (html,json)", default="html")
-
-    return params
-
-
-def _engine_prompts(params: dict, has_clustering: bool = False) -> dict:
-    """Interactive Rich prompts for engine configuration (fires after scan).
-
-    Args:
-        params: CLI parameters dict to check for pre-provided values
-        has_clustering: Whether clustering fields were detected in any entity
-
-    Returns:
-        Dict of prompt responses for target_region, query_sla_ms,
-        preferred_engine, and post_optimization (conditional)
-    """
-    responses: dict = {}
-
-    # Skip prompts if values already provided via CLI
-    if params.get("target_region") is None:
-        region = Prompt.ask(
-            "Target AWS region",
-            choices=["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-2", "other"],
-            default="us-east-1",
-        )
-        if region == "other":
-            region = Prompt.ask("Enter AWS region")
-        responses["target_region"] = region
-
-    if params.get("query_sla_ms") is None:
-        sla_choice = Prompt.ask(
-            "Query latency SLA",
-            choices=["1s", "5s", "30s", "no constraint"],
-            default="5s",
-        )
-        sla_map = {"1s": 1000, "5s": 5000, "30s": 30000, "no constraint": 60000}
-        responses["query_sla_ms"] = sla_map.get(sla_choice, 5000)
-
-    # Skip preferred_engine prompt if already set via --engine (unless it's "both")
-    if not params.get("preferred_engine") and params.get("engine") in (None, "both"):
-        engine = Prompt.ask(
-            "Preferred query engine",
-            choices=["athena", "redshift", "let tool decide"],
-            default="let tool decide",
-        )
-        responses["preferred_engine"] = None if engine == "let tool decide" else engine
-
-    # Only prompt for post-optimization if clustering detected AND not already set
-    if has_clustering and params.get("post_optimization") is None:
-        responses["post_optimization"] = Confirm.ask(
-            "Include post-migration optimization steps (Spark sort/compact)?",
-            default=True,
-        )
-
-    return responses
-
-
-
-
 def _validate_report_params(params: dict) -> list[str]:
     """Validate output format params; return the parsed formats list. Exits on error."""
     output_format: str = params.get("format", "html")
@@ -381,6 +272,8 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     yaml_engine_config = params.get("_yaml_engine_config", {})
     cli_engine_params = params.get("_cli_engine_params", {})
 
+    # Override precedence (report-time flag > bundle-carried customer cost) is
+    # resolved inside CostEstimator.estimate() — one seam (2026-08-12 review F4).
     bigquery_monthly_cost: float | None = params.get("bigquery_monthly_cost")
     base_output_dir: str = params.get("output", "bq-migration/")
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -458,16 +351,12 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     console.print(f"[green]✓ Converted {len(conversion_results)} schemas.[/green]")
 
-    # ── Stage 4b: Engine Configuration Prompts ─────────────────────
-    # Fire interactive prompts if enabled and TTY is available
+    # Engine configuration comes from flags/YAML/defaults only — no prompts.
+    # Customers run `bq-assess assess --gcp-project X --use-adc` and nothing
+    # else; --target-region/--query-sla-ms/--engine are operator options
+    # (Ryan, 2026-08-12: the only default prompt in the tool is the
+    # reservation grant-and-retry recovery in collector.py).
     prompt_responses: dict = {}
-    if params.get("interactive") and sys.stdout.isatty():
-        # Detect clustering fields across all entities
-        has_clustering = any(
-            entity.clustering_fields for entity in entities
-        )
-        console.print("\n[bold cyan]Engine configuration[/bold cyan]")
-        prompt_responses = _engine_prompts(params, has_clustering=has_clustering)
 
     # ── Stage 5: Score Effort ──────────────────────────────────────
     console.print("\n[bold]Stage 5:[/bold] Scoring migration effort for TABLE entities...")
@@ -560,19 +449,42 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             f"[yellow]⚠ No verified rate table for BigQuery location "
             f"'{detected_location}' — using US multi-region rates (may understate cost).[/yellow]"
         )
-    if bundle.aws_region:
-        aws_region = bundle.aws_region
-        is_fallback = False
+    # Region precedence: explicit --target-region > current nearest-region policy.
+    # The bundle's recorded aws_region is provenance, not authority — an old bundle
+    # must not pin the report to a mapping the policy has since corrected
+    # (e.g. asia-southeast2 bundles collected when Jakarta still mapped to Sydney).
+    if params.get("target_region"):
+        match = _k.RegionMatch(
+            params["target_region"], "pinned", "user-specified via --target-region", None,
+            "pinned region",
+        )
     else:
-        aws_region, is_fallback = _k.bq_location_to_aws_region(detected_location)
-    _k.apply_aws_region(aws_region)
-    if is_fallback:
+        match = _k.match_bq_location(detected_location)
+    aws_region, is_fallback = match.aws_region, match.kind == "fallback"
+    if bundle.aws_region and bundle.aws_region != aws_region:
+        console.print(
+            f"[dim]  Bundle was collected with AWS region {bundle.aws_region}; "
+            f"current mapping selects {aws_region} — using {aws_region}.[/dim]"
+        )
+    if not _k.apply_aws_region(aws_region, match_note=match.note, match_label=match.ui_label):
+        console.print(
+            f"[yellow]⚠ No verified rate table for AWS region '{aws_region}' — "
+            f"pricing at us-east-1 rates instead (regional costs may differ).[/yellow]"
+        )
+        aws_region = "us-east-1"
+        _k.apply_aws_region(
+            aws_region,
+            match_note=f"no verified rates for {match.aws_region}; priced at us-east-1",
+            match_label="fallback region",
+        )
+    elif is_fallback:
         console.print(
             f"[yellow]⚠ BigQuery location '{detected_location}' has no AWS mapping — "
             f"defaulting to us-east-1 pricing; override with --target-region[/yellow]"
         )
     else:
-        console.print(f"[green]✓ AWS priced for region: {aws_region}[/green]")
+        note = f" ({match.note})" if match.note else ""
+        console.print(f"[green]✓ AWS priced for region: {aws_region}[/green][dim]{note}[/dim]")
 
     if params.get("refresh_pricing", False):
         try:
@@ -623,6 +535,9 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             cost_comparison = cost_estimator.estimate(
                 entities, pricing, slots, bigquery_monthly_cost, effort_total,
                 location=detected_location,
+                # Stage 8's final decision (--target-region / rate-table fallback
+                # included) — estimate() must not re-derive and clobber it.
+                aws_region_override=aws_region,
                 storage_basis=storage_basis,
                 as_of=as_of,
                 egress_gib=bundle.egress_gib,
@@ -971,6 +886,26 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
 
     console.print(f"[green]✓ Generated Athena migration plans for {len(migration_plans)} tables.[/green]")
 
+    # Re-score effort for tables whose generated load cannot run at all (#74).
+    # Must happen HERE: the plan only just became available, and both the
+    # per-entity effort read and the summary counts below consume
+    # effort_results — scoring any later would let rows and headline disagree.
+    from bq_assess.scoring.effort import amend_for_load_blocking
+
+    load_blocked = [
+        name for name, dml in migration_plans.items()
+        if any(s.blocks_load for s in dml.shortcomings)
+    ]
+    for name in load_blocked:
+        if name in effort_results:
+            effort_results[name] = amend_for_load_blocking(effort_results[name])
+    if load_blocked:
+        console.print(
+            f"[yellow]⚠ {len(load_blocked)} table(s) re-scored MANUAL — the generated "
+            f"load cannot run (federated connector cannot read them): "
+            f"{', '.join(sorted(n.split('.')[-1] for n in load_blocked))}[/yellow]"
+        )
+
     # ── Stage 14: Assemble Assessment ──────────────────────────────
     console.print("\n[bold]Stage 14:[/bold] Assembling assessment report...")
 
@@ -1175,6 +1110,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             ],
             translation_results=translation_results,
             dataset_id=datasets_used[0] if datasets_used else None,
+            provenance=report_provenance(assessment),
         )
         output_files.append(mig_dir)
         console.print(f"  [green]✓ Migration scripts: {mig_dir}[/green]")
@@ -1213,6 +1149,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     readme_path = write_readme(
         project_dir=project_dir,
         gcp_project=gcp_project,
+        provenance=report_provenance(assessment),
         has_report="html" in formats or "json" in formats,
         has_terraform=bool(datasets_used),
         has_migration=bool(migration_plans),
@@ -1390,9 +1327,9 @@ def _assess_options(f):
         ),
         click.option("--bigquery-monthly-cost", type=float, default=None, help="Monthly BigQuery spend override."),
         click.option("--reservation-config", default=None, hidden=True, help="[DEPRECATED] Reservation details are now auto-read. Use --bigquery-monthly-cost instead."),
+        click.option("--interactive", "interactive_deprecated", is_flag=True, default=False, hidden=True, help="[DEPRECATED] Prompting is now the default on a terminal."),
         click.option("--output", default=None, help="Output directory (default: bq-migration/)."),
         click.option("--format", "output_format", default=None, help="Output formats: html,json (default: html)."),
-        click.option("--interactive", is_flag=True, default=False, help="Interactive prompt mode."),
         click.option(
             "--export-bundle/--no-export-bundle", "export_bundle", default=True,
             help="Write the re-processable bundle/ next to the report (default: enabled).",
@@ -1443,9 +1380,9 @@ def assess_cmd(
     query_log_days: int | None,
     bigquery_monthly_cost: float | None,
     reservation_config: str | None,
+    interactive_deprecated: bool,
     output: str | None,
     output_format: str | None,
-    interactive: bool,
     export_bundle: bool,
     zip_bundle: bool,
     exclude_query_text: bool,
@@ -1464,12 +1401,17 @@ def assess_cmd(
     logging.basicConfig(level=logging.WARNING)
     logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 
+    if interactive_deprecated:
+        console.print(
+            "[yellow]⚠ --interactive is deprecated and ignored — prompting is now "
+            "the default whenever bq-assess runs in a terminal.[/yellow]"
+        )
     params = _build_params(
         gcp_project=gcp_project, credentials=credentials, use_adc=use_adc,
         datasets=datasets, query_logs=query_logs,
         query_log_days=query_log_days, bigquery_monthly_cost=bigquery_monthly_cost,
         reservation_config=reservation_config, output=output, output_format=output_format,
-        interactive=interactive, export_bundle=export_bundle,
+        export_bundle=export_bundle,
         zip_bundle=zip_bundle,
         exclude_query_text=exclude_query_text, concurrency=concurrency,
         skip_translation=skip_translation, skip_workload=skip_workload,
@@ -1482,6 +1424,7 @@ def assess_cmd(
         _validate_collect_params(params)
         _validate_report_params(params)
 
+        _reject_fleet_cost_override(params)
         if str(params.get("gcp_project", "")).lower() == "all":
             _assess_all_projects(params)
         else:
@@ -1542,6 +1485,7 @@ def _assess_all_projects(params: dict) -> None:
         project_params = dict(params)
         project_params["gcp_project"] = project_id
         project_params["_multi_project"] = True  # fleet README replaces per-project ones
+        project_params["prompts"] = False        # unattended sweep — never block on stdin
         project_params["reservation_cache"] = fleet_reservation_cache
         try:
             bundle = collect(project_params)
@@ -1661,6 +1605,10 @@ def report_cmd(
         "format": output_format or "html",
         "export_bundle": export_bundle,
         "refresh_pricing": refresh_pricing,
+        # Fully offline by contract — the report command NEVER prompts; missing
+        # engine values take documented defaults (2026-08-12 review: same bundle
+        # must produce the same report with or without a terminal).
+        "prompts": False,
     }
     if bigquery_monthly_cost is not None:
         params["bigquery_monthly_cost"] = bigquery_monthly_cost
@@ -1717,6 +1665,23 @@ def report_cmd(
         sys.exit(1)
 
 
+def _reject_fleet_cost_override(params: dict) -> None:
+    """--bigquery-monthly-cost is one project's bill; combined with
+    --gcp-project all it would be written into EVERY project's bundle and
+    N-times-counted across the fleet (2026-08-12 review). Hard error."""
+    if (
+        str(params.get("gcp_project", "")).lower() == "all"
+        and params.get("bigquery_monthly_cost") is not None
+    ):
+        console.print(
+            "[red]Error: --bigquery-monthly-cost cannot be combined with "
+            "--gcp-project all — the figure is one project's bill and would be "
+            "recorded into every project's bundle. Collect projects individually "
+            "with their own costs, or omit the flag.[/red]"
+        )
+        sys.exit(1)
+
+
 def _build_params(**kwargs) -> dict:
     """Merge CLI args, config file, and defaults into the params dict (CLI wins)."""
     cli_params: dict = {}
@@ -1740,8 +1705,6 @@ def _build_params(**kwargs) -> dict:
         cli_params["output"] = kwargs["output"]
     if kwargs.get("output_format") is not None:
         cli_params["format"] = kwargs["output_format"]
-    if kwargs.get("interactive"):
-        cli_params["interactive"] = True
     cli_params["export_bundle"] = kwargs.get("export_bundle", True)
     if kwargs.get("exclude_query_text"):
         cli_params["exclude_query_text"] = True
@@ -1783,6 +1746,15 @@ def _build_params(**kwargs) -> dict:
 
     # Merge: CLI args > config file > defaults
     params = _merge_config(cli_params, config_values)
+    # Resolve prompting ONCE here (2026-08-12 review): terminal-attached assess
+    # runs prompt by default; report_cmd and fleet loops override to False.
+    if params.pop("interactive", None):
+        console.print(
+            "[yellow]⚠ Config key 'interactive' is deprecated and ignored — "
+            "prompting is now the default whenever bq-assess runs in a "
+            "terminal.[/yellow]"
+        )
+    params["prompts"] = prompts_enabled()
 
     # Store YAML engine config and CLI engine params separately for precedence tracking
     params["_yaml_engine_config"] = yaml_engine_config
@@ -1795,15 +1767,12 @@ def _build_params(**kwargs) -> dict:
     params.setdefault("include_query_logs", True)
     params.setdefault("output", "bq-migration/")
     params.setdefault("format", "html")
-    params.setdefault("interactive", False)
 
-    if params.get("interactive"):
-        params = _interactive_prompts(params)
 
     if not params.get("gcp_project"):
         console.print(
             "[red]Error: --gcp-project is required.[/red]\n"
-            "Provide it via CLI argument, config file, or use --interactive mode."
+            "Provide it via CLI argument or config file."
         )
         sys.exit(1)
 

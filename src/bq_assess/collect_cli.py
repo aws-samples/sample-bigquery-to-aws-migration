@@ -19,6 +19,7 @@ from bq_assess import __version__
 from bq_assess.bundle import BundleWriter
 from bq_assess.collector import collect
 from bq_assess.core.disclaimer import CLI_ONE_LINER, DATA_HANDLING
+from bq_assess.core.tty import prompts_enabled
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -38,6 +39,7 @@ console = Console()
     help="Lookback window for INFORMATION_SCHEMA.JOBS in days.",
 )
 @click.option("--reservation-config", default=None, hidden=True, help="[DEPRECATED] Reservation details are now auto-read during collection.")
+@click.option("--bigquery-monthly-cost", type=float, default=None, help="Monthly BigQuery spend override.")
 @click.option("--output", default="bundle-out/", show_default=True, help="Directory the bundle/ is written into.")
 @click.option(
     "--exclude-query-text", is_flag=True, default=False,
@@ -62,6 +64,7 @@ def main(
     datasets: str | None,
     query_log_days: int,
     reservation_config: str | None,
+    bigquery_monthly_cost: float | None,
     output: str,
     exclude_query_text: bool,
     concurrency: int,
@@ -93,11 +96,15 @@ def main(
         "datasets": datasets,
         "query_log_days": query_log_days,
         "reservation_config": reservation_config,
+        "bigquery_monthly_cost": bigquery_monthly_cost,
         "exclude_query_text": exclude_query_text,
         "concurrency": concurrency,
         "skip_workload": skip_workload,
         "offline_pricing": offline_pricing,
         "no_cache": no_cache,
+        # Prompting resolved once (2026-08-12 review): terminal-attached
+        # single-project collects prompt by default; the fleet loop overrides.
+        "prompts": prompts_enabled(),
     }
 
     # Load reservation config if provided (kept file-free inside collect())
@@ -119,6 +126,15 @@ def main(
             console.print(f"[green]✓ Loaded reservation config: {reservation_config}[/green]")
         except Exception as exc:
             console.print(f"[yellow]⚠ Failed to load reservation config: {exc}[/yellow]")
+
+    if str(gcp_project).lower() == "all" and bigquery_monthly_cost is not None:
+        console.print(
+            "[red]Error: --bigquery-monthly-cost cannot be combined with "
+            "--gcp-project all — the figure is one project's bill and would be "
+            "recorded into every project's bundle. Collect projects individually "
+            "with their own costs, or omit the flag.[/red]"
+        )
+        sys.exit(1)
 
     try:
         if str(gcp_project).lower() == "all":
@@ -217,6 +233,7 @@ def _collect_all_projects(params: dict, output: str, zip_bundle: bool) -> None:
         project_params = dict(params)
         project_params["gcp_project"] = project_id
         project_params["reservation_cache"] = fleet_reservation_cache
+        project_params["prompts"] = False   # unattended sweep — never block on stdin
         project_out = os.path.join(output, f"bundle-{project_id}")
         try:
             _collect_one(project_params, project_out, zip_bundle)

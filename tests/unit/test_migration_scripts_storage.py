@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from bq_assess.engine.athena.migration_scripts import generate_migration_scripts
 from bq_assess.models import (
     ConfidenceLevel,
@@ -162,7 +164,7 @@ def test_migration_names_single_source():
 
 
 def test_phase3_creates_external_schema_before_loads(tmp_path):
-    """Deep audit HRI-1: Phase 3 must ensure the iceberg external schema exists
+    """Storm audit HRI-1: Phase 3 must ensure the iceberg external schema exists
     (idempotently) before its INSERT..SELECTs, instead of assuming it."""
     generate_migration_scripts(
         project_dir=str(tmp_path), migration_plans={"ds.t1": _dml()}, connector_name=None,
@@ -174,7 +176,7 @@ def test_phase3_creates_external_schema_before_loads(tmp_path):
 
 
 def test_phase_specific_wait_ceilings(tmp_path):
-    """Deep audit HRI-2/HRI-3: Athena waits ~the 30-min DML quota (server kills
+    """Storm audit HRI-2/HRI-3: Athena waits ~the 30-min DML quota (server kills
     first); Redshift waits up to the 24h Data API max and never cancels on timeout."""
     generate_migration_scripts(
         project_dir=str(tmp_path), migration_plans={"ds.t1": _dml()}, connector_name=None,
@@ -190,7 +192,7 @@ def test_phase_specific_wait_ceilings(tmp_path):
 
 
 def test_guide_and_setup_use_doc_verified_credential_var(tmp_path):
-    """Deep audit HRI-5: the connector credential var is secret_manager_gcp_creds_name
+    """Storm audit HRI-5: the connector credential var is secret_manager_gcp_creds_name
     (doc-verified); GOOGLE_CREDENTIAL must not appear anywhere."""
     from bq_assess.engine.athena.migration import generate_source_db_setup
     class _T:
@@ -414,7 +416,7 @@ def test_rms_staging_schema_is_per_dataset():
 
 def test_rebuilt_view_names_quoted(tmp_path):
     """View names with spaces/hyphens (legal in BQ) must be quoted in the
-    emitted CREATE OR REPLACE VIEW (2026-07-31 sandbox estate:
+    emitted CREATE OR REPLACE VIEW (2026-07-31 SpinLab sandbox estate:
     'sandbox.Inf Count Switches' emitted unquoted)."""
     from types import SimpleNamespace
 
@@ -487,3 +489,157 @@ def test_rebuilt_view_missing_dependency_flagged(tmp_path):
     assert "NOT in this migration plan" in sql
     # the satisfied dependency is not flagged
     assert "depends on ds.t1" not in sql
+
+
+# --- #54: discovery failure must not masquerade as an empty source -----------
+
+
+class _DiscoveryClient:
+    """Minimal Athena stub for _fetch_scalar_row.
+
+    ``state`` drives the query outcome; ``row`` is the single result row returned
+    when it SUCCEEDEDs (None => return only the header row).
+    """
+
+    def __init__(self, state="SUCCEEDED", row=("2025-01-01", "2025-03-01"), reason="boom"):
+        self.state = state
+        self.row = row
+        self.reason = reason
+
+    def start_query_execution(self, **kwargs):
+        return {"QueryExecutionId": "q-1"}
+
+    def get_query_execution(self, QueryExecutionId=None):
+        return {"QueryExecution": {"Status": {
+            "State": self.state, "StateChangeReason": self.reason,
+        }}}
+
+    def get_query_results(self, QueryExecutionId=None):
+        header = [{"VarCharValue": "min_val"}, {"VarCharValue": "max_val"}]
+        rows = [{"Data": header}]
+        if self.row is not None:
+            rows.append({"Data": [{"VarCharValue": v} for v in self.row]})
+        return {"ResultSet": {"Rows": rows}}
+
+
+def _chunked_statements(with_null_chunk=False):
+    stmts = [
+        "SELECT MIN(d) AS min_val, MAX(d) AS max_val FROM src.t;\n",
+        (
+            "DELETE FROM ds.t1 WHERE d >= DATE '2026-04-13' AND d < DATE '2026-07-12';\n"
+            "INSERT INTO ds.t1 SELECT * FROM src.t "
+            "WHERE d >= DATE '2026-04-13' AND d < DATE '2026-07-12';\n"
+        ),
+    ]
+    if with_null_chunk:
+        stmts.append(
+            "DELETE FROM ds.t1 WHERE d IS NULL;\n"
+            "INSERT INTO ds.t1 SELECT * FROM src.t WHERE d IS NULL;\n"
+        )
+    return stmts
+
+
+@pytest.mark.parametrize("state", ["FAILED", "CANCELLED"])
+def test_failed_discovery_raises_rather_than_reporting_empty(tmp_path, state):
+    """A connector timeout / federation error used to surface as None, which
+    rechunk read as 'source empty' and phase 2 counted as SUCCEEDED with zero
+    rows migrated and exit code 0."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(state=state, reason="connector Lambda timed out")
+    with pytest.raises(mod.DiscoveryFailed) as exc:
+        mod.rechunk_statements(client, _chunked_statements(), dry_run=False)
+    assert state in str(exc.value)
+    assert "connector Lambda timed out" in str(exc.value)
+
+
+def test_discovery_timeout_raises(tmp_path, monkeypatch):
+    """TIMED_OUT is synthesized by wait_for_query, not returned by Athena, so it
+    is injected here rather than driven from the client stub (doing the latter
+    spins wait_for_query for its full 30-minute cap)."""
+    mod = _generated_module(tmp_path)
+    monkeypatch.setattr(mod, "wait_for_query", lambda *a, **k: {
+        "QueryExecution": {"Status": {"State": "TIMED_OUT"}}
+    })
+    with pytest.raises(mod.DiscoveryFailed) as exc:
+        mod.rechunk_statements(_DiscoveryClient(), _chunked_statements(), dry_run=False)
+    assert "TIMED_OUT" in str(exc.value)
+
+
+def test_missing_result_row_is_a_failure_not_emptiness(tmp_path):
+    """MIN/MAX always yields one row; none means the query did not do what we
+    asked, which is not the same as an empty table."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(row=None)
+    with pytest.raises(mod.DiscoveryFailed):
+        mod.rechunk_statements(client, _chunked_statements(), dry_run=False)
+
+
+def test_unparseable_range_is_a_failure(tmp_path):
+    """An unexpected value shape would otherwise crash the whole run uncaught."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(row=("not-a-date", "also-not"))
+    with pytest.raises(mod.DiscoveryFailed):
+        mod.rechunk_statements(client, _chunked_statements(), dry_run=False)
+
+
+def test_genuinely_empty_source_still_returns_no_statements(tmp_path):
+    """A SUCCEEDED query over an empty source returns (None, None) — that is
+    expressed in the return value, never as an exception."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(row=(None, None))
+    assert mod.rechunk_statements(client, _chunked_statements(), dry_run=False) == []
+
+
+def test_null_partition_rows_are_loaded_when_no_dated_rows_exist(tmp_path):
+    """Second data-loss path in the same branch: MIN/MAX are NULL when every row
+    sits in BigQuery's __NULL__ partition. The table is NOT empty, but returning
+    [] dropped those rows and still reported success."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(row=(None, None))
+    out = mod.rechunk_statements(
+        client, _chunked_statements(with_null_chunk=True), dry_run=False
+    )
+    assert out, "NULL-partition rows must still load"
+    assert all("IS NULL" in s for s in out)
+    assert not any("DATE '" in s for s in out), "no date windows to run"
+
+
+def test_successful_discovery_still_rechunks(tmp_path):
+    """Guard the happy path against the new exception plumbing."""
+    mod = _generated_module(tmp_path)
+    client = _DiscoveryClient(row=("2025-01-01", "2025-03-01"))
+    out = mod.rechunk_statements(client, _chunked_statements(), dry_run=False)
+    assert out
+    assert "DATE '2025-01-01'" in out[0]
+
+
+def test_phase_2_counts_failed_discovery_as_failed(tmp_path, monkeypatch):
+    """The headline: the run must not report success for a table it did not load."""
+    mod = _generated_module(tmp_path)
+
+    def _boom(client, statements, dry_run=False, workgroup=None):
+        raise mod.DiscoveryFailed("FAILED: connector Lambda timed out")
+
+    monkeypatch.setattr(mod, "rechunk_statements", _boom)
+    monkeypatch.setattr(mod, "execute_statement", lambda *a, **k: True)
+    tables = [{
+        "table": "ds.t1",
+        "statements": _chunked_statements(),
+        "shortcomings": [],
+    }]
+    succeeded, failed = mod.run_phase_2(None, tables, dry_run=False)
+    assert (succeeded, failed) == (0, 1)
+
+
+def test_phase_2_counts_verified_empty_source_as_succeeded(tmp_path, monkeypatch):
+    """Emptiness is still a success — only failure changed."""
+    mod = _generated_module(tmp_path)
+    monkeypatch.setattr(mod, "rechunk_statements", lambda *a, **k: [])
+    monkeypatch.setattr(mod, "execute_statement", lambda *a, **k: True)
+    tables = [{
+        "table": "ds.t1",
+        "statements": _chunked_statements(),
+        "shortcomings": [],
+    }]
+    succeeded, failed = mod.run_phase_2(None, tables, dry_run=False)
+    assert (succeeded, failed) == (1, 0)

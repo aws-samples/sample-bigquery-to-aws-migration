@@ -19,8 +19,6 @@ import pytest
 from click.testing import CliRunner
 
 from bq_assess.cli import (
-    _engine_prompts,
-    _interactive_prompts,
     _load_config,
     _merge_config,
     main,
@@ -82,7 +80,7 @@ class TestLoadConfig:
         assert result["use_adc"] is False
         assert result["datasets"] == "analytics,marketing"
         assert result["include_query_logs"] is True
-        assert result["query_logs"] == "/tmp/logs.json"
+        assert result["query_logs"] == "/tmp/logs.json"  # nosec B108 - asserting CLI arg passthrough, no file created
         assert result["query_log_days"] == 7
         assert result["bigquery_monthly_cost"] == 5000.0
         assert result["reservation_config"] == "/path/to/res.yaml"
@@ -338,88 +336,6 @@ class TestClickCommand:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _interactive_prompts (mocked)
-# ---------------------------------------------------------------------------
-
-
-class TestInteractivePrompts:
-    """Test interactive mode prompts with mocked Rich prompts."""
-
-    @patch("bq_assess.cli.Prompt.ask")
-    @patch("bq_assess.cli.Confirm.ask")
-    def test_fills_missing_gcp_project(self, mock_confirm, mock_prompt) -> None:
-        """Interactive mode prompts for gcp_project when missing."""
-        mock_prompt.side_effect = lambda *a, **kw: {
-            "GCP Project ID": "prompted-project",
-            "Authentication method": "adc",
-            "Datasets to scan (comma-separated, or empty for all)": "",
-            "Path to exported query logs JSON (or empty for API)": "",
-            "Query log lookback window in days (1-90)": "30",
-            "Monthly BigQuery cost override (or empty to calculate)": "",
-            "Output directory": "bq-migration/",
-            "Output formats (html,json)": "html",
-        }.get(a[0], "")
-        mock_confirm.return_value = False
-
-        params: dict = {}
-        result = _interactive_prompts(params)
-
-        assert result["gcp_project"] == "prompted-project"
-        assert result["use_adc"] is True
-
-    @patch("bq_assess.cli.Prompt.ask")
-    @patch("bq_assess.cli.Confirm.ask")
-    def test_preserves_existing_values(self, mock_confirm, mock_prompt) -> None:
-        """Interactive mode does not overwrite already-set values."""
-        mock_prompt.side_effect = lambda *a, **kw: {
-            "Datasets to scan (comma-separated, or empty for all)": "",
-            "Path to exported query logs JSON (or empty for API)": "",
-            "Query log lookback window in days (1-90)": "30",
-            "Monthly BigQuery cost override (or empty to calculate)": "",
-            "Output directory": "bq-migration/",
-            "Output formats (html,json)": "html",
-        }.get(a[0], "")
-        mock_confirm.return_value = False
-
-        params = {"gcp_project": "already-set", "use_adc": True}
-        result = _interactive_prompts(params)
-
-        assert result["gcp_project"] == "already-set"
-
-    @patch("bq_assess.cli.Prompt.ask")
-    @patch("bq_assess.cli.Confirm.ask")
-    def test_credentials_path_prompt(self, mock_confirm, mock_prompt) -> None:
-        """Interactive mode prompts for credentials path when 'credentials' is chosen."""
-        call_count = 0
-
-        def prompt_side_effect(*args, **kwargs):
-            nonlocal call_count
-            prompt_text = args[0] if args else ""
-            call_count += 1
-            responses = {
-                "GCP Project ID": "my-proj",
-                "Authentication method": "credentials",
-                "Path to service account JSON": "/path/to/sa.json",
-                "Datasets to scan (comma-separated, or empty for all)": "",
-                "Path to exported query logs JSON (or empty for API)": "",
-                "Query log lookback window in days (1-90)": "30",
-                "Monthly BigQuery cost override (or empty to calculate)": "",
-                "Output directory": "bq-migration/",
-                "Output formats (html,json)": "html",
-            }
-            return responses.get(prompt_text, "")
-
-        mock_prompt.side_effect = prompt_side_effect
-        mock_confirm.return_value = False
-
-        params: dict = {}
-        result = _interactive_prompts(params)
-
-        assert result["gcp_project"] == "my-proj"
-        assert result["credentials"] == "/path/to/sa.json"
-
-
-# ---------------------------------------------------------------------------
 # Tests: Engine options (Task 8)
 # ---------------------------------------------------------------------------
 
@@ -471,145 +387,3 @@ def test_engine_athena_reaches_config():
         assert result.exit_code == 0
 
 
-# ---------------------------------------------------------------------------
-# Tests: _engine_prompts
-# ---------------------------------------------------------------------------
-
-
-class TestEnginePrompts:
-    """Test the _engine_prompts function (Task 9)."""
-
-    def test_engine_prompts_returns_responses_when_no_cli_values(self) -> None:
-        """_engine_prompts returns responses when CLI values are not provided."""
-        from rich.prompt import Confirm, Prompt
-
-        params = {}
-
-        # Mock the Rich prompts
-        with patch.object(Prompt, "ask") as mock_ask, \
-             patch.object(Confirm, "ask") as mock_confirm:
-            # Set up mock return values
-            mock_ask.side_effect = ["us-east-1", "5s", "let tool decide"]
-            mock_confirm.return_value = True
-
-            responses = _engine_prompts(params, has_clustering=True)
-
-            assert responses["target_region"] == "us-east-1"
-            assert responses["query_sla_ms"] == 5000
-            assert responses["preferred_engine"] is None
-            assert responses["post_optimization"] is True
-
-    def test_engine_prompts_skips_when_cli_values_provided(self) -> None:
-        """_engine_prompts skips prompts when CLI values are provided."""
-        from rich.prompt import Confirm, Prompt
-
-        params = {
-            "target_region": "us-west-2",
-            "query_sla_ms": 1000,
-            "engine": "athena",
-            "post_optimization": False,
-        }
-
-        with patch.object(Prompt, "ask") as mock_ask, \
-             patch.object(Confirm, "ask") as mock_confirm:
-            responses = _engine_prompts(params, has_clustering=True)
-
-            # No prompts should fire, and dict should be empty
-            assert mock_ask.call_count == 0
-            assert mock_confirm.call_count == 0
-            assert responses == {}
-
-    def test_engine_prompts_no_clustering_skips_post_optimization(self) -> None:
-        """_engine_prompts skips post_optimization prompt when no clustering detected."""
-        from rich.prompt import Confirm, Prompt
-
-        params = {}
-
-        with patch.object(Prompt, "ask") as mock_ask, \
-             patch.object(Confirm, "ask") as mock_confirm:
-            mock_ask.side_effect = ["us-east-1", "5s", "athena"]
-
-            responses = _engine_prompts(params, has_clustering=False)
-
-            # Confirm should not be called for post_optimization
-            assert mock_confirm.call_count == 0
-            assert "post_optimization" not in responses
-
-    def test_engine_prompts_other_region_prompts_for_custom(self) -> None:
-        """_engine_prompts prompts for custom region when 'other' is selected."""
-        from rich.prompt import Confirm, Prompt
-
-        params = {}
-
-        with patch.object(Prompt, "ask") as mock_ask, \
-             patch.object(Confirm, "ask") as mock_confirm:
-            # First prompt: "other", second prompt: custom region, then SLA and engine
-            mock_ask.side_effect = ["other", "eu-central-1", "30s", "redshift"]
-            mock_confirm.return_value = True
-
-            responses = _engine_prompts(params, has_clustering=True)
-
-            assert responses["target_region"] == "eu-central-1"
-            assert responses["query_sla_ms"] == 30000
-            assert responses["preferred_engine"] == "redshift"
-
-    def test_engine_prompts_skips_with_falsy_cli_values(self) -> None:
-        """Explicit falsy CLI values still suppress their prompts."""
-        from rich.prompt import Confirm, Prompt
-
-        params = {
-            "query_sla_ms": 0,
-            "post_optimization": False,
-        }
-
-        with patch.object(Prompt, "ask") as mock_ask, \
-             patch.object(Confirm, "ask") as mock_confirm:
-            # Only region + engine prompts should fire (since they're not in params)
-            mock_ask.side_effect = ["us-east-1", "let tool decide"]
-
-            responses = _engine_prompts(params, has_clustering=True)
-
-            # query_sla_ms=0 and post_optimization=False should NOT prompt
-            assert "query_sla_ms" not in responses
-            assert "post_optimization" not in responses
-            # But region and engine should still prompt (not in params at all)
-            assert responses["target_region"] == "us-east-1"
-            assert responses["preferred_engine"] is None
-            # Confirm should never be called (post_optimization=False already set)
-            assert mock_confirm.call_count == 0
-
-
-def test_report_accepts_engine_flags():
-    """MRI-7: report command should accept --engine, --query-sla-ms, --target-region, --config."""
-    from bq_assess.bundle.models import Bundle
-    runner = CliRunner()
-    with runner.isolated_filesystem():
-        # Create a minimal bundle mock
-        mock_bundle = Bundle(
-            project_id="test",
-            bq_location="us",
-            aws_region="us-east-1",
-            entities=[],
-            queries=[],
-            created_at="2026-01-01T00:00:00Z",
-        )
-
-        # Patch analyze_and_report to capture params
-        with patch("bq_assess.cli.analyze_and_report") as mock_report, \
-             patch("bq_assess.cli.BundleLoader") as mock_loader:
-            mock_loader.return_value.load.return_value = mock_bundle
-
-            result = runner.invoke(main, [
-                "report",
-                "--bundle", "bundle",
-                "--engine", "athena",
-                "--query-sla-ms", "3000",
-                "--target-region", "us-west-2",
-            ])
-
-            # Command should complete or call analyze_and_report
-            assert result.exit_code == 0 or mock_report.called
-            # analyze_and_report should have been called with params containing engine flags
-            if mock_report.called:
-                params = mock_report.call_args[0][1]
-                assert params.get("engine") == "athena" or params.get("_cli_engine_params", {}).get("engine") == "athena"

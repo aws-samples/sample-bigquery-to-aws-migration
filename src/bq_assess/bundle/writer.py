@@ -67,6 +67,11 @@ class BundleWriter:
                     "time_partitioning": self._tp_to_dict(e.time_partitioning),
                     "range_partitioning": self._rp_to_dict(e.range_partitioning),
                     "clustering_fields": e.clustering_fields,
+                    # Measured partition count/bounds (#53). Without these the
+                    # offline path re-guesses from last_modified and under-chunks.
+                    "partition_count": e.partition_count,
+                    "partition_min_id": e.partition_min_id,
+                    "partition_max_id": e.partition_max_id,
                     "view_query": e.view_query,
                     "mview_query": e.mview_query,
                     "depends_on": e.depends_on,
