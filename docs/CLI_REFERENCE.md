@@ -5,7 +5,7 @@ For the guided experience, see the [main README](../README.md).
 ## Install
 
 ```bash
-pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git"
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.9.0"
 ```
 
 ## Usage

@@ -36,7 +36,7 @@ If the script exits non-zero, do **NOT** advance to the Scan phase. Report the e
 Tell the user that the `bq-assess` CLI is not found on PATH. Provide the exact install commands:
 
 ```bash
-pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git"
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.9.0"
 ```
 
 Then ask: **"Would you like me to run these commands, or will you handle the installation manually?"**
