@@ -1,7 +1,7 @@
 """Unit tests for the BQ→Redshift translation pipeline (rewrite.py, 2026-07-16 rework).
 
 Covers the regression cases named in the design review
-(2026-07-16 translation deep-audit):
+(storm-aws-report/2026-07-16-assess-bq-assess-translation-fixes.md):
 temporal AST rewrites to a fixpoint, the string-literal offset guard,
 AST-based residual detection (no string-literal false positives),
 idempotency, multi-statement isolation, and the confidence taxonomy.
@@ -194,7 +194,7 @@ class TestConfidenceTaxonomy:
         assert r.confidence == "HIGH"
 
 
-# ---- Deep-audit fixes (2026-07-16 build deep-audit) ---------------------
+# ---- Storm-AWS audit fixes (2026-07-16 build deep-audit) ---------------------
 
 
 class TestZSuffixFix:

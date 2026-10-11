@@ -661,3 +661,28 @@ class TestReservationDataCollected:
 
         bundle = BundleLoader().load(bundle_dir)
         assert bundle.pricing.reservation_data_collected is True
+
+
+class TestCustomerMonthlyCostRoundTrip:
+    """--bigquery-monthly-cost captured at collection rides in pricing.json and
+    survives write→load, so the report can use it as the BQ cost (2026-08-12)."""
+
+    def test_customer_cost_round_trips_through_bundle(self, tmp_path) -> None:
+        bundle = _make_bundle([], pricing=PricingDetection(
+            model=BQPricingModel.CAPACITY, confidence=ConfidenceLevel.MEDIUM,
+            source_note="test", edition="ENTERPRISE",
+            customer_monthly_cost=8000.0, customer_cost_supplied_on="2026-08-12",
+        ))
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        loaded = BundleLoader().load(bundle_dir)
+        assert loaded.pricing.customer_monthly_cost == 8000.0
+        assert loaded.pricing.customer_cost_supplied_on == "2026-08-12"
+
+    def test_absent_customer_cost_loads_as_none(self, tmp_path) -> None:
+        bundle = _make_bundle([], pricing=PricingDetection(
+            model=BQPricingModel.ON_DEMAND, confidence=ConfidenceLevel.HIGH,
+            source_note="test",
+        ))
+        bundle_dir = BundleWriter().write(bundle, str(tmp_path))
+        loaded = BundleLoader().load(bundle_dir)
+        assert loaded.pricing.customer_monthly_cost is None

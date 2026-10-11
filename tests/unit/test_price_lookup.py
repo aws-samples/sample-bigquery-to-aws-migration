@@ -126,7 +126,7 @@ def test_both_live_result_is_cached(tmp_path, monkeypatch) -> None:
 def test_fetch_live_rates_times_out_before_slow_fetch_completes() -> None:
     """A fetch that outlasts the budget raises PricingTimeout at the deadline, not later.
 
-    Regression for the internal deep-audit finding that the paginated GCP catalog fetch
+    Regression for the storm-aws deep-audit finding that the paginated GCP catalog fetch
     could freeze the CLI for minutes. The wait ends at the budget, and the orphaned worker
     thread must not delay the return.
     """
@@ -165,3 +165,69 @@ def test_fetch_live_rates_passes_gcp_client_through() -> None:
     sentinel = object()
     fetch_live_rates_with_timeout(RecordingLookup(), gcp_client=sentinel, budget_seconds=5)
     assert seen["client"] is sentinel
+
+
+@pytest.fixture
+def _restore_aws_constants():
+    """Snapshot/restore EVERYTHING apply_aws_region + apply_live_rates mutate —
+    a partial restore leaks another region's rates into later tests."""
+    import copy
+
+    from bq_assess.engine.redshift import cost_constants as k
+
+    snap = {n: getattr(k, n) for n in (
+        "V1_RPU_HOUR_USD", "V1_SERVERLESS_1YR_ALL_UPFRONT_RPU_HOUR_USD",
+        "V1_SERVERLESS_1YR_NO_UPFRONT_RPU_HOUR_USD", "V1_SERVERLESS_3YR_RPU_HOUR_USD",
+        "V2_S3_TABLES_USD_PER_GB_MONTH_TIER1", "V2_S3_TABLES_USD_PER_GB_MONTH_TIER2",
+        "V2_S3_TABLES_USD_PER_GB_MONTH_TIER3", "V2_INT_IA_USD_PER_GB_MONTH",
+        "V2_INT_AIA_USD_PER_GB_MONTH", "V6_MANAGED_STORAGE_USD_PER_GB_MONTH",
+        "V8_DATA_TRANSFER_OUT_USD_PER_GB",
+        "AWS_PRICING_REGION", "AWS_REGION_SCOPE", "AWS_REGION_MATCH_NOTE",
+        "AWS_REGION_MATCH_LABEL", "AWS_CONFIRMED_DATE", "AWS_PROVISIONED_CONFIRMED_DATE",
+    )}
+    nodes = (copy.deepcopy(k.V7_RG_NODE_TYPES), copy.deepcopy(k.V6_RA3_NODE_TYPES))
+    yield
+    for n, val in snap.items():
+        setattr(k, n, val)
+    k.V7_RG_NODE_TYPES.update(nodes[0])
+    k.V6_RA3_NODE_TYPES.update(nodes[1])
+
+
+def test_apply_live_rates_region_gate_rejects_mismatched_aws_half(
+    _restore_aws_constants,
+) -> None:
+    """A live AWS snapshot fetched for a DIFFERENT region than the cascade installed
+    must not apply — e.g. a bundle collected while asia-southeast2 mapped to Sydney
+    replaying Sydney rates onto a report now priced in Jakarta (2026-08-13)."""
+    import bq_assess.core.price_lookup as pl
+    from bq_assess.engine.redshift import cost_constants as k
+
+    assert k.apply_aws_region("ap-southeast-3")
+    rpu_before = k.V1_RPU_HOUR_USD
+    stale = pl.PricingRates(
+        aws=pl.AWSRates(rpu_hour_usd=0.419, fetched_at="2026-08-10",
+                        source="AWS Price List API"),
+        is_live=True, aws_region="ap-southeast-2",
+    )
+    aws_applied, _ = pl.apply_live_rates(stale)
+    assert aws_applied is False
+    assert k.V1_RPU_HOUR_USD == rpu_before          # Jakarta rate survived
+    assert k.AWS_PRICING_REGION == "ap-southeast-3"  # tag not re-stamped
+
+
+def test_apply_live_rates_region_gate_accepts_matching_aws_half(
+    _restore_aws_constants,
+) -> None:
+    """Same-region live snapshot still applies (the gate only rejects mismatches)."""
+    import bq_assess.core.price_lookup as pl
+    from bq_assess.engine.redshift import cost_constants as k
+
+    assert k.apply_aws_region("ap-southeast-3")
+    fresh = pl.PricingRates(
+        aws=pl.AWSRates(rpu_hour_usd=0.4567, fetched_at="2026-08-13",
+                        source="AWS Price List API"),
+        is_live=True, aws_region="ap-southeast-3",
+    )
+    aws_applied, _ = pl.apply_live_rates(fresh)
+    assert aws_applied is True
+    assert k.V1_RPU_HOUR_USD == 0.4567

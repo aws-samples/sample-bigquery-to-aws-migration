@@ -38,6 +38,7 @@ from bq_assess.core.jobs_query import (
     read_jobs_queries,
     read_reservation_groups,
 )
+from bq_assess.core.partition_stats import resolve_partition_counts
 from bq_assess.core.price_lookup import (
     PriceLookup,
     PricingTimeout,
@@ -45,7 +46,7 @@ from bq_assess.core.price_lookup import (
     rates_to_dict,
 )
 from bq_assess.core.pricing import PricingDetector
-from bq_assess.core.region_mapping import bq_location_to_aws_region
+from bq_assess.core.region_mapping import match_bq_location
 from bq_assess.core.reservation_reader import (
     ReservationCache,
     parse_admin_project,
@@ -63,6 +64,7 @@ from bq_assess.models import (
     ConfidenceLevel,
     EntityMetadata,
     FailureRecord,
+    PricingDetection,
 )
 
 logger = logging.getLogger(__name__)
@@ -142,22 +144,16 @@ def collect(params: dict) -> Bundle:
     entities: list[EntityMetadata] | None = None
 
     if not params.get("no_cache") and cache.has_cache(gcp_project):
-        use_cache = True
-        if params.get("interactive"):
-            use_cache = Confirm.ask(
-                f"Cached metadata found for project '{gcp_project}'. Use cached data?",
-                default=True,
-            )
+        # --use-cache is an explicit opt-in (no_cache defaults True), so honor it
+        # silently — prompting about the thing the flag just decided contradicted
+        # the flag and stalled fleet loops (2026-08-12 review).
+        console.print(f"[cyan]Using cached metadata for project '{gcp_project}'.[/cyan]")
+        entities = cache.load(gcp_project)
+        if entities:
+            console.print(f"[green]✓ Loaded {len(entities)} entities from cache.[/green]")
         else:
-            console.print(f"[cyan]Using cached metadata for project '{gcp_project}'.[/cyan]")
-
-        if use_cache:
-            entities = cache.load(gcp_project)
-            if entities:
-                console.print(f"[green]✓ Loaded {len(entities)} entities from cache.[/green]")
-            else:
-                console.print("[yellow]⚠ Cache is empty — rescanning.[/yellow]")
-                entities = None
+            console.print("[yellow]⚠ Cache is empty — rescanning.[/yellow]")
+            entities = None
 
     if entities is None:
         console.print("\n[bold]Stage 2:[/bold] Scanning BigQuery metadata...")
@@ -268,6 +264,29 @@ def collect(params: dict) -> Bundle:
         console.print(f"[yellow]⚠ Pricing detection failed: {exc}[/yellow]")
         pricing = None
 
+    # Customer-supplied bill (--bigquery-monthly-cost) rides in the bundle so the
+    # report uses it as the BQ cost for ANY pricing model (2026-08-12). Recorded
+    # even when detection failed — the override is exactly for that case.
+    if params.get("bigquery_monthly_cost") is not None:
+        if pricing is None:
+            # Detection failed but the customer told us the bill. Use the
+            # detector's own documented undeterminable convention (ON_DEMAND at
+            # LOW — core/pricing.py: "the detector never returns model == UNKNOWN"),
+            # NOT a hand-rolled UNKNOWN: downstream dispatch has no UNKNOWN
+            # branches and Stage 13b treats UNKNOWN as the offline sentinel,
+            # silently skipping the whole comparison (2026-08-12 review F3).
+            pricing = PricingDetection(
+                model=BQPricingModel.ON_DEMAND, confidence=ConfidenceLevel.LOW,
+                source_note="Pricing detection failed; customer-supplied monthly cost recorded.",
+            )
+        pricing.customer_monthly_cost = float(params["bigquery_monthly_cost"])
+        pricing.customer_cost_supplied_on = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        console.print(
+            f"[green]✓ Customer-provided monthly BigQuery cost recorded: "
+            f"${pricing.customer_monthly_cost:,.2f} — the report will use it as the "
+            f"BigQuery cost.[/green]"
+        )
+
     # ── Stage 3b: Auto-read reservation details (all capacity editions) ──
     reservation_cache: ReservationCache | None = params.get("reservation_cache")
     if (
@@ -329,6 +348,18 @@ def collect(params: dict) -> Bundle:
                     f"commitment={read_result.commitment_slots} "
                     f"({read_result.commitment_plan})[/green]"
                 )
+            elif read_result.permission_denied and pricing.customer_monthly_cost is not None:
+                # Customer already supplied the bill — no doom messaging, no retry
+                # prompt: the report uses their figure (2026-08-12 review F5; the old
+                # path told them to supply the flag they had just passed).
+                pricing.reservation_readable = False
+                console.print(
+                    f"[yellow]⚠ Reservation details unreadable on '{admin_proj}' — "
+                    f"using your provided monthly cost "
+                    f"(${pricing.customer_monthly_cost:,.2f}) as the BigQuery cost.[/yellow]"
+                )
+                if reservation_cache:
+                    reservation_cache.put(admin_proj, res_location, res_name, read_result)
             elif read_result.permission_denied:
                 # Branch messaging: ENTERPRISE/ENTERPRISE_PLUS require commitments (hard stop),
                 # STANDARD has a fallback (modelled range from measured slot usage).
@@ -380,8 +411,11 @@ def collect(params: dict) -> Bundle:
                 )
                 console.print()
 
+                # Prompting is resolved ONCE at params assembly (params["prompts"]):
+                # default-on for terminal-attached single-project runs, always off
+                # for bq-assess report and fleet loops (2026-08-12 review).
                 retry = (
-                    params.get("interactive")
+                    params.get("prompts")
                     and Confirm.ask("Grant access and retry?", default=False)
                 )
                 if retry:
@@ -525,14 +559,18 @@ def collect(params: dict) -> Bundle:
 
     # ── Stage 6: Region Detection + Rate Snapshot ──────────────────
     console.print("\n[bold]Stage 6:[/bold] Snapshotting pricing rates...")
-    aws_region, is_fallback = bq_location_to_aws_region(detected_location)
-    if is_fallback:
+    region_match = match_bq_location(detected_location)
+    aws_region = region_match.aws_region
+    if region_match.kind == "fallback":
         console.print(
             f"[yellow]⚠ BigQuery location '{detected_location}' has no AWS mapping — "
             f"defaulting to us-east-1 pricing; override with --target-region[/yellow]"
         )
     else:
-        console.print(f"[dim]  Source region: {detected_location} → AWS region: {aws_region}[/dim]")
+        note = f" ({region_match.note})" if region_match.note else ""
+        console.print(
+            f"[dim]  Source region: {detected_location} → AWS region: {aws_region}{note}[/dim]"
+        )
 
     rates_snapshot: dict | None = None
     if not params.get("offline_pricing", False):
@@ -604,6 +642,46 @@ def collect(params: dict) -> Bundle:
                 entity.physical_bytes = effective_physical_bytes(entity.num_bytes, None)
 
     storage_basis = storage_stats.basis if storage_stats else "assumed"
+
+    # ── Partition counts (INFORMATION_SCHEMA.PARTITIONS) ──────────────
+    # Feeds the Athena chunking decision. Without it the count is guessed from
+    # last_modified, which under-counts actively-written tables and skips
+    # required chunking (#53). Degrading to the guess is survivable, so a
+    # failure here is recorded but never aborts the run.
+    console.print("\n[bold]Stage 7b:[/bold] Reading partition counts...")
+    try:
+        partition_stats = resolve_partition_counts(
+            client, gcp_project, region_datasets, entities
+        )
+        for entity in entities:
+            info = partition_stats.partitions.get(entity.full_name)
+            if info:
+                entity.partition_count = info.count
+                entity.partition_min_id = info.min_id
+                entity.partition_max_id = info.max_id
+
+        if partition_stats.basis == "measured":
+            console.print(f"[green]✓ {partition_stats.source_note}[/green]")
+        else:
+            console.print(f"[yellow]⚠ {partition_stats.source_note}[/yellow]")
+        if partition_stats.failure_reason:
+            scope = (
+                "PARTITIONS unreadable"
+                if partition_stats.measured_datasets == 0
+                else "PARTITIONS partially read — some dataset(s) failed"
+            )
+            failures.append(FailureRecord(
+                entity_name=f"{gcp_project} (INFORMATION_SCHEMA.PARTITIONS)",
+                stage="scan",
+                error=f"{scope} — {partition_stats.failure_reason}",
+            ))
+    except Exception as exc:
+        console.print(f"[yellow]⚠ Partition count resolution failed: {exc}[/yellow]")
+        failures.append(FailureRecord(
+            entity_name=f"{gcp_project} (INFORMATION_SCHEMA.PARTITIONS)",
+            stage="scan",
+            error=f"partition count resolution failed — {type(exc).__name__}: {exc}",
+        ))
 
     # ── Storage Read API egress estimation (Cloud Monitoring) ─────────
     egress_sessions: int | None = None

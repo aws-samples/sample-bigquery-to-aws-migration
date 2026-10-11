@@ -1,3 +1,8 @@
+# No `select` here, so the active rule set is ruff's built-in default — which is
+# version-dependent (0.15: 59 rules, 0.16: 405). That is why the ruff version is
+# pinned exactly in pyproject.toml [dev] and .gitlab-ci.yml; bumping it is a
+# deliberate act that may surface new rules. If the team later wants the standard
+# written down independently of upstream defaults, add an explicit `select`.
 [lint]
 ignore = [
     "BLE001",   # bare Exception in CLI/collector is intentional graceful degradation

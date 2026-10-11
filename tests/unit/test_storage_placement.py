@@ -246,7 +246,7 @@ def test_effort_category_ladder_single_source():
 
 
 def test_apply_rms_storage_split_moves_bytes_to_rms_line():
-    """Deep audit HRI-4: serverless bills RMS separately — RMS-placed bytes must
+    """Storm audit HRI-4: serverless bills RMS separately — RMS-placed bytes must
     leave the S3 Tables line and appear as an RMS line, with headline totals updated."""
     from bq_assess.engine.redshift import cost_constants as k
     from bq_assess.engine.redshift.cost import (
@@ -312,7 +312,7 @@ def test_apply_rms_storage_split_noop_without_rms_bytes():
 
 
 def test_size_ceiling_labelled_as_opinion(advisor):
-    """Deep audit: the 500GB ceiling has no AWS backing — the signal must say so."""
+    """Storm audit: the 500GB ceiling has no AWS backing — the signal must say so."""
     entity = _table([_col("boundary", "GEOGRAPHY")], num_bytes=600 * _ONE_GB)
     sp = advisor.recommend(entity)
     assert any("practitioner judgment" in s for s in sp.signals)

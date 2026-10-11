@@ -85,7 +85,7 @@ def read_jobs_hourly(
     BigQuery collapses per-job rows server-side into the same UTC-hour buckets
     ``WorkloadAnalyzer._compute`` previously built in Python, so a Source running millions
     of queries/month costs the client ≤720 rows instead of a multi-GB row stream (the
-    10 PB-scale OOM found in the 2026-07-08 deep audit). ``missing_billed_jobs`` preserves
+    10 PB-scale OOM found in the 2026-07-08 storm audit). ``missing_billed_jobs`` preserves
     the all-or-nothing ``has_billed_bytes`` semantics: any NULL ``total_bytes_billed`` on a
     job that actually scanned bytes degrades the whole window to the processed-bytes
     fallback. No-scan jobs (NULL/0 ``total_bytes_processed`` — materialized-view
@@ -112,7 +112,7 @@ def read_jobs_hourly(
 # Cap on distinct query SHAPES exported to queries.jsonl. Ordered by total slot-ms so the
 # heaviest statements always survive the cut; the collector logs when truncation occurs.
 # Bounds the export the same way read_jobs_hourly bounds the workload read (no per-job
-# row stream — the 2026-07-08 deep-audit OOM class).
+# row stream — the 2026-07-08 storm-audit OOM class).
 QUERIES_EXPORT_LIMIT = 50_000
 
 # Server-side query-shape normalization for the GROUP BY key (2026-07-28 scale

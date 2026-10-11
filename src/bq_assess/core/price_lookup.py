@@ -180,7 +180,7 @@ class PriceLookup:
             url = _AWS_OFFER_URL_TEMPLATE.format(service="AmazonRedshift", region=self._aws_region)
             req = urllib.request.Request(url)
             req.add_header("Accept-Encoding", "gzip")
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - hardcoded https AWS Price List API URL, no user input
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as exc:
             logger.warning("AWS Price List API unreachable: %s — using hardcoded rates", exc)
@@ -276,7 +276,7 @@ class PriceLookup:
         try:
             url = _AWS_OFFER_URL_TEMPLATE.format(service="AmazonS3", region=self._aws_region)
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 - hardcoded https AWS Price List API URL, no user input
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
             return None
@@ -727,6 +727,17 @@ def apply_live_rates(rates: PricingRates) -> tuple[bool, bool]:
     # apply_bq_region/apply_aws_region installed (the Sydney-priced-as-US class).
     aws_is_live = is_live_half(aws)
     gcp_is_live = is_live_half(gcp)
+
+    # Region gate on the AWS half: a live snapshot fetched for a DIFFERENT region
+    # than the cascade installed must not apply — e.g. a bundle collected while
+    # asia-southeast2 still mapped to Sydney replaying Sydney rates onto a report
+    # the nearest-region policy now prices in Jakarta (2026-08-13).
+    if aws_is_live and rates.aws_region != k.AWS_PRICING_REGION:
+        logger.info(
+            "bundle AWS rate snapshot is for %s but constants reflect %s — "
+            "keeping region-adjusted rates", rates.aws_region, k.AWS_PRICING_REGION,
+        )
+        aws_is_live = False
 
     # AWS Serverless
     if aws_is_live and aws.rpu_hour_usd > 0:

@@ -36,21 +36,28 @@ Cloud Shell is the easiest environment — it's already authenticated.
 # 1. Install the collector (slim: no report-generation dependencies)
 pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git#subdirectory=packaging/collector"
 
-# 2. Collect
-bq-collect --gcp-project <YOUR_PROJECT> --use-adc --output bundle-out/
+# 2. Collect — a single project:
+bq-collect --gcp-project <YOUR_PROJECT> --use-adc --output bundle-out/ --zip
 
-# 3. Zip the bundle
-cd bundle-out && zip -r bundle.zip bundle/
+# ...or every project your credentials can access, in one pass:
+bq-collect --gcp-project all --use-adc --output bundle-out/ --zip
 ```
 
-Typical runs finish in under 10 minutes. Multi-region datasets are handled
+`--zip` writes an already-zipped bundle for you. With a single project that's
+`bundle-out/bundle.zip`; with `all` it's one zip per project, each written to
+`bundle-out/bundle-<project>/`. Datasets with no BigQuery usage are skipped
+automatically, and one project failing (permissions, etc.) doesn't stop the rest.
+
+Typical runs finish in under 10 minutes per project. Multi-region datasets are handled
 automatically, and an interrupted scan resumes where it left off if you re-run it.
 
 ### Useful options
 
 | Option | Effect |
 | --- | --- |
-| `--datasets a,b,c` | Limit collection to specific datasets |
+| `--gcp-project all` | Collect every BigQuery project your credentials can access |
+| `--zip` | Write the bundle already zipped, ready to send |
+| `--datasets a,b,c` | Limit collection to specific datasets (single-project only) |
 | `--exclude-query-text` | Collect usage statistics but no query text at all |
 | `--skip-workload` | Skip query-log analysis entirely (lower confidence output) |
 | `--credentials key.json` | Use a service-account key instead of ADC |
@@ -60,7 +67,7 @@ Run `bq-collect --help` for the full list.
 
 ## Review before sharing
 
-Everything in `bundle-out/bundle/` is plain text you can audit:
+Before sending anything, unzip and look. Everything inside is plain text you can audit:
 
 | File | Contents |
 | --- | --- |

@@ -165,3 +165,78 @@ class TestEffortScorer:
         scorer = EffortScorer()
         result = scorer.score(e, _conversion())
         assert "ongoing_sync" in result.flags
+
+
+# --- #74: a table whose generated load cannot run must not score AUTO --------
+
+
+class TestAmendForLoadBlocking:
+    """CONTEXT.md defines the axis as AUTO = tool moves it unattended,
+    ASSISTED = moves it but a flagged decision needs sign-off, MANUAL = human
+    designs the load. A connector-blocked table is MANUAL: there is no working
+    generated load to sign off on.
+
+    Before this, clickstream_events_denormalized was scored AUTO / 0 ("fully
+    automatable") while the same report said its load would fail.
+    """
+
+    def _result(self, score, category, flags=None, reasoning="base"):
+        from bq_assess.models import ConfidenceLevel, EffortResult
+        return EffortResult(
+            category=category, score=score, flags=flags or [],
+            reasoning=reasoning, confidence=ConfidenceLevel.HIGH,
+        )
+
+    def test_auto_table_becomes_manual(self):
+        from bq_assess.models import EffortCategory
+        from bq_assess.scoring.effort import amend_for_load_blocking
+        out = amend_for_load_blocking(
+            self._result(0, EffortCategory.AUTO, reasoning="No effort factors detected"))
+        assert out.category is EffortCategory.MANUAL
+        assert out.score == 3
+
+    def test_assisted_table_also_becomes_manual(self):
+        from bq_assess.models import EffortCategory
+        from bq_assess.scoring.effort import amend_for_load_blocking
+        out = amend_for_load_blocking(self._result(2, EffortCategory.ASSISTED))
+        assert out.category is EffortCategory.MANUAL
+        assert out.score == 5
+
+    def test_category_is_derived_not_forced(self):
+        """+3 clears the >2 MANUAL threshold from any starting score, so the
+        shared _category_for ladder still governs — nothing hardcodes MANUAL."""
+        from bq_assess.scoring.effort import _category_for, amend_for_load_blocking
+        for start in (0, 1, 2, 5, 10):
+            out = amend_for_load_blocking(self._result(start, EffortCategory.AUTO))
+            assert out.category is _category_for(out.score)
+            assert out.category is EffortCategory.MANUAL
+
+    def test_composes_with_rms_amend_in_either_order(self):
+        """Additive points mean the two amends cannot discard each other."""
+        from bq_assess.models import EffortCategory
+        from bq_assess.scoring.effort import (
+            amend_for_load_blocking,
+            amend_for_rms_placement,
+        )
+        base = self._result(1, EffortCategory.ASSISTED)
+        a = amend_for_rms_placement(amend_for_load_blocking(base))
+        b = amend_for_load_blocking(amend_for_rms_placement(base))
+        assert a.score == b.score == 5
+        assert {"connector_load_blocked", "rms_two_phase_load"} <= set(a.flags)
+        assert {"connector_load_blocked", "rms_two_phase_load"} <= set(b.flags)
+
+    def test_flag_and_reasoning_are_appended_not_replaced(self):
+        from bq_assess.models import EffortCategory
+        from bq_assess.scoring.effort import amend_for_load_blocking
+        out = amend_for_load_blocking(
+            self._result(1, EffortCategory.ASSISTED, flags=["data_volume_large"],
+                         reasoning="large volume (+1)"))
+        assert out.flags == ["data_volume_large", "connector_load_blocked"]
+        assert "large volume (+1)" in out.reasoning
+        assert "cannot run" in out.reasoning
+
+    def test_confidence_preserved(self):
+        from bq_assess.models import ConfidenceLevel, EffortCategory
+        from bq_assess.scoring.effort import amend_for_load_blocking
+        out = amend_for_load_blocking(self._result(0, EffortCategory.AUTO))
+        assert out.confidence is ConfidenceLevel.HIGH

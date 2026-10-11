@@ -126,6 +126,13 @@ def test_full_pipeline_low_volume():
         range_partitioning=None, clustering_fields=["id"],
         view_query=None, mview_query=None, routine=None,
         depends_on=[], last_modified=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        # Pin the partition count so this test does not depend on wall-clock
+        # time. It used to rely on the fallback estimator, which measures
+        # "days since last_modified" — with last_modified fixed at 2026-07-01
+        # the estimate grew daily and crossed the 100-partition chunking
+        # threshold on 2026-10-09, turning the assertion below red with no code
+        # change. Same root cause as #53, surfacing in the test suite.
+        partition_count=10,
     )
     conversion = ConversionResult(
         ddl="CREATE TABLE ...",

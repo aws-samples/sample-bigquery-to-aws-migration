@@ -13,7 +13,13 @@ from __future__ import annotations
 import dataclasses
 
 from bq_assess.engine.redshift import cost_constants as k
-from bq_assess.engine.redshift.cost import _line_high, _line_low, _line_value
+from bq_assess.engine.redshift.cost import (
+    _line_high,
+    _line_low,
+    _line_value,
+    bq_basis_qualifier,
+    estimate_basis_level,
+)
 from bq_assess.models import (
     AWSRecommendation,
     AWSScenario,
@@ -137,7 +143,8 @@ def assemble_cost_comparison(
 
     # Estimate basis: derives from the winner (fixes #4)
     basis_level, basis_text = _derive_estimate_basis(
-        base_comparison.bigquery_breakdown, best, workload_profile
+        base_comparison.bigquery_breakdown, best, workload_profile,
+        bq_cost_basis=base_comparison.bq_cost_basis,
     )
 
     # Order scenarios: recommended first, then ascending by monthly_total
@@ -409,7 +416,7 @@ def _build_redshift_elaborated_justification(
         )
     # The crossover-assumptions sentence describes Serverless's 4-RPU minimum posture —
     # only relevant when the recommended scenario IS Serverless (a provisioned
-    # recommendation mentioning "4 RPU" reads as a contradiction — sandbox feedback).
+    # recommendation mentioning "4 RPU" reads as a contradiction — SpinLab feedback).
     if scenario.category.startswith("SERVERLESS"):
         justification += _crossover_assumptions_sentence(crossover)
 
@@ -550,23 +557,24 @@ def _derive_estimate_basis(
     bq_breakdown: list[CostLine],
     best: AWSScenario,
     workload_profile: WorkloadProfile,
+    *,
+    bq_cost_basis: str,
 ) -> tuple[ConfidenceLevel, str]:
     """Derive the estimate_basis from the winning scenario (Fix 4).
 
     When Athena is the winner, the sentence names Athena's pricing model.
     When Redshift is the winner, the sentence names Redshift's pricing inputs.
-    Level = minimum across the BQ breakdown and the recommended option's lines.
+    Level = estimate_basis_level (min over PRICED lines, capped at MEDIUM when
+    the BQ side is unavailable — Ryan 2026-08-13); the BQ-side wording for the
+    customer-provided/unavailable states comes from bq_basis_qualifier. Both
+    helpers are shared with CostEstimator._estimate_basis so the two report
+    paths cannot drift on level OR wording (this function REBUILDS the text and
+    wins whenever workload data exists — 2026-08-13 review).
+    ``bq_cost_basis``: "modelled" | "customer_provided" | "unavailable".
     """
-    _CONFIDENCE_ORDER = {
-        ConfidenceLevel.LOW: 0,
-        ConfidenceLevel.MEDIUM: 1,
-        ConfidenceLevel.HIGH: 2,
-    }
-    lines = list(bq_breakdown) + list(best.lines)
-    level = min(
-        (ln.confidence for ln in lines),
-        key=lambda c: _CONFIDENCE_ORDER.get(c, 0),
-        default=ConfidenceLevel.LOW,
+    level = estimate_basis_level(
+        bq_breakdown, best.lines,
+        bq_cost_available=bq_cost_basis != "unavailable",
     )
 
     is_athena = "Athena" in best.label
@@ -590,11 +598,17 @@ def _derive_estimate_basis(
                 "Priced from Redshift Serverless RPU-hours; "
                 "projected from measured workload data and current published rates."
             )
-        else:
+        elif bq_cost_basis == "modelled":
             text = (
                 "No workload data — compute is a rough range. "
                 "Provide query logs for a measured estimate."
             )
+        else:
+            # Query logs cannot fix a customer-provided or unavailable BQ side —
+            # don't advise them as a remedy (2026-08-13 review).
+            text = "No workload data — AWS compute is a rough range."
+
+    text += bq_basis_qualifier(bq_cost_basis)
 
     return level, text
 

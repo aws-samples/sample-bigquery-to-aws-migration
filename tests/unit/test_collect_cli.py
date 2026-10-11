@@ -148,3 +148,16 @@ class TestCollectAllAndZip:
         assert os.path.isfile(keep)                # sibling untouched
         assert os.path.isfile(str(tmp_path / "shared.zip"))
         assert not os.path.exists(os.path.join(out, "bundle"))
+
+
+class TestFleetCostOverrideRejected:
+    """--bigquery-monthly-cost is one project's bill — combined with
+    --gcp-project all it would be baked into EVERY bundle (2026-08-12 review F2)."""
+
+    def test_all_plus_cost_override_exits_with_error(self) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["--gcp-project", "all", "--use-adc", "--bigquery-monthly-cost", "10000"],
+        )
+        assert result.exit_code == 1
+        assert "cannot be combined" in result.output

@@ -152,14 +152,14 @@ class BundleLoader:
                 raise BundleError(
                     f"Bundle file listed in manifest is missing: {filename} — "
                     f"the bundle is incomplete (truncated zip or partial copy). "
-                    f"Ask the customer to re-send it."
+                    f"Ask the bundle provider to re-send it."
                 )
             actual_sha = sha256_file(fpath)
             if actual_sha != expected_sha:
                 raise BundleError(
                     f"Checksum mismatch for {filename}: bundle may be corrupt or "
                     f"tampered (expected {expected_sha[:12]}…, got {actual_sha[:12]}…). "
-                    f"Ask the customer to re-send the bundle."
+                    f"Ask the bundle provider to re-send the bundle."
                 )
 
         return manifest
@@ -245,6 +245,11 @@ class BundleLoader:
                     depends_on=t.get("depends_on", []),
                     last_modified=self._parse_dt(t.get("last_modified")),
                     physical_bytes=t.get("physical_bytes"),
+                    # Absent in bundles written before #53 — None then falls back
+                    # to estimating, which is the pre-fix behaviour.
+                    partition_count=t.get("partition_count"),
+                    partition_min_id=t.get("partition_min_id"),
+                    partition_max_id=t.get("partition_max_id"),
                 ))
             except (KeyError, ValueError) as exc:
                 raise BundleError(f"Malformed table entry in tables.json: {exc}") from exc
@@ -339,6 +344,8 @@ class BundleLoader:
                 assigned_projects=data.get("assigned_projects") or [],
                 assigned_count=data.get("assigned_count", 0),
                 commitments=data.get("commitments") or [],
+                customer_monthly_cost=data.get("customer_monthly_cost"),
+                customer_cost_supplied_on=data.get("customer_cost_supplied_on"),
             )
         except (TypeError, ValueError) as exc:
             raise BundleError(f"Malformed pricing.json: {exc}") from exc

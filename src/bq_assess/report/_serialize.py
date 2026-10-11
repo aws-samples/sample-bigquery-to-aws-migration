@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
 from bq_assess.engine.redshift import cost_constants as k
 from bq_assess.models import Assessment, EntityPopulation
+from bq_assess.report.provenance import provenance
 
 
 def _to_dict(obj):
@@ -49,16 +51,16 @@ def _to_dict(obj):
 def serialize_landing(assessment: Assessment) -> dict:
     """Build the landing JSON dict: metadata + summary + cost + failures + engine fields.
 
-    ``schema_version`` (the package version) lets external consumers gate on field
-    semantics — added 2026-07-16 when ``cost.scope_notes`` changed meaning under the
-    same key (region caveat moved to ``pricing_notes``; AWS-side exclusions added).
+    Identity fields come from ``provenance()`` so every artifact carries the same
+    block. ``schema_version`` lets external consumers gate on field semantics —
+    added 2026-07-16 when ``cost.scope_notes`` changed meaning under the same key
+    — and is an integer bumped by hand, NOT the package version, which could
+    never signal a contract change. See report/provenance.py.
 
     migration_plans is serialized as a SUMMARY (counts only) at the landing level —
     the full per-entity plans live in the effort JSON rows (Fix 7: kill double
     serialization; per-entity is the canonical copy the report reads).
     """
-    from bq_assess import __version__
-
     # Slim migration_plans to a summary instead of full plans (Fix 7)
     migration_summary = None
     if assessment.migration_plans:
@@ -71,17 +73,30 @@ def serialize_landing(assessment: Assessment) -> dict:
             1 for p in plans.values()
             if any(s.severity == "action_required" for s in p.shortcomings)
         )
+        # Split the action_required count (#68). "This load cannot run as
+        # generated" and "review the emitted cast" are very different asks, and
+        # one number covering both misleads planning — a reader cannot tell
+        # whether 7 means 7 broken loads or 7 casts to eyeball. action_required
+        # is retained as the total so existing consumers keep working.
+        load_blocking = sum(
+            1 for p in plans.values()
+            if any(s.blocks_load for s in p.shortcomings)
+        )
+        review_only = sum(
+            1 for p in plans.values()
+            if any(s.severity == "action_required" for s in p.shortcomings)
+            and not any(s.blocks_load for s in p.shortcomings)
+        )
         migration_summary = {
             "tables": len(plans),
             "chunked": chunked,
             "action_required": action_required,
+            "load_blocking": load_blocking,
+            "action_required_review_only": review_only,
         }
 
     result = {
-        "schema_version": __version__,
-        "assessment_id": assessment.assessment_id,
-        "generated_at": assessment.generated_at.isoformat(),
-        "project_id": assessment.project_id,
+        **provenance(assessment),
         "summary": _to_dict(assessment.summary),
         "cost": _to_dict(assessment.cost),
         "failures": _to_dict(assessment.failures),
@@ -139,10 +154,12 @@ _EFFORT_ROW_KEYS = (
     "full_name", "entity_type", "population", "rows",
     "logical_size_gb", "physical_size_gb",
     "effort", "storage_placement", "detail_chunk",
+    "detail_omitted",      # heavy payload past the embed budget — panel points at migration/
 )
 _QUERY_ROW_KEYS = (
     "full_name", "entity_type", "population",
     "complexity", "depends_on", "rewrite_guidance", "placement", "detail_chunk",
+    "detail_omitted",      # heavy payload past the embed budget — panel points at migration/
     "has_translated_sql",  # row-level flag; the SQL itself lives in the detail chunk
     "query_workload",      # lightweight summary: {query_count, slot_hours, statement_types, num_shapes}
     "has_workload",        # boolean flag for JS: true if this entity has attributed query logs
@@ -155,6 +172,28 @@ _DETAIL_KEYS = ("conversion", "migration_plan", "translated_sql")
 # Entities per detail chunk: ~4 KB/entity of DDL+DML keeps each chunk's one-time
 # JSON.parse (on first expand of a row in that chunk) around 2 MB / tens of ms.
 DETAIL_CHUNK_SIZE = 500
+
+# Byte budget for ALL embedded heavy detail (chunk JSON, CLAUDE.md § Scale rule).
+# Chunks are lazy-parsed but still ship inside the single HTML file — embedding
+# DDL/DML for every entity of a petabyte-scale estate makes the file itself
+# unloadable (measured 2026-08-14: 100k entities → 383 MB of chunks → 471 MB HTML).
+# Entities are embedded in attention order (REBUILT SQL first — views/MVs/routines
+# are the review surface — then flagged tables, then by size); entities past the
+# budget keep their detail panel but point at migration/plan.json +
+# redshift_phase.sql, the canonical runnable copies. Never silent: the count is
+# returned and rendered in the report toolbar.
+DETAIL_BYTE_BUDGET = 64 * 1024 * 1024
+
+
+def _detail_priority(d: dict) -> tuple:
+    """Attention-first embed order. Lower sorts first."""
+    if d.get("population") == "REBUILT":
+        tier = 0                                   # SQL definitions: the review surface
+    elif (d.get("effort") or {}).get("flags"):
+        tier = 1                                   # tables someone must look at
+    else:
+        tier = 2
+    return (tier, -(d.get("logical_size_gb") or 0.0))
 
 # Nested fields the renderer never reads. `complexity.constructs` matters most: it
 # carries per-construct anonymized SQL snippets, which at query-log scale dominate
@@ -189,25 +228,30 @@ def _project_row(d: dict, keys: tuple[str, ...]) -> dict:
 
 def build_report_rows(
     effort_entities: list[dict], query_entities: list[dict],
-) -> tuple[dict, list[dict]]:
+    detail_byte_budget: int = DETAIL_BYTE_BUDGET,
+) -> tuple[dict, list[dict], int]:
     """Project serialized entity dicts down to the HTML report's table payload.
 
     Rows without a score are dropped here, mirroring the former template-side
     ``{% if e.effort %}`` / ``{% if e.complexity %}`` guards.
 
-    Returns ``(rows, detail_chunks)``. Heavy fields (Iceberg DDL, load DML,
-    translated SQL) are split into ``detail_chunks`` — lists of
-    ``{full_name: {conversion, migration_plan, translated_sql}}`` dicts of
-    ``DETAIL_CHUNK_SIZE`` entities each. The template embeds each chunk as its own
-    inert JSON script tag; the JS parses a chunk only when a row in it is first
-    expanded. Keeping them out of ``rows`` keeps the page-load ``JSON.parse``
-    proportional to entity count, not DDL volume (a 50k-table estate: 219 MB of
-    load-time JSON with DDL inline vs 46 MB without — the chunks stay unparsed).
+    Returns ``(rows, detail_chunks, detail_omitted_count)``. Heavy fields
+    (Iceberg DDL, load DML, translated SQL) are split into ``detail_chunks`` —
+    lists of ``{full_name: {conversion, migration_plan, translated_sql}}`` dicts
+    of ``DETAIL_CHUNK_SIZE`` entities each. The template embeds each chunk as its
+    own inert JSON script tag; the JS parses a chunk only when a row in it is
+    first expanded. Keeping them out of ``rows`` keeps the page-load
+    ``JSON.parse`` proportional to entity count, not DDL volume.
+
+    Embedded detail is capped at ``detail_byte_budget`` JSON bytes in
+    ``_detail_priority`` order (CLAUDE.md § Scale rule); past the budget the row
+    gets ``detail_omitted: true`` and its panel points at migration/plan.json.
     """
-    detail_chunks: list[dict] = []
-    chunk_of: dict[str, int] = {}
-    current: dict[str, dict] = {}
-    for d in query_entities:  # superset: includes every effort entity
+    # Heavy payloads first, in attention order, until the byte budget is spent.
+    heavy_of: dict[str, dict] = {}
+    omitted: set[str] = set()
+    budget_left = detail_byte_budget
+    for d in sorted(query_entities, key=_detail_priority):  # superset of effort
         heavy = {}
         for key in _DETAIL_KEYS:
             value = d.get(key)
@@ -218,6 +262,21 @@ def build_report_rows(
                 value = {k: v for k, v in value.items() if k not in drop}
             heavy[key] = value
         if not heavy:
+            continue
+        cost = len(json.dumps(heavy, separators=(",", ":")))
+        if cost > budget_left:
+            omitted.add(d["full_name"])
+            continue
+        budget_left -= cost
+        heavy_of[d["full_name"]] = heavy
+
+    # Chunk in ROW order so a page of rows touches few chunks, not one per row.
+    detail_chunks: list[dict] = []
+    chunk_of: dict[str, int] = {}
+    current: dict[str, dict] = {}
+    for d in query_entities:
+        heavy = heavy_of.get(d["full_name"])
+        if heavy is None:
             continue
         if len(current) >= DETAIL_CHUNK_SIZE:
             detail_chunks.append(current)
@@ -232,6 +291,8 @@ def build_report_rows(
         chunk = chunk_of.get(d["full_name"])
         if chunk is not None:
             row["detail_chunk"] = chunk
+        elif d["full_name"] in omitted:
+            row["detail_omitted"] = True
         return row
 
     def _query_row(d: dict) -> dict:
@@ -239,6 +300,8 @@ def build_report_rows(
         chunk = chunk_of.get(d["full_name"])
         if chunk is not None:
             row["detail_chunk"] = chunk
+        elif d["full_name"] in omitted:
+            row["detail_omitted"] = True
         if d.get("translated_sql") is not None:
             row["has_translated_sql"] = True
         return row
@@ -251,7 +314,7 @@ def build_report_rows(
             _query_row(d) for d in query_entities if d.get("complexity")
         ],
     }
-    return rows, detail_chunks
+    return rows, detail_chunks, len(omitted)
 
 
 QUERY_SAMPLE_CHUNK_SIZE = 100
@@ -270,9 +333,18 @@ def _clip_sql(sql: str) -> str:
     return sql[:MAX_SAMPLE_SQL_CHARS] + _CLIP_NOTE
 
 
+# Byte budget for embedded query samples (CLAUDE.md § Scale rule). Per-sample
+# clipping bounds each entity (~24 KB worst) but not the estate: 100k attributed
+# entities would ship GBs. Heaviest workloads (by slot-ms) keep their SQL; the
+# rest keep their workload stats on the row, sample-less. Never silent — the
+# omitted count is returned and rendered in the report.
+QUERY_SAMPLE_BYTE_BUDGET = 32 * 1024 * 1024
+
+
 def build_query_sample_chunks(
     query_workloads: dict[str, dict],
-) -> tuple[list[dict], dict[str, int]]:
+    sample_byte_budget: int = QUERY_SAMPLE_BYTE_BUDGET,
+) -> tuple[list[dict], dict[str, int], int]:
     """Build chunked query-sample JSON for lazy loading in the report.
 
     Each chunk is a dict of {entity_full_name: [{o, t, s, m}, ...]} holding
@@ -280,23 +352,31 @@ def build_query_sample_chunks(
     Chunks are capped at QUERY_SAMPLE_CHUNK_SIZE entities so each one-time
     JSON.parse (on first expand of a row in that chunk) stays small.
 
-    Returns ``(chunks, entity_to_chunk)``: the index map lets the JS parse
-    ONLY the chunk holding the expanded entity. Without it, getQuerySamples
-    walked and parsed EVERY chunk until it found the entity — one expand
-    could parse the entire sample payload (~26 MB at 4,247 entities),
-    blocking the UI exactly on the large estates chunking exists for
-    (2026-08-04 review).
+    Returns ``(chunks, entity_to_chunk, omitted_count)``: the index map lets
+    the JS parse ONLY the chunk holding the expanded entity. Without it,
+    getQuerySamples walked and parsed EVERY chunk until it found the entity —
+    one expand could parse the entire sample payload (~26 MB at 4,247
+    entities), blocking the UI exactly on the large estates chunking exists
+    for (2026-08-04 review). Estate-level size is bounded by
+    ``sample_byte_budget``, spent heaviest-workload-first.
 
     The query_workloads dict maps entity full_name → {samples: [{query, translated, statement_type, total_slot_ms}]}.
     """
+    def _weight(item: tuple[str, dict]) -> int:
+        return -max(
+            (s.get("total_slot_ms") or 0) for s in item[1].get("samples", [{}])
+        )
+
     chunks: list[dict] = []
     entity_to_chunk: dict[str, int] = {}
     current: dict = {}
-    for entity_name, wl in query_workloads.items():
+    omitted = 0
+    budget_left = sample_byte_budget
+    for entity_name, wl in sorted(query_workloads.items(), key=_weight):
         samples = wl.get("samples", [])
         if not samples:
             continue
-        current[entity_name] = [
+        entry = [
             {
                 "o": _clip_sql(s["query"]),
                 "t": _clip_sql(s["translated"]),
@@ -305,12 +385,18 @@ def build_query_sample_chunks(
             }
             for s in samples
         ]
+        cost = len(json.dumps(entry, separators=(",", ":")))
+        if cost > budget_left:
+            omitted += 1
+            continue
+        budget_left -= cost
+        current[entity_name] = entry
         entity_to_chunk[entity_name] = len(chunks)
         if len(current) >= QUERY_SAMPLE_CHUNK_SIZE:
             chunks.append(current)
             current = {}
     if current:
         chunks.append(current)
-    return chunks, entity_to_chunk
+    return chunks, entity_to_chunk, omitted
 
 

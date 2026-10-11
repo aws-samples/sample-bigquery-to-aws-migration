@@ -171,7 +171,7 @@ def test_report_rows_prune_nested_dead_fields():
         home="REDSHIFT", signals=["s"], confidence=ConfidenceLevel.HIGH, refresh_unverified=False
     )
     effort, query = serialize_entities(_minimal_assessment(entities))
-    rows, chunks = build_report_rows(effort, query)
+    rows, chunks, _omitted = build_report_rows(effort, query)
 
     q = rows["query"][0]
     assert "constructs" not in q["complexity"]
@@ -194,7 +194,7 @@ def test_report_rows_drop_unscored_entities():
     ]
     entities[1].complexity = None
     effort, query = serialize_entities(_minimal_assessment(entities))
-    rows, _ = build_report_rows(effort, query)
+    rows, _, _omitted = build_report_rows(effort, query)
     assert [r["full_name"] for r in rows["query"]] == ["ds.tbl"]
 
 
@@ -213,7 +213,7 @@ def test_detail_chunking_splits_and_indexes():
     original = ser.DETAIL_CHUNK_SIZE
     ser.DETAIL_CHUNK_SIZE = 2
     try:
-        rows, chunks = build_report_rows(effort, query)
+        rows, chunks, _omitted = build_report_rows(effort, query)
     finally:
         ser.DETAIL_CHUNK_SIZE = original
 

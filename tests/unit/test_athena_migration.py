@@ -1,7 +1,7 @@
 """Tests for Athena migration DML generator."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -41,6 +41,9 @@ def _entity(
     time_partitioning: TimePartitionConfig | None = None,
     columns: list[ColumnSchema] | None = None,
     last_modified: datetime | None = None,
+    partition_count: int | None = None,
+    partition_min_id: str | None = None,
+    partition_max_id: str | None = None,
 ) -> EntityMetadata:
     # Default to 100 days ago to generate concrete chunks
     from datetime import timedelta
@@ -67,6 +70,9 @@ def _entity(
         routine=None,
         depends_on=[],
         last_modified=last_modified,
+        partition_count=partition_count,
+        partition_min_id=partition_min_id,
+        partition_max_id=partition_max_id,
     )
 
 
@@ -440,10 +446,12 @@ def test_interval_casts_and_range_flags_unreadable(generator):
     assert "CAST(value_range" not in full_sql
     unreadable = [
         s for s in result.shortcomings
-        if "cannot read ARRAY/STRUCT/RANGE" in s.description
+        if "will fail for this table" in s.description
     ]
     assert unreadable, "RANGE column should raise the connector-unreadable shortcoming"
     assert "value_range" in unreadable[0].bq_source
+    # Description now names the specific cause rather than one blanket sentence
+    assert "unsupported vector type" in unreadable[0].description
 
 
 def test_no_special_types_uses_select_star(generator):
@@ -664,7 +672,7 @@ def test_cast_annotations_never_swallow_list_comma(generator):
 
 def test_hyphenated_table_name_quoted_in_dml(generator):
     """BQ allows hyphens in table names; unquoted they fail Trino parsing.
-    2026-07-31 sandbox validation: 310 DELETE/INSERT statements unparseable.
+    2026-07-31 SpinLab validation: 310 DELETE/INSERT statements unparseable.
     Target AND federated source refs must quote non-standard identifiers."""
     import sqlglot
 
@@ -825,3 +833,338 @@ def test_rechunk_preserves_null_partition_chunk(tmp_path):
     )
     # and the date windows were rebuilt from the discovered range
     assert any("2025-06-01" in s for s in out)
+
+
+# --- #53: real partition counts replace the last_modified guess --------------
+
+
+class TestMeasuredPartitionCount:
+    """The chunking decision must use INFORMATION_SCHEMA.PARTITIONS when available.
+
+    Measured on a 24-month testbed: five tables holding 730-731 partitions were
+    estimated at 30, so chunking was skipped and a single INSERT would have tried
+    to open every partition at once, past Athena's ~100 limit. The guess fails in
+    the unsafe direction and fails worst on actively-written tables, because
+    last_modified is the last WRITE, not the creation date.
+    """
+
+    def test_measured_count_triggers_chunking_where_guess_did_not(self):
+        gen = AthenaMigrationGenerator()
+        # last_modified today => the old guess yields ~0 partitions
+        fresh = datetime.now(timezone.utc)
+        entity = _entity(
+            num_bytes=1_000_000,                       # well under _LARGE_TABLE_BYTES
+            time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+            last_modified=fresh,
+            partition_count=730,
+            partition_min_id="20240824",
+            partition_max_id="20260823",
+        )
+        result = gen.generate(entity, _conversion(), _config())
+        assert len(result.statements) > 1, "730 partitions must chunk"
+
+    def test_guess_alone_would_not_have_chunked(self):
+        """Pins the bug this fixes: identical entity, no measured count."""
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            num_bytes=1_000_000,
+            time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+            last_modified=datetime.now(timezone.utc),
+        )
+        result = gen.generate(entity, _conversion(), _config())
+        assert len(result.statements) == 1, "fallback estimate still under-chunks"
+
+    def test_measured_count_below_threshold_does_not_chunk(self):
+        """The measurement is trusted in both directions, not just upward."""
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            num_bytes=1_000_000,
+            time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+            last_modified=datetime.now(timezone.utc) - timedelta(days=5000),
+            partition_count=12,
+        )
+        result = gen.generate(entity, _conversion(), _config())
+        assert len(result.statements) == 1
+
+    def test_windows_span_real_partition_range_not_last_modified(self):
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            num_bytes=1_000_000,
+            time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+            last_modified=datetime.now(timezone.utc),
+            partition_count=730,
+            partition_min_id="20240824",
+            partition_max_id="20260823",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows, "real bounds must produce windows even when written today"
+        assert windows[0][0] == "2024-08-24"
+        # Exclusive upper bound is one day past the last DAY partition
+        assert windows[-1][1] == "2026-08-24"
+
+    def test_windows_cover_the_final_partition(self):
+        """Off-by-one guard: the last partition's rows must fall inside a window."""
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="DAY", field="d"),
+            partition_count=200, partition_min_id="20250101", partition_max_id="20250105",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows[-1][1] > "2025-01-05"
+
+    def test_month_granularity_upper_bound_rolls_the_month(self):
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="MONTH", field="m"),
+            partition_count=150, partition_min_id="202401", partition_max_id="202608",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows[0][0] == "2024-01-01"
+        assert windows[-1][1] == "2026-09-01", "must clear all of August, not stop mid-month"
+
+    def test_december_month_bound_rolls_the_year(self):
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="MONTH", field="m"),
+            partition_count=150, partition_min_id="202401", partition_max_id="202512",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows[-1][1] == "2026-01-01"
+
+    def test_year_granularity_upper_bound_rolls_the_year(self):
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="YEAR", field="y"),
+            partition_count=150, partition_min_id="2024", partition_max_id="2026",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows[0][0] == "2024-01-01"
+        assert windows[-1][1] == "2027-01-01"
+
+    def test_falls_back_to_last_modified_when_bounds_absent(self):
+        """Offline bundles and permission failures keep the old behaviour."""
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="DAY", field="d"),
+            last_modified=datetime.now(timezone.utc) - timedelta(days=100),
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows
+        assert windows[0][0] == str((datetime.now(timezone.utc) - timedelta(days=100)).date())
+
+    def test_unparseable_bounds_fall_back_rather_than_emit_bad_dates(self):
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            time_partitioning=TimePartitionConfig(type="DAY", field="d"),
+            last_modified=datetime.now(timezone.utc) - timedelta(days=100),
+            partition_count=730, partition_min_id="__NULL__", partition_max_id="__NULL__",
+        )
+        windows = gen._generate_chunk_windows(entity, 90)
+        assert windows
+        for start, end in windows:
+            assert start.count("-") == 2 and end.count("-") == 2
+
+    def test_chunked_plan_from_real_bounds_has_no_template_placeholders(self):
+        """A table written today used to produce zero windows, which sent
+        _chunked_insert down its template branch and made Phase 2 skip the
+        table entirely."""
+        gen = AthenaMigrationGenerator()
+        entity = _entity(
+            num_bytes=1_000_000,
+            time_partitioning=TimePartitionConfig(type="DAY", field="event_date"),
+            last_modified=datetime.now(timezone.utc),
+            partition_count=730,
+            partition_min_id="20240824", partition_max_id="20260823",
+        )
+        result = gen.generate(entity, _conversion(), _config())
+        assert not any("{{start}}" in s or "{{end}}" in s for s in result.statements)
+
+
+# --- #67: connector readability, corrected in both directions ----------------
+
+
+def _col(name, field_type, mode="NULLABLE", fields=None):
+    return ColumnSchema(name=name, field_type=field_type, mode=mode, fields=fields or [])
+
+
+def _shortcoming_with(result, needle):
+    return [s for s in result.shortcomings if needle in s.description]
+
+
+class TestConnectorReadability:
+    """The old rule flagged every REPEATED or RECORD column as unreadable.
+
+    Measured against the live connector (2025.41.1) on 2026-09-28, that was
+    wrong for 4 of 6 testbed tables — ARRAY and STRUCT read fine. What actually
+    fails is a NON-REPEATED record holding a REPEATED record, and it takes the
+    whole-table SELECT * with it.
+    """
+
+    def test_array_of_struct_is_not_flagged(self):
+        """COUNT(preferences) on ARRAY<STRUCT> succeeded live."""
+        entity = _entity(columns=[
+            _col("id", "INT64", "REQUIRED"),
+            _col("preferences", "RECORD", "REPEATED", [
+                _col("category", "STRING"),
+                _col("settings", "RECORD", "NULLABLE", [_col("frequency", "STRING")]),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not _shortcoming_with(result, "will fail for this table")
+
+    def test_plain_struct_of_scalars_is_not_flagged(self):
+        """COUNT(dimensions) on a STRUCT of scalars succeeded live."""
+        entity = _entity(columns=[
+            _col("dimensions", "RECORD", "NULLABLE", [
+                _col("width", "FLOAT64"), _col("height", "FLOAT64"),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not _shortcoming_with(result, "will fail for this table")
+
+    def test_repeated_scalar_is_not_flagged(self):
+        entity = _entity(columns=[_col("tags", "STRING", "REPEATED")])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not _shortcoming_with(result, "will fail for this table")
+
+    def test_struct_containing_repeated_struct_is_flagged(self):
+        """The real failure: clickstream.ecommerce{ items ARRAY<STRUCT> } threw
+        IllegalArgumentException, and SELECT * on the table failed with it."""
+        entity = _entity(columns=[
+            _col("ecommerce", "RECORD", "NULLABLE", [
+                _col("revenue", "FLOAT64"),
+                _col("items", "RECORD", "REPEATED", [_col("product_id", "INT64")]),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        blocked = _shortcoming_with(result, "will fail for this table")
+        assert blocked, "struct-containing-repeated-struct must stay load-blocking"
+        assert "ecommerce" in blocked[0].description
+        assert "IllegalArgumentException" in blocked[0].description
+
+    def test_repeated_struct_containing_repeated_struct_not_flagged(self):
+        """Only a NON-repeated parent failed live; a repeated parent read fine."""
+        entity = _entity(columns=[
+            _col("event_data", "RECORD", "REPEATED", [
+                _col("properties", "RECORD", "NULLABLE", [_col("url", "STRING")]),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not _shortcoming_with(result, "will fail for this table")
+
+
+class TestNestedTimestampNulling:
+    """Nested TIMESTAMP reads as NULL — the load succeeds and row counts match.
+
+    Measured against the live connector vs BigQuery ground truth:
+      user_profiles.metadata.updated_at   0 of 20,000 non-null
+      clickstream.session.session_start   0 of 150,000
+      order_facts.shipping.shipped_at     0 of 42,105
+      order_facts.payment.processed_at    0 of 60,000
+    """
+
+    def _nested_ts_entity(self):
+        return _entity(columns=[
+            _col("id", "INT64", "REQUIRED"),
+            _col("metadata", "RECORD", "NULLABLE", [
+                _col("source", "STRING"),
+                _col("updated_at", "TIMESTAMP"),
+            ]),
+        ])
+
+    def test_nested_timestamp_is_reported(self):
+        result = AthenaMigrationGenerator().generate(
+            self._nested_ts_entity(), _conversion(), _config())
+        hits = _shortcoming_with(result, "arrives NULL")
+        assert hits
+        assert "metadata.updated_at" in hits[0].description
+
+    def test_warns_that_row_count_validation_cannot_detect_it(self):
+        """The whole hazard: validation_query compares row counts, which match."""
+        result = AthenaMigrationGenerator().generate(
+            self._nested_ts_entity(), _conversion(), _config())
+        hits = _shortcoming_with(result, "arrives NULL")
+        assert "CANNOT detect" in hits[0].description
+
+    def test_nested_timestamp_alone_is_not_load_blocking(self):
+        """The table DOES load — scoring it as blocked would be a different lie.
+        Must stay clear of check_report.py's load-blocking markers."""
+        result = AthenaMigrationGenerator().generate(
+            self._nested_ts_entity(), _conversion(), _config())
+        hits = _shortcoming_with(result, "arrives NULL")
+        for marker in ("cannot read ARRAY/STRUCT/RANGE", "will fail for this table"):
+            assert marker not in hits[0].description
+
+    def test_top_level_timestamp_is_not_reported_as_nulled(self):
+        """A top-level TIMESTAMP is served fine and cast by the generated SQL."""
+        entity = _entity(columns=[_col("created_at", "TIMESTAMP")])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not _shortcoming_with(result, "arrives NULL")
+
+    def test_deeply_nested_timestamp_is_found(self):
+        """order_facts.attribution.touchpoints.timestamp sits two levels down."""
+        entity = _entity(columns=[
+            _col("attribution", "RECORD", "NULLABLE", [
+                _col("touchpoints", "RECORD", "REPEATED", [
+                    _col("channel", "STRING"), _col("timestamp", "TIMESTAMP"),
+                ]),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        hits = _shortcoming_with(result, "arrives NULL")
+        assert hits
+        assert "attribution.touchpoints.timestamp" in hits[0].description
+
+    def test_nested_datetime_also_reported(self):
+        entity = _entity(columns=[
+            _col("meta", "RECORD", "NULLABLE", [_col("seen_at", "DATETIME")]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert _shortcoming_with(result, "arrives NULL")
+
+
+# --- #68/#74: blocks_load is the structured load-blocking signal -------------
+
+
+class TestBlocksLoadFlag:
+    """category+severity cannot distinguish the three action_required cases —
+    all are ("type_cast", "action_required"). Before this field the only
+    discriminator was prose in `description`, which product code must not
+    depend on: that wording was rewritten once already.
+    """
+
+    def test_connector_blocked_sets_blocks_load(self):
+        entity = _entity(columns=[
+            _col("ecommerce", "RECORD", "NULLABLE", [
+                _col("items", "RECORD", "REPEATED", [_col("id", "INT64")]),
+            ]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        blocking = [s for s in result.shortcomings if s.blocks_load]
+        assert len(blocking) == 1
+        assert "ecommerce" in blocking[0].description
+
+    def test_nested_timestamp_does_not_set_blocks_load(self):
+        """That table DOES load — its values just arrive NULL."""
+        entity = _entity(columns=[
+            _col("metadata", "RECORD", "NULLABLE", [_col("updated_at", "TIMESTAMP")]),
+        ])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert [s for s in result.shortcomings if "arrives NULL" in s.description]
+        assert not [s for s in result.shortcomings if s.blocks_load]
+
+    def test_lossy_cast_does_not_set_blocks_load(self):
+        entity = _entity(columns=[_col("geo", "GEOGRAPHY")])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert [s for s in result.shortcomings if s.severity == "action_required"]
+        assert not [s for s in result.shortcomings if s.blocks_load]
+
+    def test_clean_table_sets_nothing(self):
+        entity = _entity(columns=[_col("id", "INT64", "REQUIRED")])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert not [s for s in result.shortcomings if s.blocks_load]
+
+    def test_range_column_sets_blocks_load(self):
+        entity = _entity(columns=[_col("r", "RANGE")])
+        result = AthenaMigrationGenerator().generate(entity, _conversion(), _config())
+        assert [s for s in result.shortcomings if s.blocks_load]

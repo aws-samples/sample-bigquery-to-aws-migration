@@ -91,7 +91,7 @@ def _known_assessment(
     return Assessment(
         assessment_id="assess-20260617-abc123",
         generated_at=datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc),
-        project_id="example-project",
+        project_id="my-project",
         summary=AssessmentSummary(
             total_entities=2,
             total_tables=1,
@@ -146,7 +146,7 @@ def test_html_renders_single_file():
     assert len(paths) == 1
     assert paths[0].endswith(".html")
     assert os.path.exists(paths[0])
-    assert os.path.basename(paths[0]) == "example-project-assessment.html"
+    assert os.path.basename(paths[0]) == "my-project-assessment.html"
 
 
 def test_html_contains_all_tabs():
@@ -358,7 +358,7 @@ def test_html_csp_nonce_is_per_render():
 def test_html_malicious_identifier_is_neutralized():
     """A BigQuery identifier attempting <code> breakout + <script> injection is escaped.
 
-    Regression for the internal deep-audit XSS finding: DDL/DML rendered from
+    Regression for the storm-aws deep-audit XSS finding: DDL/DML rendered from
     attacker-controlled entity names must never produce an executable <script>.
     """
     a = _known_assessment()
@@ -556,7 +556,7 @@ def test_format_savings_large_positive():
 
 def test_format_savings_large_negative():
     """Negative deltas say 'more' explicitly — the previous bare '+$X' under a
-    'Savings' label read as a saving (2026-07-31 sandbox validation fix)."""
+    'Savings' label read as a saving (2026-07-31 SpinLab sandbox fix)."""
     from bq_assess.report.html_writer import _format_savings
     assert _format_savings(-15.0) == "$15.00/mo more"
     assert _format_savings(-355.59) == "$356/mo more"
@@ -848,7 +848,7 @@ def test_range_storage_line_renders_range_not_na():
     """A range CostLine (monthly=None, low/high set) must render 'low – high'.
     _to_dict omits None-valued keys, so the template must use .get(): Jinja's
     Undefined is NOT none, and the bare check rendered every range line as
-    'N/A' (2026-07-31 sandbox validation: all three storage cells showed N/A)."""
+    'N/A' (2026-07-31 SpinLab: all three storage cells showed N/A)."""
     a = _known_assessment()
     a.cost.aws_lines = [
         CostLine(
@@ -899,7 +899,7 @@ def test_bq_breakdown_range_line_renders_range_not_na():
 
 
 def test_negative_delta_never_labeled_savings():
-    """A cost increase must not render as a green 'Savings' (sandbox validation:
+    """A cost increase must not render as a green 'Savings' (SpinLab sandbox:
     -$356/mo rendered '+$355.59/mo' under 'Monthly Savings')."""
     a = _known_assessment()
     a.cost.monthly_delta_low = -355.59

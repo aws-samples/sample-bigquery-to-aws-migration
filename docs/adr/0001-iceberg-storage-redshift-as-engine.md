@@ -16,3 +16,16 @@ only** — provisioned Redshift and its serverless-vs-provisioned advisor are ou
 - "Migration complexity" can no longer be one number — see ADR-0002.
 - The old Redshift-native-storage path is dropped, not kept as a parallel target. Re-adding
   it later would mean reintroducing a storage-coupled cost/DDL model.
+
+## Amendment (2026-08-14): provisioned Redshift is in scope as a COST scenario
+
+"Scope: Serverless only" above described the migration target, and that part stands —
+generated DDL, placement, and the storage layer remain Serverless-over-Iceberg. But the
+cost comparison has since grown provisioned scenarios (rg/ra3 node pricing, added with the
+capacity-pricing work) and recommends provisioned clusters for sustained workloads where
+they are cheaper. The nearest-region policy therefore requires **rg node availability**
+alongside S3 Tables + Serverless when selecting an AWS pricing region
+(`core/region_mapping.AWS_REGIONS_WITH_STACK`): a region that cannot price every offered
+scenario cannot be the pricing anchor. Consequence: locations whose same-metro AWS region
+lacks the full stack (Tel Aviv/il-central-1, Doha & Dammam/me-central-1 & me-south-1,
+Zurich/eu-central-2) price at the nearest full-stack region, flagged in the report.

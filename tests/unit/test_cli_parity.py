@@ -18,13 +18,17 @@ from bq_assess.collect_cli import main as collect_cmd
 # Flags that exist only in bq-assess because they configure REPORT generation —
 # the one legitimate difference between the tools. Everything else must match.
 REPORT_ONLY_FLAGS = {
-    "--bigquery-monthly-cost",   # cost-comparison override (report figure)
+    # --bigquery-monthly-cost exists on BOTH since 2026-08-12 (bundle-carried
+    # override); --interactive was REMOVED 2026-08-12 (prompting is default
+    # behaviour on a TTY in both CLIs) — it survives on assess ONLY as a hidden
+    # deprecated no-op shim so saved invocations don't die (bq-collect never
+    # had the flag, so no shim there).
+    "--interactive",             # hidden deprecation shim, ignored
     "--config",                  # YAML config incl. engine/report sections
     "--engine",                  # which engine assessment to render
     "--export-bundle",           # bundle is bq-collect's PRODUCT, not optional there
     "--no-export-bundle",
     "--format",                  # html/json report formats
-    "--interactive",             # assess prompt flow
     "--post-optimization",       # migration-plan report content
     "--no-post-optimization",
     "--query-logs",              # offline logs FILE feeds report analysis paths
@@ -88,7 +92,7 @@ def test_shared_flags_have_matching_defaults():
             # config can layer under the CLI; the effective default then comes
             # from shared code (e.g. collector.py's `query_log_days or 30`).
             # Same for --gcp-project: required in collect, sentinel-None in
-            # assess because --config/--interactive may supply it. Only a
+            # assess because --config or the terminal prompts may supply it. Only a
             # CONCRETE divergent default is drift.
             if a.default is None:
                 continue

@@ -52,7 +52,7 @@ def _known_assessment():
     return Assessment(
         assessment_id="assess-20260617-abc123",
         generated_at=datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc),
-        project_id="example-project",
+        project_id="my-project",
         summary=AssessmentSummary(
             total_entities=2, total_tables=1, total_size_gb=42.5,
             effort_counts={"AUTO": 0, "ASSISTED": 1, "MANUAL": 0},
@@ -99,15 +99,26 @@ def test_json_landing_schema():
 
 def test_json_landing_carries_schema_version():
     """External consumers gate field semantics on schema_version (added 2026-07-16
-    when cost.scope_notes changed meaning under the same key)."""
+    when cost.scope_notes changed meaning under the same key).
+
+    It is deliberately NOT the package version any more (#61). Tied to
+    __version__ it moved on releases that changed nothing structural, and stayed
+    put when semantics genuinely shifted — both observed in one day
+    (migration_plans.chunked 0->5 under #53, effort counts under #74, same data,
+    same "0.8.0"). This test previously asserted that broken coupling.
+    """
     from bq_assess import __version__
+    from bq_assess.report.provenance import REPORT_SCHEMA_VERSION
     a = _known_assessment()
     out = tempfile.mkdtemp()
     paths = JSONWriter().write(a, out)
     landing_path = next(p for p in paths if "landing" in p)
     with open(landing_path) as f:
         data = json.load(f)
-    assert data["schema_version"] == __version__
+    assert data["schema_version"] == REPORT_SCHEMA_VERSION
+    assert isinstance(data["schema_version"], int), "contract version, not a release string"
+    # The package version is still reported, just under its own key
+    assert data["tool_version"] == __version__
 
 
 def test_json_effort_tables_only():

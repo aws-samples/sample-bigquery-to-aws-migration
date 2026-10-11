@@ -1,9 +1,9 @@
-"""Terraform generation: deep-audit IAM + connector fixes (2026-07-22),
+"""Terraform generation: storm-audit IAM + connector fixes (2026-07-22),
 SAR connector deploy + bucket_prefix length fix (2026-07-30)."""
 from __future__ import annotations
 
 import shutil
-import subprocess
+import subprocess  # nosec B404 - test runs terraform validate with fixed args, no shell
 
 import pytest
 
@@ -11,7 +11,7 @@ from bq_assess.engine.athena import naming
 from bq_assess.engine.athena.terraform import generate_terraform
 
 # Long enough that the friendly bucket_prefix form would exceed the 37-char cap.
-_LONG_DATASET = "verylong_analytics_warehouse_prod"
+_LONG_DATASET = "spinlabs_analytics_warehouse_prod"
 
 
 def _tf(tmp_path, dataset_id="my_ds"):
@@ -23,7 +23,7 @@ def _tf(tmp_path, dataset_id="my_ds"):
 
 
 def test_operator_policy_covers_phase3(tmp_path):
-    """Deep audit HRI-1: the operator policy must grant the redshift-data actions
+    """Storm audit HRI-1: the operator policy must grant the redshift-data actions
     Phase 3 calls, plus redshift-serverless:GetCredentials for IAM temp auth."""
     tf = _tf(tmp_path)
     assert "redshift-data:ExecuteStatement" in tf
@@ -111,12 +111,12 @@ def test_generated_terraform_validates(tmp_path):
         tables=[], target_region="us-east-1",
     )
     tf_dir = tmp_path / "terraform"
-    init = subprocess.run(
+    init = subprocess.run(  # nosec B603 B607 - fixed arg list, no shell, test-only
         ["terraform", "init", "-backend=false", "-input=false"],
         cwd=tf_dir, capture_output=True, text=True, timeout=300, check=False,
     )
     assert init.returncode == 0, init.stderr
-    validate = subprocess.run(
+    validate = subprocess.run(  # nosec B603 B607 - fixed arg list, no shell, test-only
         ["terraform", "validate"],
         cwd=tf_dir, capture_output=True, text=True, timeout=60, check=False,
     )

@@ -39,7 +39,7 @@ def _project_row(a: Assessment) -> dict:
     # default scope. summary.complexity_counts spans ALL entities, where every
     # plain table scores PORTABLE by definition — at fleet scale that rendered
     # "100% SQL portable across 12,599 entities" when only ~300 own SQL
-    # (2026-07-31 sandbox validation).
+    # (2026-07-31 SpinLab).
     sql_complexity: dict[str, int] = {"PORTABLE": 0, "ADAPT": 0, "REWRITE": 0}
     for e in a.entities:
         if getattr(e.population, "value", e.population) != "REBUILT":
@@ -62,7 +62,7 @@ def _project_row(a: Assessment) -> dict:
     # i.e. BigQuery vs the high end of the AWS range (monthly_delta_low).
     # annual_saving_high is kept so a range that straddles zero (worst case
     # costs more, steady state saves — the Intelligent-Tiering spread) renders
-    # as a range instead of a bare "(higher)" verdict (2026-07-31 sandbox validation).
+    # as a range instead of a bare "(higher)" verdict (2026-07-31 SpinLab sandbox).
     # When BQ cost is unavailable (2026-08-10), render None so the fleet table
     # shows "—" and _key_takeaways excludes it from savings aggregates.
     if a.cost.bq_cost_available:
