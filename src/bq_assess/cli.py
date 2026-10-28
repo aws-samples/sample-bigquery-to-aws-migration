@@ -76,6 +76,11 @@ from bq_assess.models import (
 from bq_assess.report.html_writer import HTMLWriter
 from bq_assess.report.json_writer import JSONWriter
 from bq_assess.report.provenance import provenance as report_provenance
+from bq_assess.report.run_layout import (
+    allocate_run_folder,
+    legacy_run_folder_name,
+    write_latest_pointer,
+)
 from bq_assess.scoring.complexity import ComplexityScorer
 from bq_assess.scoring.effort import EffortScorer
 from bq_assess.targets.iceberg.converter import IcebergConverter
@@ -276,9 +281,9 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     # resolved inside CostEstimator.estimate() — one seam (2026-08-12 review F4).
     bigquery_monthly_cost: float | None = params.get("bigquery_monthly_cost")
     base_output_dir: str = params.get("output", "bq-migration/")
-    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    project_folder = f"{gcp_project}_{run_date}"
-    output_dir = str(Path(base_output_dir) / project_folder / "report")
+    # The run folder is allocated at Stage 15, when deliverables are written —
+    # not here — so a run that exits early leaves no empty folder behind, and the
+    # folder name's timestamp matches the assessment's generated_at.
     formats = _validate_report_params(params)
 
     if not entities:
@@ -1040,12 +1045,20 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
     # ── Stage 15: Write Deliverables ─────────────────────────────────
     console.print("\n[bold]Stage 15:[/bold] Writing deliverables...")
 
+    # A fresh folder per run, never reused (report/run_layout.py). Before 0.10.0
+    # same-day runs shared <project>_<date>/: report JSON piled up beside a single
+    # overwritten HTML, and terraform/*.tf was regenerated next to any
+    # terraform.tfstate from an earlier apply.
+    project_folder = allocate_run_folder(base_output_dir, gcp_project, assessment.generated_at)
+    assessment.run_folder = project_folder
     project_dir = str(Path(base_output_dir) / project_folder)
-
-    # Ensure output directory exists
+    output_dir = str(Path(project_dir) / "report")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     output_files: list[str] = []
+    # Every artifact the latest-run pointer should name, keyed by a stable name
+    # consumers can rely on. Filled as each artifact is written.
+    pointer_files: dict[str, str | None] = {}
 
     if "json" in formats:
         json_writer = JSONWriter()
@@ -1053,6 +1066,12 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         output_files.extend(paths)
         for path in paths:
             console.print(f"  [green]✓ JSON report: {path}[/green]")
+            # Keyed by file-name prefix, not list position, so a reorder in the
+            # writer can't silently swap landing/effort/query.
+            base_name = Path(path).name
+            for kind in ("landing", "effort", "query"):
+                if base_name.startswith(f"assessment-{kind}-"):
+                    pointer_files[f"{kind}_json"] = path
 
     if "html" in formats:
         html_writer = HTMLWriter()
@@ -1064,6 +1083,8 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         output_files.extend(paths)
         for path in paths:
             console.print(f"  [green]✓ HTML report: {path}[/green]")
+        if paths:
+            pointer_files["report_html"] = paths[0]
 
     # Query-workload sidecar: EVERY attributed shape translated, one .sql per
     # entity — the HTML embeds only the top 5, the rest live here (+ INDEX.csv).
@@ -1075,6 +1096,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
         )
         if workload_sidecar_dir:
             output_files.append(workload_sidecar_dir)
+            pointer_files["query_workload_dir"] = workload_sidecar_dir
             console.print(f"  [green]✓ Query workload: {workload_sidecar_dir}[/green]")
 
     # Terraform infrastructure files
@@ -1089,6 +1111,7 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             target_region=engine_config.target_region,
         )
         output_files.append(tf_dir)
+        pointer_files["terraform_dir"] = tf_dir
         console.print(f"  [green]✓ Terraform: {tf_dir}[/green]")
 
     # Migration scripts (plan.json + run_migration.py)
@@ -1113,6 +1136,8 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             provenance=report_provenance(assessment),
         )
         output_files.append(mig_dir)
+        pointer_files["migration_dir"] = mig_dir
+        pointer_files["plan_json"] = str(Path(mig_dir) / "plan.json")
         console.print(f"  [green]✓ Migration scripts: {mig_dir}[/green]")
 
     # Bundle export (replaces the pre-0.3 metadata/ export — the bundle is a strict
@@ -1134,37 +1159,47 @@ def analyze_and_report(bundle: Bundle, params: dict) -> Assessment:
             )
             shutil.rmtree(bundle_dir)
             output_files.append(zip_path)
+            pointer_files["bundle"] = zip_path
             console.print(f"  [green]✓ Bundle exported (zipped): {zip_path}[/green]")
         else:
             output_files.append(bundle_dir)
+            pointer_files["bundle"] = bundle_dir
             console.print(f"  [green]✓ Bundle exported: {bundle_dir}[/green]")
 
     # Customer-facing README at the project root. Skipped in multi-project mode
     # (2026-08-03): the fleet writes ONE top-level README next to SUMMARY.html
     # instead of near-identical per-project copies.
-    if params.get("_multi_project"):
-        _print_summary(assessment, output_files)
-        return assessment
-    from bq_assess.report.readme_writer import write_readme
-    readme_path = write_readme(
-        project_dir=project_dir,
-        gcp_project=gcp_project,
-        provenance=report_provenance(assessment),
-        has_report="html" in formats or "json" in formats,
-        has_terraform=bool(datasets_used),
-        has_migration=bool(migration_plans),
-        has_bundle=params.get("export_bundle", True),
-        has_rebuilt_entities=bool(rebuilt_entities),
-        has_redshift_phase=bool(
-            storage_placement_results and any(
-                p.target == StorageTarget.RMS
-                for p in storage_placement_results.values()
-            )
-        ),
-        has_query_workload=bool(workload_sidecar_dir),
+    if not params.get("_multi_project"):
+        from bq_assess.report.readme_writer import write_readme
+        readme_path = write_readme(
+            project_dir=project_dir,
+            gcp_project=gcp_project,
+            provenance=report_provenance(assessment),
+            has_report="html" in formats or "json" in formats,
+            has_terraform=bool(datasets_used),
+            has_migration=bool(migration_plans),
+            has_bundle=params.get("export_bundle", True),
+            has_rebuilt_entities=bool(rebuilt_entities),
+            has_redshift_phase=bool(
+                storage_placement_results and any(
+                    p.target == StorageTarget.RMS
+                    for p in storage_placement_results.values()
+                )
+            ),
+            has_query_workload=bool(workload_sidecar_dir),
+        )
+        output_files.append(readme_path)
+        pointer_files["readme_html"] = readme_path
+        console.print(f"  [green]✓ README: {readme_path}[/green]")
+
+    # Latest-run pointer — written LAST so it only ever names a complete run.
+    # Readers (the bq-assess skill, integrating tools) take paths from here
+    # instead of guessing from folder or file names.
+    pointer_path = write_latest_pointer(
+        base_output_dir, report_provenance(assessment), project_folder, pointer_files,
     )
-    output_files.append(readme_path)
-    console.print(f"  [green]✓ README: {readme_path}[/green]")
+    output_files.append(pointer_path)
+    console.print(f"  [green]✓ Latest-run pointer: {pointer_path}[/green]")
 
     # ── Stage 16: Terminal Summary ─────────────────────────────────
     _print_summary(assessment, output_files)
@@ -1448,7 +1483,7 @@ def _discover_projects(credentials_path: str | None) -> list[tuple[str, bool]]:
 def _assess_all_projects(params: dict) -> None:
     """Discover all accessible projects and run the full pipeline for each.
 
-    Each project gets its own <project>_<date>/ output folder. One project
+    Each project gets its own <project>_<date>_<time>/ output folder. One project
     failing does not stop the others; a summary table prints at the end.
     """
     console.print("\n[bold]Discovering accessible GCP projects...[/bold]")
@@ -1516,10 +1551,11 @@ def _assess_all_projects(params: dict) -> None:
             logger.exception("Failed to write cross-project summary")
             console.print(f"[yellow]⚠ Could not write cross-project summary: {exc}[/yellow]")
         try:
-            # Folder names match the per-project output convention
-            # (<project>_<date>/) used by analyze_and_report + summary links.
+            # The folder each run ACTUALLY wrote to, as recorded at Stage 15 —
+            # never recomputed from generated_at, which can't reproduce a
+            # same-second collision suffix (report/run_layout.py).
             folders = [
-                (a.project_id, f"{a.project_id}_{a.generated_at.strftime('%Y-%m-%d')}")
+                (a.project_id, a.run_folder or legacy_run_folder_name(a.project_id, a.generated_at))
                 for a in completed_assessments
             ]
             readme_path = write_fleet_readme(base_output_dir, folders)

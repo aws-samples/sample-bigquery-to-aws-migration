@@ -34,7 +34,7 @@ Cloud Shell is the easiest environment — it's already authenticated.
 
 ```bash
 # 1. Install the collector (slim: no report-generation dependencies)
-pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.9.0#subdirectory=packaging/collector"
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.10.0#subdirectory=packaging/collector"
 
 # 2. Collect — a single project:
 bq-collect --gcp-project <YOUR_PROJECT> --use-adc --output bundle-out/ --zip

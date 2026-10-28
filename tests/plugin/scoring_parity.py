@@ -63,8 +63,6 @@ def main() -> int:
     scorer_path = repo_root / "src" / "bq_assess" / "scoring" / "complexity.py"
     rules_path = (
         repo_root
-        / "features"
-        / "bq-assess"
         / "skills"
         / "bq-assess"
         / "references"

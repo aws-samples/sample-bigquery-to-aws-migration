@@ -5,7 +5,7 @@ For the guided experience, see the [main README](../README.md).
 ## Install
 
 ```bash
-pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.9.0"
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.10.0"
 ```
 
 ## Usage
@@ -46,11 +46,28 @@ bq-assess --config assessment-config.yaml
 | `--query-log-days` | Query log lookback window in days (1-90) | 30 |
 | `--redshift-type` | Target Redshift node type (overrides auto-recommendation) | auto |
 | `--bigquery-monthly-cost` | Monthly BigQuery spend override | estimated |
-| `--output` | Output directory | reports/ |
+| `--output` | Output directory — see [Output layout](#output-layout) | bq-migration/ |
 | `--format` | Output formats (json, html, csv) | json,html |
 | `--config` | Path to YAML config file | — |
 
 Note: query-log analysis is always on; opt out with `--skip-workload` (no JOBS reads) or `--exclude-query-text` (no statements in the bundle).
+
+## Output layout
+
+Each run writes a **new** folder under `--output`, named `<project>_<YYYY-MM-DD>_<HHMMSS>` (UTC), and never modifies earlier ones. Runs started in the same second get a `-2`, `-3` suffix. When the run finishes, it updates `latest-<project>.json` in the output directory, which names that run's files (paths relative to the output directory):
+
+```
+<output>/
+  latest-<project>.json
+  <project>_<YYYY-MM-DD>_<HHMMSS>/
+    README.html
+    report/      assessment-{landing,effort,query}-<id>.json, <project>-assessment.html
+    terraform/   migration/   bundle/   query-workload/
+```
+
+Scripts and integrations should read `latest-<project>.json` rather than search for report files by name. If you have already run `terraform apply` from one run's folder, keep running Terraform from that folder — its state file lives there, and a newer run's `terraform/` starts without it.
+
+Before 0.10.0 the folder was `<project>_<YYYY-MM-DD>`, shared by every run that day, and no pointer file was written.
 
 Note: bq-assess never prompts for configuration — run
 `bq-assess assess --gcp-project <X|all> --use-adc` and it completes on its own
@@ -58,14 +75,6 @@ Note: bq-assess never prompts for configuration — run
 capacity reservation read is permission-denied in a terminal, it offers
 "Grant access and retry?" so the collection needn't be re-run. `bq-assess
 report`, fleet runs, and scripted/redirected runs never prompt at all.
-
-## Output
-
-- `assessment-<id>.json` — full assessment with per-table details
-- `assessment-<id>.html` — visual report for customer walkthroughs
-- `tables-auto.csv` — tables safe for automated migration
-- `tables-review.csv` — tables needing review
-- `tables-manual.csv` — tables requiring manual effort
 
 ## Query Logs
 

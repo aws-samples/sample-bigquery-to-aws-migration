@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "bq-assess"
 # Keep in step with src/bq_assess/__init__.py and packaging/collector/pyproject.toml.
 # tests/unit/test_version_consistency.py enforces it — nothing did before 0.9.0.
-version = "0.9.0"
+version = "0.10.0"
 description = "Read-only BigQuery migration assessment CLI: profiles a Source and assesses migrating it to an AWS lakehouse (S3 Tables / Apache Iceberg storage, Amazon Redshift Serverless query engine)."
 readme = "README.md"
 license = "Apache-2.0"

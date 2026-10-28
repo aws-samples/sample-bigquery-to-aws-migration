@@ -72,16 +72,21 @@ After the CLI exits, inspect the exit code and output to determine the next acti
 
 ### Success (exit code 0)
 
-The CLI has completed successfully and written reports to the output directory. The run produces **three mirrored JSON files** (not one) — capture all three:
+The CLI has completed successfully. Every run writes a **new** folder, `reports/{gcp_project}_<YYYY-MM-DD>_<HHMMSS>/` (UTC), and then updates a pointer file naming that run's files. **Always take report paths from the pointer — never search for report files by name.** A re-run on the same day writes a second folder next to the first, so a name search can pick up the wrong run.
 
-1. Locate the three report files in the output directory:
-   - `landing_json` — matches `reports/assessment-landing-*.json` (holds `summary` + `cost`)
-   - `effort_json` — matches `reports/assessment-effort-*.json` (holds Migration Effort `entities[]` + Iceberg DDL)
-   - `query_json` — matches `reports/assessment-query-*.json` (holds Query Complexity `entities[]`)
+1. Read the pointer `reports/latest-{gcp_project}.json`. Paths in its `files` object are relative to `reports/`:
+   - `landing_json` = `reports/` + `files.landing_json` (holds `summary` + `cost`)
+   - `effort_json` = `reports/` + `files.effort_json` (holds Migration Effort `entities[]` + Iceberg DDL)
+   - `query_json` = `reports/` + `files.query_json` (holds Query Complexity `entities[]`)
+   - `report_html` = `reports/` + `files.report_html` (the single HTML report to share)
+
+   Check that the pointer's `assessment_id` equals the `assessment_id` inside `landing_json`.
+
+   **If the pointer does not exist,** the installed CLI predates 0.10.0, which wrote no pointer. Find every `reports/{gcp_project}_*/report/assessment-landing-*.json`, read `generated_at` from each, and use the one with the newest `generated_at`. Never choose by file or folder name: older CLIs put all of a day's runs in one folder, and their file names end in a random string. Take `effort_json` and `query_json` with the same assessment ID from the same folder, and suggest the user upgrade the CLI.
 2. Verify each file exists and is non-empty. If `landing_json` is missing or empty, treat this as a generic fatal error (see below). If only `effort_json`/`query_json` is missing, note it and continue with what is present.
 3. **Check for silently degraded workload data** — see "Workload Data Unavailable" below. Do this BEFORE describing the run as clean.
-4. Tell the user the assessment completed successfully and show the output directory path.
-5. Advance to the **Interpret phase**, passing `landing_json`, `effort_json`, and `query_json`.
+4. Tell the user the assessment completed successfully and show the run folder (`reports/` + `run_folder` from the pointer).
+5. Advance to the **Interpret phase**, passing `landing_json`, `effort_json`, `query_json`, and `report_html`.
 
 ---
 
@@ -107,7 +112,7 @@ gcloud projects add-iam-policy-binding {gcp_project} \
 
 > Replace `{sa_email}` with the user's GCP identity (`gcloud auth list` shows it). `roles/bigquery.resourceViewer` carries `bigquery.jobs.listAll`.
 
-After the grant lands, re-run the same command from Step 2.
+After the grant lands, re-run the same command from Step 2. The re-run writes a new run folder and updates the pointer, so go through Step 3 again and **re-read the pointer** — do not reuse the earlier `landing_json`, which still describes the run without workload data.
 
 #### Option 2: Continue with the current report
 
@@ -177,4 +182,4 @@ The Scan phase is complete when **all** of the following are true:
 2. `landing_json` is set to a valid file path that exists and is non-empty.
 3. `effort_json` and `query_json` are captured if present (note any that are missing).
 
-Pass `landing_json`, `effort_json`, and `query_json` to the **Interpret phase**.
+Pass `landing_json`, `effort_json`, `query_json`, and `report_html` to the **Interpret phase**.
