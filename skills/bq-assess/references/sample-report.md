@@ -6,17 +6,22 @@
 
 ## Output File Structure
 
-A run with `--format json,html` writes **three mirrored JSON files** plus the HTML report:
+Each run writes a **new** folder, `<output>/<project>_<YYYY-MM-DD>_<HHMMSS>/` (UTC), and then updates `<output>/latest-<project>.json`, which names that run's files (paths relative to `<output>/`). Read report paths from the pointer; never search for them by name.
+
+A run with `--format json,html` writes, under `<run folder>/report/`, **three mirrored JSON files** plus one HTML report:
 
 | File | Top-level keys | Holds |
 |------|----------------|-------|
-| `assessment-landing-*.json` | `assessment_id`, `generated_at`, `project_id`, `summary`, `cost`, `failures` | Headline summary + cost comparison |
-| `assessment-effort-*.json` | `assessment_id`, `entities[]` | Per-**table** Migration Effort, Iceberg DDL, load/sync DML |
-| `assessment-query-*.json` | `assessment_id`, `entities[]` | Per-entity Query Complexity + rewrite guidance |
+| `assessment-landing-*.json` | provenance + `summary`, `cost`, `failures`, `engine_recommendation`, `migration_plans`, `source_db_setup` | Headline summary + cost comparison |
+| `assessment-effort-*.json` | provenance + `entities[]` | Per-**table** Migration Effort, Iceberg DDL, load/sync DML |
+| `assessment-query-*.json` | provenance + `entities[]` | Per-entity Query Complexity + rewrite guidance |
+| `<project>-assessment.html` | — | The single HTML report to share |
+
+"Provenance" is the same block on every file: `schema_version` (an integer that changes only when the file format changes), `tool_version`, `assessment_id`, `project_id`, `generated_at`, and `advisory`.
 
 The Interpret phase reads `summary` and `cost` from the **landing** file, and per-entity detail from the **effort** / **query** files.
 
-A raw metadata export is also written under `<output>/metadata/` (`tables.json`, `routines.json`, `jobs.jsonl`, `workload_summary.json`, `pricing_detection.json`) for verification.
+The run folder also holds `terraform/`, `migration/` (with `plan.json`), and `bundle/`, the re-processable metadata export (`bq-assess report --bundle <path>`).
 
 ---
 
@@ -67,7 +72,7 @@ A raw metadata export is also written under `<output>/metadata/` (`tables.json`,
         "lines": [ /* S3 Tables storage + Serverless compute */ ] }
       // + Serverless Reserved 1yr All Upfront / 1yr No Upfront / 3yr,
       //   Provisioned RG On-Demand / 1yr RI / 3yr RI.
-      // All scenarios share the userME S3 Tables storage basis (decoupled lakehouse).
+      // All scenarios share the SAME S3 Tables storage basis (decoupled lakehouse).
     ],
     "recommendation": {
       "recommended_scenario": "Redshift Serverless",

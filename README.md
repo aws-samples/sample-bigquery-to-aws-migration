@@ -68,7 +68,7 @@ Then ask:
 Install directly:
 
 ```bash
-pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.9.0"
+pip3 install "git+https://github.com/aws-samples/sample-bigquery-to-aws-migration.git@v0.10.0"
 ```
 
 Then:

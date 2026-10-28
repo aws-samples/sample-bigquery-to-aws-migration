@@ -1,4 +1,4 @@
-"""Detail/sample embed budgets — the petabyte-scale rule (CLAUDE.md § Scale rule).
+"""Detail/sample embed budgets — the petabyte-scale rule.
 
 Embedding DDL/DML/SQL for every entity makes the single-file report unloadable at
 100k-entity scale (measured 471 MB). These tests pin the budget mechanics: spend

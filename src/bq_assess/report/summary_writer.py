@@ -15,6 +15,7 @@ from pathlib import Path
 
 from bq_assess.core.units import fmt_size as _fmt_size  # canonical size formatter
 from bq_assess.models import Assessment
+from bq_assess.report.run_layout import legacy_run_folder_name
 
 
 def _fmt_money(value: float) -> str:
@@ -99,7 +100,14 @@ def _project_row(a: Assessment) -> dict:
         "recommendation": recommendation,
         "effort_counts": s.effort_counts,
         "complexity_counts": sql_complexity,
-        "report_href": f"{a.project_id}_{a.generated_at.strftime('%Y-%m-%d')}/report/{a.project_id}-assessment.html",
+        # The folder the run actually wrote to (recorded at Stage 15). Recomputing
+        # it from generated_at breaks on same-second collision suffixes and on
+        # runs that cross UTC midnight; the legacy name is only a fallback for
+        # Assessments built outside analyze_and_report.
+        "report_href": (
+            f"{a.run_folder or legacy_run_folder_name(a.project_id, a.generated_at)}"
+            f"/report/{a.project_id}-assessment.html"
+        ),
     }
 
 

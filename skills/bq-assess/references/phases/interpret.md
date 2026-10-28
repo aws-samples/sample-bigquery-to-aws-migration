@@ -119,15 +119,15 @@ Check the `summary.sql_surface_confidence` and `cost.compute_confidence` fields.
 > bq-assess --gcp-project {project_id} --use-adc --format json,html --output reports/
 > ```
 
+If the user re-runs, go back through Scan phase Step 3 and re-read `reports/latest-{project_id}.json` before interpreting again — the earlier `landing_json` still describes the earlier run.
+
 **If `compute_confidence` is `LOW`:**
 
 > ⚠️ **LOW Compute Confidence:** The cost comparison uses default assumptions for compute sizing. Provide a `--reservation-config` file with actual slot usage for higher-confidence estimates.
 
 ## Step 7: HTML Report Path
 
-The HTML report is generated alongside the JSON report in the same output directory. The output includes multiple HTML files (landing page, effort detail, query detail).
-
-Derive the HTML directory from `landing_json` by looking at the same output directory.
+The HTML report is a single file covering the summary, Migration Effort, and Query Complexity. Its path is `report_html`, taken from the latest-run pointer in the Scan phase (`reports/` + `files.report_html`).
 
 Tell the user:
 

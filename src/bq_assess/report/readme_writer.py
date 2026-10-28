@@ -66,7 +66,7 @@ def write_fleet_readme(output_dir: str, project_folders: list[tuple[str, str]]) 
     )
 
     # Annotated file tree — the package as the customer sees it on disk.
-    first_folder = project_folders[0][1] if project_folders else "<project>_<date>"
+    first_folder = project_folders[0][1] if project_folders else "<project>_<date>_<time>"
     more = ""
     if n > 1:
         more = "\n" + _tree_row(
@@ -412,6 +412,11 @@ bq-assess --gcp-project {gcp_project} --credentials /path/to/key.json
 bq-assess report --bundle /path/to/bundle</code></pre>
   <p><code>--no-cache</code> forces a fresh scan. Query-log analysis runs automatically
   (requires <code>bigquery.jobs.listAll</code>; opt out with <code>--skip-workload</code>).</p>
+  <p>Every run writes a <strong>new</strong> <code>&lt;project&gt;_&lt;date&gt;_&lt;time&gt;/</code>
+  folder (UTC) and leaves earlier runs untouched; <code>latest-{gcp_project}.json</code> in the
+  output folder names the newest run's files. If you have already run
+  <code>terraform apply</code> from an earlier folder, keep running Terraform from that folder &mdash;
+  its state file lives there, and a newer folder's copy starts without it.</p>
   </div>
 </details>
 

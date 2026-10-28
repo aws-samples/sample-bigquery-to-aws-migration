@@ -493,6 +493,14 @@ class Assessment:
     engine_recommendation: EngineRecommendation | None = None
     migration_plans: dict[str, MigrationDML] | None = None
     source_db_setup: list[str] | None = None
+    # Name of the folder this run's outputs were written to, e.g.
+    # "my-project_2026-10-27_134305" (report/run_layout.py). Set when the
+    # deliverables are written; "" for Assessments built elsewhere. Readers that
+    # link to a run (fleet SUMMARY.html, fleet README) must use THIS rather than
+    # recompute a name from generated_at — a same-second collision suffix can't
+    # be reconstructed, and the pre-0.10.0 date-only recomputation already broke
+    # for runs that crossed UTC midnight.
+    run_folder: str = ""
 
 
 # ---- Engine layer (Phase 9 — Athena addition) -----------------------------

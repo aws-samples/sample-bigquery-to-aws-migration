@@ -73,6 +73,15 @@ class TestWriteSummary:
         assert "80" in html
 
     def test_links_to_project_reports(self, tmp_path) -> None:
+        """Links use the folder the run actually wrote to (Assessment.run_folder)."""
+        a = _assessment("proj-alpha", 5000.0, 2000.0)
+        a.run_folder = "proj-alpha_2026-07-22_093015-2"
+        write_summary([a], str(tmp_path))
+        html = (tmp_path / "SUMMARY.html").read_text(encoding="utf-8")
+        assert 'href="proj-alpha_2026-07-22_093015-2/report/proj-alpha-assessment.html"' in html
+
+    def test_links_fall_back_to_legacy_folder_without_run_folder(self, tmp_path) -> None:
+        """Assessments built outside analyze_and_report carry no run_folder."""
         write_summary([_assessment("proj-alpha", 5000.0, 2000.0)], str(tmp_path))
         html = (tmp_path / "SUMMARY.html").read_text(encoding="utf-8")
         assert 'href="proj-alpha_2026-07-22/report/proj-alpha-assessment.html"' in html

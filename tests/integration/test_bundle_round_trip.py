@@ -11,6 +11,7 @@ assess run is accepted by `report` and reproduces the Assessment.
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -133,17 +134,27 @@ def _fixture_bundle() -> Bundle:
 
 
 def _normalize(assessment) -> dict:
-    """Assessment as a dict with the run-specific fields (id, timestamp) removed."""
+    """Assessment as a dict with the run-specific fields (id, timestamp, folder) removed.
+
+    run_folder embeds the run's time to the second, so leaving it in would make
+    two otherwise-identical runs compare equal only when they finish within the
+    same second — a flaky pass, not a real one.
+    """
     d = dataclasses.asdict(assessment)
     d.pop("assessment_id")
     d.pop("generated_at")
+    d.pop("run_folder")
     return d
 
 
 def _find_project_dir(base: Path, project_id: str) -> Path:
-    """Find the dated project folder (e.g. fixture-project_2026-07-22)."""
-    matches = list(base.glob(f"{project_id}_*"))
-    assert matches, f"no project dir matching {project_id}_* in {base}"
+    """Find the run folder (e.g. fixture-project_2026-10-27_134305).
+
+    Each test writes ONE run per output dir, so exactly one folder must match —
+    more than one would mean a run reused or leaked a folder.
+    """
+    matches = [p for p in base.glob(f"{project_id}_*") if p.is_dir()]
+    assert len(matches) == 1, f"expected one run folder for {project_id} in {base}, got {matches}"
     return matches[0]
 
 
@@ -187,7 +198,7 @@ class TestBundleRoundTripEquivalence:
         assert _normalize(direct) == _normalize(rerun)
 
     def test_report_outputs_written(self, tmp_path, report_params) -> None:
-        """The report side writes HTML into <project>_<date>/report/."""
+        """The report side writes HTML into <project>_<date>_<time>/report/."""
         bundle_dir = BundleWriter().write(_fixture_bundle(), str(tmp_path / "b"))
         loaded = BundleLoader().load(bundle_dir)
         params = report_params("out")
@@ -229,3 +240,93 @@ class TestBundleRoundTripEquivalence:
 
         assert assessment.cost.aws_pricing_region == "ap-southeast-2"
         assert assessment.cost.bq_pricing_region.lower() == "australia-southeast1"
+
+
+# --- Same-day re-runs: a fresh folder per run, and a pointer to the newest ----
+
+
+def _read_pointer(base: Path, project_id: str) -> dict:
+    from bq_assess.report.run_layout import latest_pointer_name
+
+    pointer = base / latest_pointer_name(project_id)
+    assert pointer.is_file(), f"no latest-run pointer at {pointer}"
+    return json.loads(pointer.read_text(encoding="utf-8"))
+
+
+class TestSameDayRerun:
+    """Before 0.10.0 every run on the same day shared <project>_<date>/: report
+    JSON piled up beside one overwritten HTML, and on the testbed "last file by
+    name" picked the OLDER of two runs. The skill's "grant the permission and
+    re-run" flow is same-day by definition, so it could re-read the stale report.
+    """
+
+    def test_rerun_gets_its_own_folder_and_leaves_the_first_untouched(
+        self, tmp_path, report_params
+    ) -> None:
+        params = report_params("rerun-out")
+        params["format"] = "json,html"
+        base = tmp_path / "rerun-out"
+
+        first = analyze_and_report(_fixture_bundle(), params)
+        first_dir = base / first.run_folder
+        first_files = {
+            p.relative_to(first_dir): p.read_bytes()
+            for p in first_dir.rglob("*") if p.is_file()
+        }
+
+        second = analyze_and_report(_fixture_bundle(), dict(params))
+
+        assert first.run_folder != second.run_folder
+        assert sorted(p.name for p in base.iterdir() if p.is_dir()) == sorted(
+            [first.run_folder, second.run_folder]
+        ), "each run must write exactly one folder of its own"
+        # Nothing in the first run's folder was rewritten or deleted.
+        assert {
+            p.relative_to(first_dir): p.read_bytes()
+            for p in first_dir.rglob("*") if p.is_file()
+        } == first_files
+        # Each folder holds exactly ONE run's report JSON — the defect was two.
+        for run in (first, second):
+            landings = list((base / run.run_folder / "report").glob("assessment-landing-*.json"))
+            assert [p.name for p in landings] == [f"assessment-landing-{run.assessment_id}.json"]
+
+    def test_pointer_names_the_newest_run_and_its_files_exist(
+        self, tmp_path, report_params
+    ) -> None:
+        params = report_params("ptr-out")
+        params["format"] = "json,html"
+        base = tmp_path / "ptr-out"
+
+        analyze_and_report(_fixture_bundle(), params)
+        newest = analyze_and_report(_fixture_bundle(), dict(params))
+
+        from bq_assess.report.run_layout import POINTER_FILE_KEYS
+
+        doc = _read_pointer(base, "fixture-project")
+        unknown = set(doc["files"]) - set(POINTER_FILE_KEYS)
+        assert not unknown, f"pointer uses keys consumers don't know about: {unknown}"
+        assert doc["assessment_id"] == newest.assessment_id
+        assert doc["run_folder"] == newest.run_folder
+        assert doc["project_id"] == "fixture-project"
+        assert isinstance(doc["schema_version"], int)
+        for key in ("landing_json", "effort_json", "query_json", "report_html", "readme_html"):
+            assert key in doc["files"], f"pointer is missing {key}"
+            rel = doc["files"][key]
+            assert not Path(rel).is_absolute(), "pointer paths must be relative to its directory"
+            assert (base / rel).exists(), f"pointer names a missing file: {rel}"
+            assert rel.startswith(f"{newest.run_folder}/"), f"{key} points outside the newest run"
+        landing = json.loads((base / doc["files"]["landing_json"]).read_text(encoding="utf-8"))
+        assert landing["assessment_id"] == newest.assessment_id
+
+    def test_pointer_is_per_project(self, tmp_path, report_params) -> None:
+        """Assessing project B must not repoint project A's pointer at B's run."""
+        params = report_params("multi-out")
+        base = tmp_path / "multi-out"
+
+        a = analyze_and_report(_fixture_bundle(), params)
+        other = _fixture_bundle()
+        other.project_id = "fixture-other"
+        b = analyze_and_report(other, dict(params))
+
+        assert _read_pointer(base, "fixture-project")["assessment_id"] == a.assessment_id
+        assert _read_pointer(base, "fixture-other")["assessment_id"] == b.assessment_id

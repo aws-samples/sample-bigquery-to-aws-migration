@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess  # nosec B404 - test runs the CLI as a subprocess with fixed args, no shell
+import subprocess  # nosec B404 - test runs the CLI with fixed args, no shell
 import sys
 from pathlib import Path
 

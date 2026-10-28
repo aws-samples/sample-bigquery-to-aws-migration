@@ -173,7 +173,7 @@ _DETAIL_KEYS = ("conversion", "migration_plan", "translated_sql")
 # JSON.parse (on first expand of a row in that chunk) around 2 MB / tens of ms.
 DETAIL_CHUNK_SIZE = 500
 
-# Byte budget for ALL embedded heavy detail (chunk JSON, CLAUDE.md § Scale rule).
+# Byte budget for ALL embedded heavy detail (chunk JSON).
 # Chunks are lazy-parsed but still ship inside the single HTML file — embedding
 # DDL/DML for every entity of a petabyte-scale estate makes the file itself
 # unloadable (measured 2026-08-14: 100k entities → 383 MB of chunks → 471 MB HTML).
@@ -244,7 +244,7 @@ def build_report_rows(
     ``JSON.parse`` proportional to entity count, not DDL volume.
 
     Embedded detail is capped at ``detail_byte_budget`` JSON bytes in
-    ``_detail_priority`` order (CLAUDE.md § Scale rule); past the budget the row
+    ``_detail_priority`` order; past the budget the row
     gets ``detail_omitted: true`` and its panel points at migration/plan.json.
     """
     # Heavy payloads first, in attention order, until the byte budget is spent.
@@ -333,7 +333,7 @@ def _clip_sql(sql: str) -> str:
     return sql[:MAX_SAMPLE_SQL_CHARS] + _CLIP_NOTE
 
 
-# Byte budget for embedded query samples (CLAUDE.md § Scale rule). Per-sample
+# Byte budget for embedded query samples. Per-sample
 # clipping bounds each entity (~24 KB worst) but not the estate: 100k attributed
 # entities would ship GBs. Heaviest workloads (by slot-ms) keep their SQL; the
 # rest keep their workload stats on the row, sample-less. Never silent — the

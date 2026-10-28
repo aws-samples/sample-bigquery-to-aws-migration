@@ -24,7 +24,7 @@ description: "Assess BigQuery warehouses for migration to AWS.
 ## Definitions
 
 - **"Load"** = read the file with the Read tool and follow its instructions.
-- **`$REPORTS_DIR`** = output directory for CLI run (default `reports/`).
+- **`$REPORTS_DIR`** = output directory for CLI run (default `reports/`). Each run writes a new `$REPORTS_DIR/<project>_<YYYY-MM-DD>_<HHMMSS>/` folder, and `$REPORTS_DIR/latest-<project>.json` names the newest run's files. Take report paths from that pointer — never search for report files by name.
 
 ## Prerequisites
 
